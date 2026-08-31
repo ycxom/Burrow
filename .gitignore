@@ -1,0 +1,44 @@
+# ---- Flutter / Dart ----
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+
+# ---- Android ----
+android/.gradle/
+android/app/build/
+android/app/.cxx/
+android/captures/
+android/key.properties
+*.jks
+*.keystore
+
+# local.properties 里是本机的 SDK 绝对路径，每台机器都不一样。
+# Flutter 会在 `flutter pub get` 时自动重新生成它。
+android/local.properties
+
+# ---- 原生构建产物 ----
+#
+# proot / talloc 是 GPL / LGPL 的。把编译好的二进制提交进来，
+# 就等于在分发 GPL 程序 —— 那要求同时提供对应源码或书面承诺。
+# 用 tool/build_proot.sh 从源码重建只要一条命令，不值得为了省这一步
+# 给仓库背上一个源码提供义务，何况二进制入 git 还会静默过期。
+#
+# 缺了它们 app 仍然能编能跑，只是退到降级模式（UI 上有明确横幅），
+# 不会变成一个难以定位的静默故障。
+android/app/src/main/jniLibs/*/libproot.so
+android/app/src/main/jniLibs/*/libproot-loader.so
+android/app/src/main/jniLibs/*/libproot-loader32.so
+
+# build_proot.sh 的工作目录（下载的 proot/talloc 源码 + 中间产物）
+.proot-build/
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db

@@ -1,0 +1,43 @@
+name: burrow
+description: 手机上的终端 LLM Agent —— Termux 基座 + 可回滚沙箱 + Flutter UI
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # 终端模拟与渲染。纯 Dart 实现，接原生 pty 的字节流。
+  # 不用 termux 的 TerminalView（Android View）—— 见 docs/ARCHITECTURE.md §3。
+  xterm: ^4.0.0
+
+  # SnapshotStore 的 content-addressed 对象名；
+  # DistroManager 校验下载的 rootfs
+  crypto: ^3.0.3
+  # AccumulatorSink —— 分块算 sha256，130MB 的 rootfs 不整包进内存
+  convert: ^3.1.1
+
+  path: ^1.9.0
+  path_provider: ^2.1.3
+
+  # 历史与检查点的持久化
+  sqflite: ^2.3.3
+
+  # LLM 流式响应
+  http: ^1.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    # 最小 bootstrap（bash/coreutils/proot/git/python）。
+    # 按 ABI 分开打包，构建时只保留目标 ABI 那一份，否则 APK 会大一倍。
+    - assets/bootstrap/

@@ -1,0 +1,8 @@
+# 统一用 LF 入库。tool/build_proot.sh 尤其关键 ——
+# 带 CRLF 的 shell 脚本在 Linux/macOS 上会因为行尾的 \r 报
+# "bad interpreter" 或 "command not found"，而且报错完全不指向真正原因。
+* text=auto eol=lf
+
+*.png  binary
+*.jks  binary
+*.so   binary

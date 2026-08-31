@@ -1,0 +1,437 @@
+/// Agent 主循环。把沙箱、回滚、上下文三块缝在一起。
+///
+/// 循环本身很短 —— 复杂度都被推到了各个部件里，这是有意的：
+/// 主循环是最难测也最难改的地方，它应该只负责编排，不负责任何判断。
+library;
+
+import 'dart:async';
+import 'dart:io';
+
+import '../context/context_limit_guard.dart';
+import '../context/memory_retrieval.dart';
+import '../context/output_distiller.dart';
+import '../context/overflow_manager.dart';
+import '../context/token_counter.dart';
+import '../sandbox/exec_policy.dart';
+import '../sandbox/prefix_generations.dart';
+import '../sandbox/sandbox_session.dart';
+import '../sandbox/snapshot_store.dart';
+import 'tools.dart';
+
+/// 审批档位。语义对齐 codex。
+enum ApprovalMode {
+  /// 只读工具可用，任何写/exec 一律拒。
+  readOnly,
+
+  /// 策略判 allow 的自动跑，prompt 的问用户，forbidden 的拒。默认。
+  onRequest,
+
+  /// allow + prompt 都自动跑，但强制开检查点。forbidden 仍拒。
+  auto,
+
+  /// 关沙箱关审批。UI 必须显示红条。
+  yolo,
+}
+
+/// UI 需要实现的回调。抽成接口是为了让主循环能脱离 Flutter 单测。
+abstract class AgentHost {
+  /// 请求用户批准一次工具调用。返回 false = 拒绝。
+  Future<bool> requestApproval(ToolCall call, PolicyVerdict verdict);
+
+  /// 助手文本的流式增量。
+  void onAssistantDelta(String text);
+
+  /// 命令输出的实时字节流，喂给终端视图。
+  void onTerminalChunk(List<int> chunk);
+
+  /// 状态变化：打了检查点、触发了摘要、沙箱降级等。用于 UI 上的小提示。
+  void onStatus(String message);
+}
+
+/// LLM 后端。用一个窄接口隔开，chatbox 那套 provider 抽象可以直接塞进来实现它。
+abstract class LlmClient {
+  /// 返回一次完整的助手回合（可能含多个 tool call）。
+  /// 实现方负责流式解析并把文本增量喂给 [onDelta]。
+  ///
+  /// 抛 [ContextOverflowException] 表示服务端拒绝了这次请求且原因是超长 ——
+  /// 主循环据此触发 ContextLimitGuard 的学习和重试。
+  Future<LlmTurn> complete({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required void Function(String delta) onDelta,
+  });
+
+  /// 当前渠道标识，供 ContextLimitGuard 分桶。
+  String get limitKey;
+}
+
+class LlmTurn {
+  final String text;
+  final List<ToolCall> toolCalls;
+  const LlmTurn({required this.text, this.toolCalls = const []});
+}
+
+class ContextOverflowException implements Exception {
+  final int status;
+  final String body;
+  const ContextOverflowException(this.status, this.body);
+}
+
+class AgentLoop {
+  final LlmClient llm;
+  final AgentHost host;
+  final ExecPolicy policy;
+  final SandboxSession sandbox;
+  final SnapshotStore snapshots;
+  final PrefixGenerations prefixGens;
+  final OverflowManager overflow;
+  final MemoryRetrieval retrieval;
+  final OutputDistiller distiller;
+  final ContextLimitGuard limitGuard;
+  final Directory outputArchiveDir;
+
+  ApprovalMode mode;
+  SandboxLevel sandboxLevel;
+
+  /// 全量历史。**永不删除** —— overflow 只控制哪些进 prompt。
+  final List<ChatMessage> history = [];
+
+  /// 单个 turn 内最多几轮工具调用。防止模型陷入
+  /// 「跑命令 → 看输出 → 再跑同一条命令」的死循环。
+  final int maxToolRounds;
+
+  AgentLoop({
+    required this.llm,
+    required this.host,
+    required this.policy,
+    required this.sandbox,
+    required this.snapshots,
+    required this.prefixGens,
+    required this.overflow,
+    required this.retrieval,
+    required this.distiller,
+    required this.limitGuard,
+    required this.outputArchiveDir,
+    this.mode = ApprovalMode.onRequest,
+    this.sandboxLevel = SandboxLevel.workspaceWrite,
+    this.maxToolRounds = 24,
+  });
+
+  Future<void> send(String userInput) async {
+    // 每个 turn 开头自动打检查点。绝大多数 turn 没改文件，diff 为空，
+    // checkpoint() 直接返回 null 且不推进代号 —— 所以这是免费的。
+    // 它换来的是「任何一轮都能整体撤销」这个非常好用的性质。
+    final cp = await snapshots.checkpoint(reason: _brief(userInput));
+    if (cp != null) {
+      host.onStatus('检查点 #${cp.generation}（${cp.changes.length} 处变更）');
+    }
+
+    history.add(ChatMessage(
+      role: 'user',
+      content: userInput,
+      at: DateTime.now(),
+    ));
+
+    // 用户提问里如果指向了被摘要挤出去的内容，先把它捞回来。
+    // 主动检索而不是等模型调 recall_memory：模型经常不知道自己忘了什么。
+    if (overflow.hasSummary) {
+      final hits = await retrieval.search(userInput, _corpus(), topK: 6);
+      if (hits.isNotEmpty) {
+        final injected = retrieval.format(hits, tokenBudget: 600);
+        if (injected.isNotEmpty) {
+          history.add(ChatMessage(
+              role: 'system', content: injected, at: DateTime.now()));
+        }
+      }
+    }
+
+    for (var round = 0; round < maxToolRounds; round++) {
+      final turn = await _completeWithRetry();
+
+      if (turn.text.isNotEmpty) {
+        history.add(ChatMessage(
+            role: 'assistant', content: turn.text, at: DateTime.now()));
+      }
+      if (turn.toolCalls.isEmpty) break;
+
+      for (final call in turn.toolCalls) {
+        final result = await _dispatch(call);
+        history.add(ChatMessage(
+          role: 'tool',
+          content: result.content,
+          at: DateTime.now(),
+          outputRef: result.outputRef,
+        ));
+      }
+
+      if (await overflow.onMessageAdded(history)) {
+        host.onStatus('已整理长期记忆（摘要覆盖到第 ${overflow.checkpoint} 条）');
+      }
+    }
+  }
+
+  /// 撞到上下文超长时：学一次真实窗口，裁剪，重试一次。
+  ///
+  /// 只重试一次。裁完还超说明 ContextLimitGuard 学到的 ratio 仍然不准，
+  /// 无限重试只会烧掉配额；报错让用户看见、让 guard 记下 hits+1，
+  /// 下一轮的收紧系数会更狠。
+  Future<LlmTurn> _completeWithRetry() async {
+    var messages = overflow.buildWindow(history);
+
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final budget = limitGuard.budgetFor(llm.limitKey);
+      if (budget > 0) messages = _trimTo(messages, budget);
+
+      try {
+        return await llm.complete(
+          messages: messages,
+          tools: allToolSpecs,
+          onDelta: host.onAssistantDelta,
+        );
+      } on ContextOverflowException catch (e) {
+        final estimate = TokenCounter.estimateMessages(
+            messages.map((m) => (role: m.role, content: m.content)));
+        final newBudget = limitGuard.learn(
+          key: llm.limitKey,
+          body: e.body,
+          ourEstimate: estimate,
+        );
+        if (newBudget <= 0 || attempt == 1) rethrow;
+        host.onStatus('服务端上下文窗口比预期小，已按 $newBudget token 重新裁剪');
+        messages = _trimTo(overflow.buildWindow(history), newBudget);
+      }
+    }
+    throw StateError('unreachable');
+  }
+
+  /// 从尾部往前保留，直到预算用完。
+  ///
+  /// system 消息永远保留 —— 它装着人格、工具约定和摘要，裁掉它模型会当场失忆。
+  /// 这个「从尾部保留」的方向也很关键：最近的消息是当前任务的上下文，
+  /// 从头保留会得到一堆和当下无关的开场白。
+  List<ChatMessage> _trimTo(List<ChatMessage> msgs, int budget) {
+    final systems = msgs.where((m) => m.role == 'system').toList();
+    final rest = msgs.where((m) => m.role != 'system').toList();
+
+    var used = TokenCounter.estimateMessages(
+        systems.map((m) => (role: m.role, content: m.content)));
+    final kept = <ChatMessage>[];
+
+    for (var i = rest.length - 1; i >= 0; i--) {
+      final cost = TokenCounter.estimate(rest[i].content) +
+          TokenCounter.perMessageOverhead;
+      if (used + cost > budget) break;
+      kept.insert(0, rest[i]);
+      used += cost;
+    }
+    return [...systems, ...kept];
+  }
+
+  // -------------------------------------------------------------------------
+  // 工具分发
+  // -------------------------------------------------------------------------
+
+  Future<ToolResult> _dispatch(ToolCall call) async {
+    // 只读工具走快路：不判策略、不打检查点。
+    if (readOnlyTools.contains(call.name)) {
+      return runReadOnlyTool(call, sandbox.workspacePath);
+    }
+
+    if (mode == ApprovalMode.readOnly) {
+      return ToolResult.rejected('当前是只读模式，${call.name} 被拒绝。'
+          '如需执行请让用户切换审批档位。');
+    }
+
+    // 回滚类工具自己就是安全阀，不需要再套一层审批 ——
+    // 但 rollback 会丢弃改动，所以仍然要问一句。
+    switch (call.name) {
+      case 'checkpoint':
+        final cp = await snapshots.checkpoint(
+            reason: call.args['reason'] as String? ?? '模型主动存档');
+        return ToolResult.ok(cp == null
+            ? '当前无变更，未创建新检查点（HEAD 仍为 #${snapshots.head}）'
+            : '已创建检查点 #${cp.generation}，记录了 ${cp.changes.length} 处变更');
+
+      case 'list_checkpoints':
+        return ToolResult.ok(_formatCheckpoints());
+
+      case 'rollback':
+        final target = (call.args['generation'] as num?)?.toInt();
+        if (target == null) {
+          return const ToolResult.rejected('rollback 缺少 generation 参数');
+        }
+        if (mode != ApprovalMode.yolo) {
+          final ok = await host.requestApproval(
+              call,
+              PolicyVerdict(
+                decision: Decision.prompt,
+                scope: WriteScope.workspace,
+                reason: '回滚到检查点 #$target，之后的所有改动会被撤销',
+              ));
+          if (!ok) return const ToolResult.rejected('用户拒绝了回滚');
+        }
+        final report = await snapshots.rollbackTo(target);
+        await snapshots.gc();
+        host.onStatus(report.toString());
+        // 回滚报告要原样交给模型，尤其是 unrecoverable 那部分 ——
+        // 让它以为回滚干净了然后基于错误前提继续，比回滚失败本身更糟。
+        return ToolResult.ok(report.toString());
+    }
+
+    // 其余的走策略判定。
+    final commandLine = call.name == 'exec'
+        ? (call.args['command'] as String? ?? '')
+        : '${call.name} ${call.args['path'] ?? ''}';
+    final verdict = policy.evaluate(commandLine);
+
+    if (verdict.decision == Decision.forbidden) {
+      return ToolResult.rejected('该命令被策略禁止：${verdict.reason}。'
+          '请换一种做法，不要重试同一条命令。');
+    }
+
+    final needsApproval = verdict.decision == Decision.prompt &&
+        mode == ApprovalMode.onRequest;
+    if (needsApproval && !await host.requestApproval(call, verdict)) {
+      return ToolResult.rejected('用户拒绝了这次操作（${verdict.reason}）。'
+          '请说明你为什么需要它，或换一种做法。');
+    }
+
+    // 会写盘就先存档。这一步在审批之后 —— 被拒的操作不该留下空检查点。
+    if (verdict.isMutating) {
+      final cp = await snapshots.checkpoint(reason: _brief(commandLine));
+      if (cp != null) host.onStatus('执行前检查点 #${cp.generation}');
+    }
+
+    // 改 $PREFIX 的走事务，和普通命令完全不同的一条路。
+    if (verdict.scope == WriteScope.prefix) {
+      return _runInPrefixTransaction(commandLine);
+    }
+
+    return _runExec(call, commandLine);
+  }
+
+  Future<ToolResult> _runExec(ToolCall call, String commandLine) async {
+    if (call.name != 'exec') {
+      return runWriteTool(call, sandbox.workspacePath, snapshots);
+    }
+
+    final ref = 'out_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    final sinkFile = File('${outputArchiveDir.path}/$ref.log');
+    await sinkFile.parent.create(recursive: true);
+
+    final level =
+        mode == ApprovalMode.yolo ? SandboxLevel.dangerFullAccess : sandboxLevel;
+
+    final result = await sandbox.run(
+      commandLine,
+      level: level,
+      outputSink: sinkFile,
+      timeout: Duration(seconds: (call.args['timeout'] as num?)?.toInt() ?? 300),
+      onChunk: host.onTerminalChunk,
+    );
+
+    final raw = await sinkFile.readAsString();
+    final distilled = distiller.distill(
+      command: commandLine,
+      raw: raw,
+      ref: ref,
+      exitCode: result.exitCode,
+      elapsed: result.elapsed,
+      timedOut: result.timedOut,
+      sandboxDenials: result.sandboxDenials,
+    );
+
+    return ToolResult.ok(distilled.text, outputRef: ref);
+  }
+
+  /// `pkg install` 这类：在 `$PREFIX` 的暂存副本里跑，成功才原子切换。
+  ///
+  /// 装包失败在手机上很常见（源不通、依赖冲突、存储不足），
+  /// 而失败的 apt 会留下一个半安装状态的 dpkg 数据库 —— 那才是真正难修的坏。
+  /// 事务化之后失败就是「什么都没发生」。
+  Future<ToolResult> _runInPrefixTransaction(String commandLine) async {
+    final tx = await prefixGens.begin(reason: _brief(commandLine));
+    host.onStatus('已创建环境暂存副本，改动不会直接落到当前环境');
+
+    final ref = 'out_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    final sinkFile = File('${outputArchiveDir.path}/$ref.log');
+    await sinkFile.parent.create(recursive: true);
+
+    // 装包必须联网，所以这里强制用联网档位 —— 但也仅限这条命令。
+    // 关键：rootfsPath 指向**暂存副本**而不是正在用的那份。
+    // 装包过程中的一切写入都落在副本里，失败就整份丢掉。
+    final txSandbox = SandboxSession(
+      rootfsPath: tx.stagingPath,
+      workspacePath: sandbox.workspacePath,
+      caps: sandbox.caps,
+      spawner: sandbox.spawner,
+      distroReady: sandbox.distroReady,
+      launcherPath: sandbox.launcherPath,
+      prootPath: sandbox.prootPath,
+      prootLoaderPath: sandbox.prootLoaderPath,
+      prootLoader32Path: sandbox.prootLoader32Path,
+      tmpPath: sandbox.tmpPath,
+    );
+
+    final result = await txSandbox.run(
+      commandLine,
+      level: SandboxLevel.workspaceWriteNetwork,
+      outputSink: sinkFile,
+      timeout: const Duration(minutes: 15), // 装包慢，给足时间
+      onChunk: host.onTerminalChunk,
+    );
+
+    final raw = await sinkFile.readAsString();
+    final distilled = distiller.distill(
+      command: commandLine,
+      raw: raw,
+      ref: ref,
+      exitCode: result.exitCode,
+      elapsed: result.elapsed,
+      timedOut: result.timedOut,
+      sandboxDenials: result.sandboxDenials,
+    );
+
+    if (result.exitCode == 0 && !result.timedOut) {
+      final gen = await tx.commit();
+      // hardlink 穿透的兜底校验，见 PrefixGenerations.verifyEtc 的注释。
+      final fixed = await prefixGens.verifyEtc(gen.id);
+      host.onStatus('环境已更新（第 ${gen.id} 代）'
+          '${fixed.isEmpty ? '' : '，修复 ${fixed.length} 处 hardlink 穿透'}');
+      return ToolResult.ok('${distilled.text}\n'
+          '[环境变更已提交为第 ${gen.id} 代，可用 rollback_env 回退]', outputRef: ref);
+    }
+
+    await tx.abort();
+    host.onStatus('装包失败，环境已回到操作前状态');
+    return ToolResult.ok('${distilled.text}\n'
+        '[命令失败，环境暂存副本已丢弃，当前环境未发生任何变化]', outputRef: ref);
+  }
+
+  // -------------------------------------------------------------------------
+
+  List<MemoryDoc> _corpus() => [
+        for (var i = 0; i < overflow.checkpoint && i < history.length; i++)
+          MemoryDoc(
+            text: '${history[i].role}: ${history[i].content}',
+            at: history[i].at,
+            importance: history[i].role == 'user' ? 0.6 : 0.5,
+            source: 'history:$i',
+          ),
+      ];
+
+  String _formatCheckpoints() {
+    if (snapshots.checkpoints.isEmpty) return '暂无检查点（HEAD = #0）';
+    final b = StringBuffer('检查点列表（HEAD = #${snapshots.head}）：\n');
+    for (final cp in snapshots.checkpoints.reversed.take(15)) {
+      b.writeln('#${cp.generation}  ${cp.createdAt.toIso8601String()}  '
+          '${cp.changes.length} 处变更  ${cp.reason}');
+    }
+    return b.toString();
+  }
+
+  static String _brief(String s) {
+    final line = s.split('\n').first.trim();
+    return line.length > 80 ? '${line.substring(0, 80)}…' : line;
+  }
+}
