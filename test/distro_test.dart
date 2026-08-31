@@ -153,10 +153,18 @@ void main() {
     expect(meta['files'], greaterThan(0));
   });
 
-  test('Debian 已启用 XZ rootfs 并固定校验和', () {
-    expect(DistroCatalog.debian.isAvailableOn('arm64-v8a'), isTrue);
+  test('Debian 被整体标为不可用，且说得出原因', () {
+    // 上游 docker-debian-artifacts 改成 OCI 布局后不再提供 rootfs.tar.xz，
+    // 目录里 pin 的那两个 commit 路径现在一律 404（实测三种取法都 404）。
+    // 保留条目 + 给理由，而不是从列表里删掉 ——
+    // 用户问「怎么没有 Debian」时应该看得到原因。
+    for (final abi in ['arm64-v8a', 'x86_64']) {
+      expect(DistroCatalog.debian.isAvailableOn(abi), isFalse);
+      expect(DistroCatalog.debian.blockedReasonFor(abi), contains('Ubuntu'),
+          reason: '不可用时必须指出替代品，否则用户只知道点不动');
+    }
+    // XZ 解码链路本身是好的（见下面那个用例），等有可靠下载点时直接放开。
     expect(DistroCatalog.debian.rootfsUrls['arm64-v8a'], endsWith('.tar.xz'));
-    expect(DistroCatalog.debian.sha256['arm64-v8a'], hasLength(64));
   });
 
   test('每个可安装基座同时提供大陆和国际来源', () {
@@ -206,7 +214,8 @@ void main() {
     expect(alpine.blockedReasonFor('x86_64'), contains('fork'));
     expect(alpine.blockedReasonFor('arm64-v8a'), isNull);
 
-    expect(DistroCatalog.debian.isAvailableOn('arm64-v8a'), isTrue);
+    // 全架构屏蔽走的是另一个字段（blockedReason），两条路都要生效。
+    expect(DistroCatalog.debian.isAvailableOn('arm64-v8a'), isFalse);
 
     // 每个受支持的架构都必须至少剩一个能装的，否则用户会看到一个空列表
     for (final abi in ['arm64-v8a', 'x86_64']) {

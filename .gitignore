@@ -7,6 +7,8 @@ build/
 
 # ---- Android ----
 android/.gradle/
+# Kotlin 编译器把失败日志丢在这里，每次失败一个新文件
+android/.kotlin/
 android/app/build/
 android/app/.cxx/
 android/captures/

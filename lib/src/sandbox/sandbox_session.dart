@@ -133,7 +133,12 @@ class SandboxSession {
   PtyHandle? _activeHandle;
 
   /// 发行版 rootfs 的路径（`distros/<id>/rootfs`）。proot 的 `-r` 指向它。
-  final String rootfsPath;
+  ///
+  /// **可变**。用户可以在聊天里当场勾选终端模式并装一个基座，装完必须
+  /// 立刻生效 —— 要求重启 app 会把「勾一下就能用」直接变成「勾一下、
+  /// 等下载、再手动杀进程重开」，那条路没人会走完。
+  /// 改这个字段的唯一入口是 [attachDistro]。
+  String rootfsPath;
 
   final String workspacePath;
   final SandboxCapabilities caps;
@@ -145,7 +150,12 @@ class SandboxSession {
   /// 没有包管理器，能做的事非常有限。它唯一的价值是让 pty 链路
   /// （JNI → Kotlin → EventChannel → xterm）能脱离发行版单独验证。
   /// UI 必须明确告诉用户环境没装。
-  final bool distroReady;
+  bool distroReady;
+
+  /// 发行版的显示名与包管理器名字。只用于拼给模型看的系统提示 ——
+  /// 告诉它这里是 apt 还是 apk，能省掉一整轮「试了 apt 发现没有」。
+  String distroLabel;
+  String packageManager;
 
   /// proot 二进制路径。和 burrow-launch 一样从 APK 的 nativeLibraryDir 取，
   /// null 表示不可用 —— 那样就没有 L1 路径隔离，只剩策略层。
@@ -192,6 +202,8 @@ class SandboxSession {
     required this.caps,
     required this.spawner,
     this.distroReady = true,
+    this.distroLabel = '',
+    this.packageManager = '',
     this.launcherPath,
     this.prootPath,
     this.prootLoaderPath,
@@ -200,6 +212,22 @@ class SandboxSession {
   });
 
   bool get canIsolate => distroReady && prootPath != null;
+
+  /// 挂上一个刚装好的发行版。
+  ///
+  /// [buildArgv] / [buildEnv] 每次调用都重新读这些字段，所以挂上之后
+  /// **下一条命令**就落在新 rootfs 里。已经跑起来的交互 shell 不会自己
+  /// 搬家（它的 argv 在 spawn 那一刻就定死了），调用方需要重启它。
+  void attachDistro({
+    required String rootfsPath,
+    required String label,
+    required String packageManager,
+  }) {
+    this.rootfsPath = rootfsPath;
+    distroLabel = label;
+    this.packageManager = packageManager;
+    distroReady = true;
+  }
 
   /// 降级时用的 shell。Android 上 `/system/bin/sh` 是 mksh，
   /// 它**不认 `-l`**（没有 login shell 概念），所以参数也要跟着换。

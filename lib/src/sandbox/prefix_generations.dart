@@ -35,6 +35,8 @@ library;
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
+
 class PrefixGeneration {
   final int id;
   final DateTime createdAt;
@@ -90,7 +92,10 @@ class PrefixGenerations {
   /// 被管理的目录的**父目录**。
   /// rename 要求同一文件系统，所以 `<name>` / `<name>.staging` / `<name>.gen`
   /// 三者必须同父。
-  final Directory filesRoot;
+  ///
+  /// 可变：用户可以在运行中装上（或换掉）发行版基座。改它的唯一入口是
+  /// [rebind]，因为换目录必须连带重读代索引。
+  Directory filesRoot;
 
   /// 被管理的目录名。
   ///
@@ -133,6 +138,18 @@ class PrefixGenerations {
     if (await _staging.exists()) {
       await _staging.delete(recursive: true);
     }
+  }
+
+  /// 改挂到另一个 rootfs 上（用户运行中装好了基座，或切换了发行版）。
+  ///
+  /// 必须重读代索引：代号是跟着 rootfs 目录走的，不是跟着 app 走的。
+  /// 沿用旧列表会让时间线上显示出一批属于另一个发行版的代，
+  /// 点回滚会 rename 到一个不存在的目录。
+  Future<void> rebind(Directory newRoot) async {
+    if (p.equals(newRoot.path, filesRoot.path)) return;
+    filesRoot = newRoot;
+    _generations.clear();
+    await open();
   }
 
   /// 开一个环境事务。`reason` 会显示在回滚时间线上。

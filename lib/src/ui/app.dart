@@ -85,14 +85,25 @@ class DistroSetupScreen extends StatefulWidget {
   final DistroManager manager;
   final String abi;
   final Future<void> Function(InstalledDistro chosen) onReady;
-  final Future<void> Function() onSkip;
+
+  /// null = 不显示「暂不安装」。
+  ///
+  /// 启动路径上必须给一条跳过的路（没网的用户否则连不进 app）；
+  /// 而从聊天里点进来时不需要 —— 用户是奔着装基座来的，
+  /// 不想装直接返回就行，再摆一个「暂不安装」只是同一个动作的第二个入口。
+  final Future<void> Function()? onSkip;
+
+  /// 作为一个页面被 push 进来（而不是启动时的全屏引导）。
+  /// 影响的只有外壳：加标题栏和返回键。
+  final bool asPage;
 
   const DistroSetupScreen({
     super.key,
     required this.manager,
     required this.abi,
     required this.onReady,
-    required this.onSkip,
+    this.onSkip,
+    this.asPage = false,
   });
 
   @override
@@ -140,13 +151,25 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
   Widget build(BuildContext context) {
     final available = DistroCatalog.forAbi(widget.abi);
 
-    return Scaffold(
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: _installing != null
-              ? _buildInstalling()
-              : _buildPicker(available),
+    // 装到一半退出：staging 目录下次安装会自动清掉，但那条正在写的下载流
+    // 没人收，它的 setState 会打在一个已经销毁的 State 上。所以安装期间
+    // 连同硬件返回键一起挡住 —— 装完（几秒到一分钟）自然放开。
+    return PopScope(
+      canPop: _installing == null,
+      child: Scaffold(
+        appBar: widget.asPage
+            ? AppBar(
+                title: const Text('安装沙箱基座'),
+                automaticallyImplyLeading: _installing == null,
+              )
+            : null,
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: _installing != null
+                ? _buildInstalling()
+                : _buildPicker(available),
+          ),
         ),
       ),
     );
@@ -279,10 +302,11 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
               ),
             ),
           const SizedBox(height: 16),
-          TextButton(
-            onPressed: () => widget.onSkip(),
-            child: const Text('暂不安装，先用 Android 自带的 shell'),
-          ),
+          if (widget.onSkip case final skip?)
+            TextButton(
+              onPressed: () => skip(),
+              child: const Text('暂不安装，先用 Android 自带的 shell'),
+            ),
         ],
       );
 }
@@ -297,7 +321,16 @@ class BurrowApp extends StatelessWidget {
   final SandboxCapabilities capabilities;
   final PrefixGenerations prefixGens;
   final PtyChannel spawner;
-  final InstalledDistro? activeDistro;
+
+  /// 当前挂载的发行版。**是个 ValueNotifier 而不是一个值** ——
+  /// 用户可以在聊天里当场装一个基座，装完 buildRuntime 造出来的新会话
+  /// 必须看到它，否则「装完了但新开的对话还是降级模式」。
+  final ValueNotifier<InstalledDistro?> activeDistro;
+
+  /// 聊天里勾终端模式、发现没装基座时要用它跳安装页。
+  final DistroManager distros;
+  final String abi;
+
   final ConfigurableLlmClient llm;
   final SettingsStore settings;
   final ChatStore chats;
@@ -310,6 +343,8 @@ class BurrowApp extends StatelessWidget {
     required this.prefixGens,
     required this.spawner,
     required this.activeDistro,
+    required this.distros,
+    required this.abi,
     required this.llm,
     required this.settings,
     required this.chats,
@@ -348,6 +383,8 @@ class BurrowApp extends StatelessWidget {
               prefixGens: prefixGens,
               spawner: spawner,
               activeDistro: activeDistro,
+              distros: distros,
+              abi: abi,
               llm: llm,
               settings: settings,
               chats: chats,
@@ -366,7 +403,9 @@ class HomeShell extends StatefulWidget {
   final SandboxCapabilities capabilities;
   final PrefixGenerations prefixGens;
   final PtyChannel spawner;
-  final InstalledDistro? activeDistro;
+  final ValueNotifier<InstalledDistro?> activeDistro;
+  final DistroManager distros;
+  final String abi;
   final ConfigurableLlmClient llm;
   final SettingsStore settings;
   final ChatStore chats;
@@ -382,6 +421,8 @@ class HomeShell extends StatefulWidget {
     required this.prefixGens,
     required this.spawner,
     required this.activeDistro,
+    required this.distros,
+    required this.abi,
     required this.llm,
     required this.settings,
     required this.chats,
@@ -408,7 +449,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   bool _loadingHistory = true;
   bool _cancelRequested = false;
   bool _runtimeReady = false;
+  bool _installingDistro = false;
   String? _threadId;
+
+  InstalledDistro? get _distro => widget.activeDistro.value;
 
   /// 助手当前这一轮的流式文本。单独存而不是每个 delta 都往 _visible 里塞，
   /// 否则每个 token 都触发一次列表重建，长回复时会明显掉帧。
@@ -431,9 +475,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   Future<void> _prepareRuntime() async {
     _runtime = await widget.runtime;
     _agent = widget.buildAgent(this, _runtime);
+    await _restoreTerminalMode();
     await _loadHistory();
     await _startShell();
     if (mounted) setState(() => _runtimeReady = true);
+  }
+
+  /// 恢复这个会话的终端模式。老会话按存的来，新会话按上次的选择来。
+  ///
+  /// 基座没装时一律按关处理，哪怕库里存的是开：开着而没有 rootfs 等于
+  /// 把模型放进 Android 自带的 mksh 里，它会对着一串 command not found
+  /// 原地打转。宁可让用户重勾一次 —— 那一勾会把安装流程带出来。
+  Future<void> _restoreTerminalMode() async {
+    final id = widget.threadId;
+    final stored = id == null ? null : await widget.chats.terminalModeOf(id);
+    final wanted = stored ?? widget.settings.terminalModeDefault;
+    _agent.terminalMode = wanted && _distro != null;
   }
 
   Future<void> _loadHistory() async {
@@ -460,7 +517,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 断网档会让他对着一个没有解释的失败发呆。Agent 才需要默认断网。
     const level = SandboxLevel.workspaceWriteNetwork;
     final argv = _runtime.sandbox.buildArgv(
-      widget.activeDistro != null ? 'exec /bin/sh -l' : 'exec sh',
+      _distro != null ? 'exec /bin/sh -l' : 'exec sh',
       level,
     );
     final env = _runtime.sandbox.buildEnv(level);
@@ -480,15 +537,97 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       _terminal.onResize = (w, h, _, __) => handle.resize(h, w);
 
       // pty → 屏幕
+      //
+      // 两条收尾消息都先确认这个 handle 还是当前那个。装完基座重开 shell 时
+      // 旧 shell 是被我们自己 kill 的，它的 `[shell 退出，code=-9]` 会在新
+      // shell 已经起来之后才到，读起来像是「刚开的 shell 当场就死了」。
       handle.output.listen(
         (chunk) => _terminal.write(String.fromCharCodes(chunk)),
-        onDone: () => _terminal.write('\r\n[会话已结束]\r\n'),
+        onDone: () {
+          if (identical(_shell, handle)) {
+            _terminal.write('\r\n[会话已结束]\r\n');
+          }
+        },
       );
-      handle.exitCode
-          .then((code) => _terminal.write('\r\n[shell 退出，code=$code]\r\n'));
+      handle.exitCode.then((code) {
+        if (identical(_shell, handle)) {
+          _terminal.write('\r\n[shell 退出，code=$code]\r\n');
+        }
+      });
     } catch (e) {
       _terminal.write('无法启动 shell：$e\r\n');
     }
+  }
+
+  // ---- 终端模式 ----
+
+  /// 勾/取消「终端模式」。
+  ///
+  /// 勾上时如果还没装基座，先把安装页推出来 —— 这是用户唯一一次需要
+  /// 关心「基座」这个概念的时刻，把它放在勾选的那一下，比放在设置里
+  /// 某个二级页面要好：想用终端的人自然会走到这里。
+  /// 装完立刻生效，不重启 app。
+  Future<void> _setTerminalMode(bool on) async {
+    // 跑到一半换模式会让这一轮已经发出去的工具调用悬空：
+    // 模型以为有工具，回来时工具没了。等这轮结束再说。
+    if (_busy || _installingDistro) return;
+
+    if (on && _distro == null) {
+      final installed = await _pushInstaller();
+      if (installed == null) return; // 放弃安装 → 开关保持关着
+      await _activateDistro(installed);
+    }
+
+    if (!mounted) return;
+    setState(() => _agent.terminalMode = on);
+    await widget.settings.setTerminalModeDefault(on);
+    final id = _threadId;
+    if (id != null) await widget.chats.setTerminalMode(id, on);
+  }
+
+  Future<InstalledDistro?> _pushInstaller() async {
+    setState(() => _installingDistro = true);
+    try {
+      return await Navigator.of(context).push<InstalledDistro>(
+        MaterialPageRoute<InstalledDistro>(
+          builder: (routeContext) => DistroSetupScreen(
+            manager: widget.distros,
+            abi: widget.abi,
+            asPage: true,
+            onReady: (chosen) async => Navigator.of(routeContext).pop(chosen),
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _installingDistro = false);
+    }
+  }
+
+  /// 让刚装好的基座立刻生效。
+  ///
+  /// 三个地方都要换，漏一个就是一类静默错误：
+  ///   - sandbox   → 下一条命令落在新 rootfs 里
+  ///   - prefixGens→ 装包事务的暂存/代目录跟着 rootfs 走
+  ///   - 交互 shell→ argv 在 spawn 那一刻就定死了，只能重开
+  Future<void> _activateDistro(InstalledDistro installed) async {
+    widget.activeDistro.value = installed;
+    _runtime.sandbox.attachDistro(
+      rootfsPath: installed.rootfs.path,
+      label: installed.distro.displayName,
+      packageManager: installed.distro.packageManager,
+    );
+    await widget.prefixGens.rebind(installed.rootfs.parent);
+    await _restartShell();
+    if (mounted) {
+      setState(() => _status = '${installed.distro.displayName} 已就绪，命令现在跑在沙箱里');
+    }
+  }
+
+  Future<void> _restartShell() async {
+    _shell?.killGroup();
+    _shell = null;
+    _terminal.write('\r\n[切换到新基座，正在重开 shell]\r\n');
+    await _startShell();
   }
 
   @override
@@ -587,6 +726,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       id = await widget.chats.createThread(
         text,
         preferredId: widget.runtimeId,
+        terminalMode: _agent.terminalMode,
       );
       _threadId = id;
     }
@@ -694,6 +834,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             caps: widget.capabilities,
             mode: _agent.mode,
             level: _agent.sandboxLevel,
+            terminalMode: _agent.terminalMode,
             status: _status,
           ),
         ),
@@ -733,7 +874,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         children: [
           _buildChat(),
           Column(children: [
-            if (widget.activeDistro == null)
+            if (_distro == null)
               Container(
                 width: double.infinity,
                 color: Colors.orange.shade900,
@@ -803,32 +944,42 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                   ),
                 ),
               ),
-              child: Row(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _input,
-                      enabled: !_busy,
-                      minLines: 1,
-                      maxLines: 5,
-                      decoration: InputDecoration(
-                        hintText: '描述你希望 Agent 完成的任务',
-                        filled: true,
-                        fillColor:
-                            Theme.of(context).colorScheme.surfaceContainerLow,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(16),
+                  _buildTerminalModeRow(),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _input,
+                          enabled: !_busy,
+                          minLines: 1,
+                          maxLines: 5,
+                          decoration: InputDecoration(
+                            hintText: _agent.terminalMode
+                                ? '描述你希望 Agent 完成的任务'
+                                : '随便聊点什么',
+                            filled: true,
+                            fillColor: Theme.of(context)
+                                .colorScheme
+                                .surfaceContainerLow,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                          ),
+                          onSubmitted: (_) => _send(),
                         ),
                       ),
-                      onSubmitted: (_) => _send(),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton.filled(
-                    onPressed: _busy ? _stop : _send,
-                    icon: _busy
-                        ? const Icon(Icons.stop_rounded)
-                        : const Icon(Icons.arrow_upward),
+                      const SizedBox(width: 8),
+                      IconButton.filled(
+                        onPressed: _busy ? _stop : _send,
+                        icon: _busy
+                            ? const Icon(Icons.stop_rounded)
+                            : const Icon(Icons.arrow_upward),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -836,6 +987,79 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           ),
         ],
       );
+
+  /// 输入框上方的「终端模式」开关。
+  ///
+  /// 放在这里而不是设置页：它决定的是**这一句话**会被怎么处理 ——
+  /// 是聊天还是让模型动手。这种开关必须在用户打字的地方，
+  /// 否则每次都要先想起来去别处确认一下自己现在是哪个模式。
+  Widget _buildTerminalModeRow() {
+    final on = _agent.terminalMode;
+    final distro = _distro;
+    final scheme = Theme.of(context).colorScheme;
+    final enabled = !_busy && !_installingDistro;
+
+    final hint = on
+        ? '模型可以在 ${distro?.distro.displayName ?? '沙箱'} 里执行命令、读写文件'
+        : distro == null
+            ? '勾选后会先装一个 Linux 基座（约 3–30MB）'
+            : '普通聊天，模型没有任何工具';
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: enabled ? () => _setTerminalMode(!on) : null,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // IgnorePointer：点击统一交给外层 InkWell 处理，
+                  // 否则复选框那 20 像素和它旁边的文字会走两条不同的路径。
+                  SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: IgnorePointer(
+                      child: Checkbox(
+                        value: on,
+                        visualDensity: VisualDensity.compact,
+                        onChanged: enabled ? (_) {} : null,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(Icons.terminal_outlined,
+                      size: 15,
+                      color: on ? scheme.primary : scheme.onSurfaceVariant),
+                  const SizedBox(width: 4),
+                  Text(
+                    '终端模式',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: on ? FontWeight.w600 : FontWeight.normal,
+                      color: on ? scheme.primary : scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              hint,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// 常驻的沙箱状态条。
@@ -845,18 +1069,28 @@ class _SandboxBar extends StatelessWidget {
   final SandboxCapabilities caps;
   final ApprovalMode mode;
   final SandboxLevel level;
+  final bool terminalMode;
   final String? status;
 
   const _SandboxBar({
     required this.caps,
     required this.mode,
     required this.level,
+    required this.terminalMode,
     this.status,
   });
 
   @override
   Widget build(BuildContext context) {
-    final danger = mode == ApprovalMode.yolo;
+    // yolo 只在终端模式下才真的危险 —— 聊天模式下没有工具可关。
+    final danger = terminalMode && mode == ApprovalMode.yolo;
+
+    // 聊天模式下报「路径隔离 + 断网」是误导：没有任何东西在跑，
+    // 那几层保护现在保护的是零。说清楚模型手里有没有工具更有用。
+    final idle = terminalMode
+        ? (danger ? '⚠ 沙箱已关闭，命令直接在环境里执行' : caps.describe())
+        : '聊天模式 · 模型没有工具，不会执行任何命令';
+
     return Container(
       width: double.infinity,
       color: danger
@@ -864,7 +1098,7 @@ class _SandboxBar extends StatelessWidget {
           : Theme.of(context).colorScheme.surfaceContainerHighest,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       child: Text(
-        status ?? (danger ? '⚠ 沙箱已关闭，命令直接在环境里执行' : caps.describe()),
+        status ?? idle,
         style: const TextStyle(fontSize: 11),
         overflow: TextOverflow.ellipsis,
       ),

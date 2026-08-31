@@ -20,7 +20,8 @@ import 'package:burrow/src/bootstrap/tar_reader.dart';
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {
-    stderr.writeln('用法: dart run tool/verify_rootfs.dart <rootfs.tar.gz> [目标目录]');
+    stderr
+        .writeln('用法: dart run tool/verify_rootfs.dart <rootfs.tar.gz> [目标目录]');
     exit(2);
   }
 
@@ -108,7 +109,12 @@ Future<void> main(List<String> args) async {
   // 建不了软链（本脚本会静默跳过），那条路径根本不存在。
   // 所以两处都认，任一命中即可。
   if (outDir != null) {
-    final candidates = ['bin/sh', 'usr/bin/sh', 'bin/busybox', 'usr/bin/busybox'];
+    final candidates = [
+      'bin/sh',
+      'usr/bin/sh',
+      'bin/busybox',
+      'usr/bin/busybox'
+    ];
     final found = <String>[];
     for (final c in candidates) {
       if (await File('${outDir.path}/$c').exists() ||

@@ -145,17 +145,6 @@ class DistroCatalog {
     },
     sources: [
       DistroSource(
-          id: 'alpine-tuna',
-          displayName: '清华 TUNA',
-          region: MirrorRegion.china,
-          rootfsUrls: {
-            'arm64-v8a':
-                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
-            'x86_64':
-                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
-          },
-          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/alpine'),
-      DistroSource(
           id: 'alpine-ustc',
           displayName: '中科大 USTC',
           region: MirrorRegion.china,
@@ -166,6 +155,22 @@ class DistroCatalog {
                 'https://mirrors.ustc.edu.cn/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
           },
           packageBaseUrl: 'https://mirrors.ustc.edu.cn/alpine'),
+      // TUNA 放在 USTC 之后而不是第一个：实测这台机器上
+      // mirrors.tuna.tsinghua.edu.cn 对 alpine / ubuntu-cdimage 两个路径
+      // 都返回 403（页面明说「您目前无法访问此页面」），像是按来源 IP 拦的。
+      // 换个网络多半是通的，所以不删掉它，只是不再当默认 ——
+      // 默认源应该选一个「几乎不会拒绝任何人」的。
+      DistroSource(
+          id: 'alpine-tuna',
+          displayName: '清华 TUNA',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/alpine'),
       DistroSource(
           id: 'alpine-nju',
           displayName: '南京大学 NJU',
@@ -194,12 +199,11 @@ class DistroCatalog {
           region: MirrorRegion.international,
           rootfsUrls: {
             'arm64-v8a':
-                'https://mirror.math.princeton.edu/pub/alpinelinux/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+                'https://mirror.math.princeton.edu/pub/alpinelinux/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
             'x86_64':
-                'https://mirror.math.princeton.edu/pub/alpinelinux/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+                'https://mirror.math.princeton.edu/pub/alpinelinux/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
           },
-          packageBaseUrl:
-              'https://mirror.math.princeton.edu/pub/alpinelinux/alpine'),
+          packageBaseUrl: 'https://mirror.math.princeton.edu/pub/alpinelinux'),
       DistroSource(
           id: 'alpine-rwth',
           displayName: 'RWTH Aachen',
@@ -282,6 +286,24 @@ class DistroCatalog {
     },
     approxInstalledBytes: 120 * 1024 * 1024,
     packageManager: 'apt',
+    // debuerreotype/docker-debian-artifacts 已经不在仓库里存 rootfs.tar.xz 了
+    // （改成了 oci/ 布局），上面这两个 pin 死的 commit 现在一律 404 ——
+    // commit 本身还在，只是那个路径下没有这个文件。实测：
+    //   raw.githubusercontent.com/.../<sha>/bookworm/rootfs.tar.xz  → 404
+    //   github.com/.../raw/dist-amd64/bookworm/rootfs.tar.xz        → 404
+    //   media.githubusercontent.com/media/...（LFS 端点）           → 404
+    // 仓库里只剩 rootfs.tar.xz.sha256（值也和上面对不上了）。
+    //
+    // 没有替换成 LXC 镜像那类源，是因为它们的路径带每日日期，
+    // 而这个目录的前提是「URL 和校验和都能写死」—— 一个会变的 URL
+    // 没法固定校验和，等于把「下一坨东西然后在里面执行代码」这件事
+    // 交给运气。
+    //
+    // 标成不可用而不是删掉：用户问「怎么没有 Debian」时应该看得到原因。
+    // Ubuntu 24.04 同样是 glibc + apt，覆盖同一个需求。
+    blockedReason: '上游 docker-debian-artifacts 已不再提供 rootfs.tar.xz '
+        '（改为 OCI 布局），目前没有可固定 URL + 校验和的下载点。'
+        '需要 glibc + apt 请选 Ubuntu 24.04',
   );
 
   static const ubuntu = Distro(
@@ -297,17 +319,6 @@ class DistroCatalog {
     },
     sources: [
       DistroSource(
-          id: 'ubuntu-tuna',
-          displayName: '清华 TUNA',
-          region: MirrorRegion.china,
-          rootfsUrls: {
-            'arm64-v8a':
-                'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
-            'x86_64':
-                'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
-          },
-          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu'),
-      DistroSource(
           id: 'ubuntu-ustc',
           displayName: '中科大 USTC',
           region: MirrorRegion.china,
@@ -318,6 +329,29 @@ class DistroCatalog {
                 'https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
           },
           packageBaseUrl: 'https://mirrors.ustc.edu.cn/ubuntu'),
+      DistroSource(
+          id: 'ubuntu-nju',
+          displayName: '南京大学 NJU',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.nju.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+            'x86_64':
+                'https://mirrors.nju.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.nju.edu.cn/ubuntu'),
+      // 同 Alpine：TUNA 的 ubuntu-cdimage 在本机实测 403，不再当默认。
+      DistroSource(
+          id: 'ubuntu-tuna',
+          displayName: '清华 TUNA',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+            'x86_64':
+                'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu'),
       DistroSource(
           id: 'ubuntu-official',
           displayName: 'Canonical 官方',

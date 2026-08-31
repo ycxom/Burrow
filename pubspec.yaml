@@ -1,5 +1,10 @@
 name: burrow
-description: 手机上的终端 LLM Agent —— Termux 基座 + 可回滚沙箱 + Flutter UI
+description: >-
+  手机上的 LLM 客户端：平时聊天，勾上「终端模式」就变成能在可回滚
+  Linux 沙箱里干活的 Agent。发行版 rootfs + proot 隔离 + Flutter UI。
+
+# Apache-2.0，见 LICENSE。第三方组件（proot / talloc / pty.c）
+# 保留各自的许可证，见 THIRD_PARTY.md。
 publish_to: none
 version: 0.1.0
 

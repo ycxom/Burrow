@@ -131,6 +131,10 @@ Future<void> _boot({
   required InstalledDistro? active,
   required _NativeBits native,
 }) async {
+  // 当前基座是**可变的**：用户可以在聊天里勾「终端模式」时当场装一个。
+  // 装完之后新建的会话必须看到它，所以这里存的是一个 notifier 而不是值。
+  final activeDistro = ValueNotifier<InstalledDistro?>(active);
+
   final sandboxRoot = Directory('${files.path}/sandbox');
   // proot 要一个可写的宿主临时目录来落 loader，见 SandboxSession.tmpPath。
   final tmp = Directory('${sandboxRoot.path}/tmp');
@@ -165,6 +169,8 @@ Future<void> _boot({
   final spawner = PtyChannel();
 
   Future<TaskRuntime> buildRuntime(String taskId) async {
+    // 每次都重新读 —— 运行中装的基座要能被之后新建的会话用上。
+    final current = activeDistro.value;
     final root = taskRootFor(sandboxRoot, taskId);
     final workspace = Directory('${root.path}/workspace');
     await workspace.create(recursive: true);
@@ -179,11 +185,13 @@ Future<void> _boot({
       root: root,
       snapshots: snapshots,
       sandbox: SandboxSession(
-        rootfsPath: active?.rootfs.path ?? '',
+        rootfsPath: current?.rootfs.path ?? '',
         workspacePath: workspace.path,
         caps: caps,
         spawner: spawner,
-        distroReady: active != null,
+        distroReady: current != null,
+        distroLabel: current?.distro.displayName ?? '',
+        packageManager: current?.distro.packageManager ?? '',
         launcherPath: native.launcher,
         prootPath: native.proot,
         prootLoaderPath: native.prootLoader,
@@ -224,7 +232,9 @@ Future<void> _boot({
     capabilities: caps,
     prefixGens: gens,
     spawner: spawner,
-    activeDistro: active,
+    activeDistro: activeDistro,
+    distros: distros,
+    abi: native.abi,
     llm: llm,
     settings: settings,
     chats: chats,

@@ -2,8 +2,12 @@
 
 手机上的 LLM 客户端 —— 平时就是聊天，需要动手时它有一整台 Linux 可用。
 
-对话、终端、检查点三个页签。同一个模型，你可以只跟它说话，也可以让它
-去装包、改代码、跑脚本；搞坏了退回上一个检查点，环境和文件一起回去。
+对话、终端、检查点三个页签。输入框上方有一个「终端模式」勾选框：
+不勾就是普通聊天（模型拿不到任何工具），勾上模型才能在沙箱里装包、
+改代码、跑脚本；搞坏了退回上一个检查点，环境和文件一起回去。
+
+📄 许可证：[Apache-2.0](LICENSE)（第三方组件各自的许可证见
+[THIRD_PARTY.md](THIRD_PARTY.md)）
 
 > **为什么叫 Burrow**：地洞是自己挖的、封闭的、安全的空间 —— 正是这个
 > app 给 Agent 的东西（发行版 rootfs + proot 隔离 + 可回滚）。而
@@ -21,6 +25,28 @@
 📐 设计：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 🔒 沙箱与回滚：[docs/SANDBOX.md](docs/SANDBOX.md) ·
 🧠 超长上下文：[docs/CONTEXT.md](docs/CONTEXT.md)
+
+---
+
+## 两种模式，一个勾选框
+
+日常聊天和 Agent 干活是两种对话，但不该是两个 app。区别收敛成输入框上方
+的一个勾选框，**它跟着会话走**（会话列表里的图标能看出哪个是哪个）：
+
+| | 不勾（聊天） | 勾上（终端） |
+|---|---|---|
+| 发给模型的工具 | 一个都没有 | 全套 11 个 |
+| 每轮开头扫 workspace 打检查点 | 不做 | 做 |
+| 系统提示 | 明说「你没有工具，需要的话让用户去勾」 | 沙箱规则 + 当前发行版和包管理器 |
+| 需要发行版基座 | 不需要 | 需要，没装会当场跳安装页 |
+
+**工具是真的收走了，不是提示词里说一句「别用」。** 大量模型只要看见工具
+就倾向于调，用户问「Rust 的所有权是什么意思」也会先 `ls` 一遍 workspace。
+同时省下每轮上千 token 的 schema。
+
+第一次勾选时如果还没装基座，会直接推出安装页（可选 Alpine / Ubuntu，
+下载源有大陆和国际镜像可选）。装完**立刻生效，不用重启 app** ——
+沙箱、装包事务的代目录、交互 shell 三处一起换过去。
 
 ---
 
@@ -115,7 +141,7 @@ Flutter 3.47.2 / Dart 3.13.2 / NDK 28.2.13676358，在 Android 模拟器
 
 ```
 dart analyze lib test   →  No issues found!
-flutter test            →  All tests passed!  (34 通过 / 3 跳过)
+flutter test            →  All tests passed!  (51 通过 / 5 跳过)
 flutter build apk       →  Built app-debug.apk (41.3 MB)
 adb install + am start  →  运行中
 ```
@@ -124,7 +150,7 @@ adb install + am start  →  运行中
 
 | 项 | 证据 |
 |---|---|
-| Dart 层 ~4300 行 | analyze 零错误零警告；34 个单测覆盖策略引擎 / 上下文窗口学习 / 输出蒸馏 / BM25+RRF / 快照回滚 / zip·tar 解析 |
+| Dart 层 | analyze 零错误零警告；51 个单测覆盖策略引擎 / 上下文窗口学习 / 输出蒸馏 / BM25+RRF / 快照回滚 / zip·tar 解析 / 聊天↔终端模式切换 |
 | Kotlin 桥接层 | 编译通过；`PtySession` 的 FileDescriptor 反射在 Android 16 上仍可用 |
 | `pty.c` → `libburrow.so` | arm64 + x86_64 编译通过，10KB；运行时 `nativeloader: Load libburrow.so ... ok` |
 | `burrow_launch.c` → `libburrow-launch.so` | 静态链接 405KB；设备上 `--probe` 返回 `{"seccomp":true,"landlock_abi":0,"rlimit":true}` |
@@ -137,13 +163,17 @@ adb install + am start  →  运行中
 | **L1+L2+L4 叠加** | 联网档 `ping 10.0.2.2` 通（5.99ms）／离线档 `permission denied`／`--rlimit-nproc=1` 让 proot 连 fork 都做不了 |
 | `ZipReader` / `TarReader` | 单测 + 真实 Alpine 3.21 rootfs：88 文件 / 96 目录 / **335 软链** / 0 跳过，568ms |
 | 发行版校验和 | Alpine x86_64 实测 sha256 与官方 `.sha256` 一致 |
+| **DistroManager 端到端** | 模拟器上从聊天页勾「终端模式」→ 跳安装页 → 走 USTC 镜像下 Ubuntu 24.04 → 校验 → 解压 → 原子 rename，全流程走通 |
+| **终端模式开关** | 未装基座时勾选会推出安装页；装完自动回到聊天且开关已打开，状态条变成「路径隔离(proot) + 断网(seccomp) + 资源限制」 |
+| **运行中挂载基座（不重启 app）** | 装完后交互 shell 自动重开，`ps` 里能看到 `libproot.so → sh`，shell 里 `cat /etc/os-release` 返回 Ubuntu 24.04.4 LTS |
 
 ### 尚未验证 / 未完成
 
 | 部分 | 状态 |
 |---|---|
-| DistroManager 端到端 | 下载/校验/解压的**代码**已完成且解析器实测过，但「在设备上点一下装 Alpine」这条路还没走通 |
-| Debian | 官方只发 `.tar.xz`，Dart 无内置 xz 解码。目录里已明确标为不可用（不是悄悄隐藏）。Ubuntu 覆盖了「glibc + apt」这个需求 |
+| Debian | **整体不可用**。上游 `docker-debian-artifacts` 改成 OCI 布局后不再提供 `rootfs.tar.xz`，pin 死的两个 commit 路径实测三种取法全 404。XZ 解码链路本身是好的（有单测），等有可固定 URL + 校验和的下载点再放开。Ubuntu 24.04 覆盖同一个「glibc + apt」需求 |
+| 清华 TUNA 镜像 | 本机实测对 `alpine/` 和 `ubuntu-cdimage/` 都返回 403（页面明说「您目前无法访问此页面」），疑似按来源 IP 拦。已从默认降到备选，默认改用 USTC |
+| Alpine on arm64 | x86_64 上被 musl 的裸 `fork` 撞上 zygote seccomp（已在目录里按 ABI 屏蔽）。arm64 无 `__NR_fork` 所以理论上没问题，但**没有实机验证过** |
 | Agent 主循环端到端 | 未接模型，只有单测 |
 | 快照/回滚在设备上 | 只有单测通过，未在真机 workspace 上跑过 |
 
@@ -160,11 +190,34 @@ tool/build_proot.sh arm64-v8a x86_64
 flutter build apk
 ```
 
+**Windows 上的一个坑**：`android/gradle.properties` 里有一条
+`kotlin.incremental=false`。不加这条，`:shared_preferences_android:compileDebugKotlin`
+必然失败在 `Could not close incremental caches ... *.tab`（删缓存、停 daemon、
+改 in-process 策略都不管用）。报错落在插件模块上，和本项目的 Kotlin 代码无关。
+
 **跳过第二步会怎样**：APK 照样能编能装，但没有 proot 就没有 L1 路径隔离，
 app 进降级模式（接 Android 自带的 `/system/bin/sh`，没有包管理器），
 UI 上有橙色横幅说明。不会变成一个难以定位的静默故障，但也确实少了半个产品。
 
-许可证与第三方组件义务见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+---
+
+## 许可证
+
+Burrow 自身的源码采用 **[Apache License 2.0](LICENSE)** ——
+可以自由使用、修改、再分发，包括商用；带专利授权；要求保留版权声明，
+并在改动过的文件上注明改动。
+
+仓库里和 APK 里还有几样第三方组件，它们**保留各自原本的许可证**：
+
+| 组件 | 许可证 | 形式 |
+|---|---|---|
+| `android/.../cpp/pty.c` | Apache-2.0 | 派生自 termux-app 的 `terminal-emulator`（该库是 termux LICENSE.md 里明确列出的 GPLv3 例外） |
+| proot | GPL-2.0 | 随 APK 分发的独立可执行文件，`execve` 调起，不与 app 代码链接 |
+| talloc | LGPL-3.0 | 静态链接进 proot |
+| 发行版 rootfs | 各软件包各自的许可证 | 运行时下载，不随 APK 分发 |
+
+**分发 APK 前请读 [THIRD_PARTY.md](THIRD_PARTY.md)。** 里面写清了 proot 的
+GPL 源码提供义务 —— 那条义务落在分发者身上，和 Burrow 自己是什么许可证无关。
 
 ### 本机网络须知
 

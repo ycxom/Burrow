@@ -305,10 +305,10 @@ class _SettingsPageState extends State<SettingsPage> {
             title: 'Agent 与终端',
             subtitle: '控制本地命令的执行边界',
           ),
-          Card(
+          const Card(
             clipBehavior: Clip.antiAlias,
             child: Column(
-              children: const [
+              children: [
                 ListTile(
                   leading: Icon(Icons.shield_outlined),
                   title: Text('沙箱模式'),

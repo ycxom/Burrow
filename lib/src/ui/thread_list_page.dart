@@ -65,7 +65,9 @@ class _ThreadListPageState extends State<ThreadListPage> {
                     SizedBox(height: 16),
                     Text('还没有任务', style: TextStyle(fontSize: 20)),
                     SizedBox(height: 8),
-                    Text('创建任务后，可以聊天、调用终端并随时回滚检查点。',
+                    Text(
+                        '新建对话可以直接聊天；勾上「终端模式」'
+                        '模型就能在沙箱里跑命令，随时回滚。',
                         textAlign: TextAlign.center),
                   ],
                 ),
@@ -78,9 +80,23 @@ class _ThreadListPageState extends State<ThreadListPage> {
             separatorBuilder: (_, __) => const SizedBox(height: 6),
             itemBuilder: (context, index) {
               final thread = threads[index];
+              // 头像分两种：开了终端模式的会话能动手改东西，普通聊天不能。
+              // 这个区别值得在列表上一眼看出来 —— 翻旧会话时要先知道
+              // 「这个对话里模型有没有跑过命令」。
+              final scheme = Theme.of(context).colorScheme;
               return Card(
                 child: ListTile(
-                  leading: const CircleAvatar(child: Icon(Icons.terminal)),
+                  leading: CircleAvatar(
+                    backgroundColor: thread.terminalMode
+                        ? scheme.primaryContainer
+                        : scheme.surfaceContainerHighest,
+                    foregroundColor: thread.terminalMode
+                        ? scheme.onPrimaryContainer
+                        : scheme.onSurfaceVariant,
+                    child: Icon(thread.terminalMode
+                        ? Icons.terminal
+                        : Icons.chat_bubble_outline),
+                  ),
                   title: Text(thread.title, maxLines: 1),
                   subtitle: Text(thread.preview, maxLines: 2),
                   trailing: const Icon(Icons.chevron_right),

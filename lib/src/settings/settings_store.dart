@@ -58,18 +58,28 @@ const providerPresets = <ProviderPreset>[
 ];
 
 class SettingsStore extends ChangeNotifier {
-  SettingsStore._(this._config, this._provider, this._prefs, this._secure);
+  SettingsStore._(this._config, this._provider, this._terminalModeDefault,
+      this._prefs, this._secure);
 
   static const _keyName = 'burrow.llm.apiKey';
   static const _prefix = 'burrow.llm.';
+  static const _keyTerminalDefault = 'burrow.terminalMode.default';
 
   LlmConfig _config;
   String _provider;
+  bool _terminalModeDefault;
   final SharedPreferences? _prefs;
   final FlutterSecureStorage? _secure;
 
   LlmConfig get config => _config;
   String get provider => _provider;
+
+  /// 新建会话时终端模式的初值 = 上一次的选择。
+  ///
+  /// 每个会话自己存开关（见 ChatThread.terminalMode），但新会话总得有个
+  /// 起点。固定成「关」的话，主要拿它当 Agent 用的人每开一个新对话都要
+  /// 重勾一次；跟着上次走则两类用户都只在真正切换用途时动手。
+  bool get terminalModeDefault => _terminalModeDefault;
 
   static Future<SettingsStore> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -86,9 +96,17 @@ class SettingsStore extends ChangeNotifier {
         streamOutput: prefs.getBool('${_prefix}streamOutput') ?? true,
       ),
       prefs.getString('${_prefix}provider') ?? 'OpenAI',
+      prefs.getBool(_keyTerminalDefault) ?? false,
       prefs,
       secure,
     );
+  }
+
+  Future<void> setTerminalModeDefault(bool on) async {
+    if (_terminalModeDefault == on) return;
+    _terminalModeDefault = on;
+    notifyListeners();
+    await _prefs?.setBool(_keyTerminalDefault, on);
   }
 
   Future<void> save(

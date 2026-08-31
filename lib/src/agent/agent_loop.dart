@@ -101,6 +101,18 @@ class AgentLoop {
   ApprovalMode mode;
   SandboxLevel sandboxLevel;
 
+  /// 终端模式：给不给模型沙箱工具。
+  ///
+  /// 关着的时候这就是一个普通聊天 app —— 不发 tool schema、不打检查点、
+  /// 不碰文件系统。这不只是省 token（一整套 schema 每轮上千）：
+  /// 大量模型只要看见工具就倾向于调，用户问「Rust 的所有权是什么意思」
+  /// 也会先 `ls` 一遍 workspace。把工具收走是唯一可靠的关法。
+  ///
+  /// 开启的前提是发行版基座已经装好 —— 没有 rootfs 时 exec 会落到
+  /// Android 自带的 mksh 上，那里面没有包管理器也没有路径隔离，
+  /// 模型会对着一堆「command not found」原地打转。UI 负责挡这一步。
+  bool terminalMode;
+
   /// 全量历史。**永不删除** —— overflow 只控制哪些进 prompt。
   final List<ChatMessage> history = [];
 
@@ -123,6 +135,7 @@ class AgentLoop {
     required this.outputArchiveDir,
     this.mode = ApprovalMode.onRequest,
     this.sandboxLevel = SandboxLevel.workspaceWrite,
+    this.terminalMode = false,
     this.maxToolRounds = 24,
   });
 
@@ -131,9 +144,14 @@ class AgentLoop {
     // 每个 turn 开头自动打检查点。绝大多数 turn 没改文件，diff 为空，
     // checkpoint() 直接返回 null 且不推进代号 —— 所以这是免费的。
     // 它换来的是「任何一轮都能整体撤销」这个非常好用的性质。
-    final cp = await snapshots.checkpoint(reason: _brief(userInput));
-    if (cp != null) {
-      host.onStatus('检查点 #${cp.generation}（${cp.changes.length} 处变更）');
+    //
+    // 聊天模式下连扫描都省掉：那一轮里没有任何东西能改文件，
+    // 而扫 workspace 是真的要走一遍磁盘的，手机上不该白付这个钱。
+    if (terminalMode) {
+      final cp = await snapshots.checkpoint(reason: _brief(userInput));
+      if (cp != null) {
+        host.onStatus('检查点 #${cp.generation}（${cp.changes.length} 处变更）');
+      }
     }
 
     history.add(ChatMessage(
@@ -205,7 +223,13 @@ class AgentLoop {
   /// 无限重试只会烧掉配额；报错让用户看见、让 guard 记下 hits+1，
   /// 下一轮的收紧系数会更狠。
   Future<LlmTurn> _completeWithRetry() async {
-    var messages = overflow.buildWindow(history);
+    // 人格提示每次现拼，不进 history —— 进了就会被一起持久化，
+    // 于是每次开线程都多出一条旧的、可能还是另一个模式下写的提示。
+    var messages = <ChatMessage>[
+      ChatMessage(role: 'system', content: _persona(), at: DateTime.now()),
+      ...overflow.buildWindow(history),
+    ];
+    final tools = terminalMode ? allToolSpecs : const <ToolSpec>[];
 
     for (var attempt = 0; attempt < 2; attempt++) {
       final budget = limitGuard.budgetFor(llm.limitKey);
@@ -214,7 +238,7 @@ class AgentLoop {
       try {
         return await llm.complete(
           messages: messages,
-          tools: allToolSpecs,
+          tools: tools,
           onDelta: host.onAssistantDelta,
         );
       } on ContextOverflowException catch (e) {
@@ -227,7 +251,10 @@ class AgentLoop {
         );
         if (newBudget <= 0 || attempt == 1) rethrow;
         host.onStatus('服务端上下文窗口比预期小，已按 $newBudget token 重新裁剪');
-        messages = _trimTo(overflow.buildWindow(history), newBudget);
+        messages = _trimTo([
+          ChatMessage(role: 'system', content: _persona(), at: DateTime.now()),
+          ...overflow.buildWindow(history),
+        ], newBudget);
       }
     }
     throw StateError('unreachable');
@@ -261,6 +288,14 @@ class AgentLoop {
   // -------------------------------------------------------------------------
 
   Future<ToolResult> _dispatch(ToolCall call) async {
+    // 聊天模式下压根没发过 tool schema，能走到这里说明模型自己编了一个
+    // 调用（本地小模型很常见）。当成普通拒绝返回，而不是抛异常 ——
+    // 抛出去整个回合就废了，返回一句话模型下一轮就会改用文字回答。
+    if (!terminalMode) {
+      return const ToolResult.rejected('当前是聊天模式，没有任何工具可用。需要执行命令或读写文件的话，'
+          '请让用户在输入框下方勾选「终端模式」。');
+    }
+
     // 只读工具走快路：不判策略、不打检查点。
     if (readOnlyTools.contains(call.name)) {
       return runReadOnlyTool(call, sandbox.workspacePath);
@@ -399,6 +434,8 @@ class AgentLoop {
       caps: sandbox.caps,
       spawner: sandbox.spawner,
       distroReady: sandbox.distroReady,
+      distroLabel: sandbox.distroLabel,
+      packageManager: sandbox.packageManager,
       launcherPath: sandbox.launcherPath,
       prootPath: sandbox.prootPath,
       prootLoaderPath: sandbox.prootLoaderPath,
@@ -446,6 +483,46 @@ class AgentLoop {
   }
 
   // -------------------------------------------------------------------------
+
+  /// 系统提示。两个模式给两份，差别不只是措辞。
+  ///
+  /// 聊天模式那份要**明确说出「我现在没有工具」**。不说的话模型会按训练里
+  /// 的习惯承诺「我来帮你跑一下」，然后什么都没发生 —— 用户看到的是一个
+  /// 会撒谎的助手，而实际上只是没人告诉它手被绑着。顺带把开关在哪告诉它，
+  /// 这样它能自己引导用户去勾。
+  String _persona() {
+    if (!terminalMode) {
+      return '你是 Burrow，一个装在手机上的助手。\n'
+          '当前是**聊天模式**：你没有任何工具，不能执行命令、'
+          '不能读写文件、不能联网。需要这些能力时，直接告诉用户'
+          '「在输入框下方勾选『终端模式』」，不要假装自己已经执行了什么。\n'
+          '回答用中文，简洁、直接，别铺排套话。';
+    }
+
+    final distro =
+        sandbox.distroLabel.isEmpty ? '一个 Linux 发行版' : sandbox.distroLabel;
+    final pm = sandbox.packageManager.isEmpty
+        ? '见 /etc/os-release'
+        : sandbox.packageManager;
+    final env = sandbox.distroReady
+        ? '$distro（包管理器 $pm）'
+        : 'Android 自带的 mksh（**没有**包管理器，绝大多数命令不存在）';
+
+    return '你是 Burrow，一个装在手机上的编程 Agent。\n'
+        '你的命令跑在 $env 里，工作目录是 /workspace，'
+        '和用户手机的其它部分隔离。\n'
+        '\n'
+        '几条硬规则：\n'
+        '1. 改文件用 write_file / apply_patch，别用 `cat >` `sed -i` —— '
+        '专用工具的改动能被精确回滚，shell 里的不能。\n'
+        '2. 动手做有风险的改动前先 checkpoint。搞砸了直接 rollback，'
+        '回滚很便宜，不要在坏状态上继续修补。\n'
+        '3. 默认断网。命令报网络不通多半是沙箱拦的，不是网络故障，'
+        '别反复重试 —— 装包这类需要联网的操作照常发起，外层会自动放行。\n'
+        '4. 命令输出会被压缩后给你，需要细节用 grep_output 按 ref 查，'
+        '别为了看全量输出重跑一遍命令。\n'
+        '回答用中文，简洁、直接。';
+  }
 
   List<MemoryDoc> _corpus() => [
         for (var i = 0; i < overflow.checkpoint && i < history.length; i++)

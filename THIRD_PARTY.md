@@ -1,6 +1,10 @@
 # 第三方组件与许可证
 
-Burrow 会**随 APK 分发**下列第三方程序。分发 APK 的人需要连带满足它们的许可证义务，
+Burrow **自身的源码是 Apache-2.0**（见 [LICENSE](LICENSE)）。
+下面这些是别人的东西，**各自保留原本的许可证** —— 已经以 Apache-2.0 / GPL
+发布的代码不会因为被放进这个仓库就改变许可条款。
+
+Burrow 会**随 APK 分发**其中一部分。分发 APK 的人需要连带满足它们的许可证义务，
 所以这里把来源、许可证和义务写清楚。
 
 ---
@@ -66,6 +70,12 @@ Apache-2.0 要求保留版权声明与许可证提示，`pty.c` 文件头已包�
 |---|---|---|
 | Alpine Linux | <https://dl-cdn.alpinelinux.org/> | 各软件包各自的许可证（多为 MIT / BSD / GPL） |
 | Ubuntu Base | <https://cdimage.ubuntu.com/ubuntu-base/> | 同上 |
+| Debian | <https://github.com/debuerreotype/docker-debian-artifacts> | 同上 |
+
+用户可以在安装页选下载源（大陆镜像 / 国际镜像）。**换源不影响安全性**：
+sha256 校验的是文件内容，镜像提供的是同一份字节，改一个字节就过不了校验。
+换源同时会把 rootfs 里的 `sources.list` / `apk/repositories` 一起写成
+对应镜像，否则装完基座之后 `apt update` 又回到慢的那条线路上。
 
 下载地址与 sha256 硬编码在 `lib/src/bootstrap/distro.dart` 里，
 每次下载都强制校验（见 ARCHITECTURE.md §2.3）。
