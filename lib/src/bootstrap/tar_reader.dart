@@ -39,6 +39,7 @@ enum TarEntryType {
   directory,
   symlink,
   hardlink,
+
   /// 设备节点 / fifo / socket —— 无 root 建不了，一律跳过。
   unsupported,
 }
@@ -78,8 +79,7 @@ class _ByteStreamReader {
   var _done = false;
   var _consumed = 0;
 
-  _ByteStreamReader(Stream<List<int>> stream)
-      : _it = StreamIterator(stream);
+  _ByteStreamReader(Stream<List<int>> stream) : _it = StreamIterator(stream);
 
   /// 已消费的字节数，用于估算进度。
   int get consumed => _consumed;
@@ -131,12 +131,15 @@ class TarReader {
   /// 遇到设备节点等建不了的类型时调用 [onSkipped] 而不是抛异常：
   /// 一个 `/dev/null` 建不出来不该让整个发行版解压失败。
   static Future<void> extract(
-    Stream<List<int>> gzippedStream, {
+    Stream<List<int>> inputStream, {
+    bool gzipCompressed = true,
     required Future<void> Function(TarEntry entry, Uint8List? content) onEntry,
     void Function(TarEntry entry, String reason)? onSkipped,
     void Function(int bytesRead)? onProgress,
   }) async {
-    final reader = _ByteStreamReader(gzippedStream.transform(gzip.decoder));
+    final reader = _ByteStreamReader(
+      gzipCompressed ? inputStream.transform(gzip.decoder) : inputStream,
+    );
 
     // GNU 'L'/'K' 和 PAX 会给**下一个**条目提供覆盖值，读到后暂存在这里。
     String? pendingLongName;
@@ -163,17 +166,20 @@ class TarReader {
 
         // --- 元数据条目：读完内容后 continue，不产出 TarEntry ---
 
-        if (typeflag == 0x4C) { // 'L' GNU long name
+        if (typeflag == 0x4C) {
+          // 'L' GNU long name
           final body = await reader.read(dataBlocks);
           pendingLongName = _cstr(body!.sublist(0, size));
           continue;
         }
-        if (typeflag == 0x4B) { // 'K' GNU long link
+        if (typeflag == 0x4B) {
+          // 'K' GNU long link
           final body = await reader.read(dataBlocks);
           pendingLongLink = _cstr(body!.sublist(0, size));
           continue;
         }
-        if (typeflag == 0x78 || typeflag == 0x67) { // 'x' / 'g' PAX
+        if (typeflag == 0x78 || typeflag == 0x67) {
+          // 'x' / 'g' PAX
           final body = await reader.read(dataBlocks);
           final pax = _parsePax(body!.sublist(0, size));
           // 'g' 是全局的，'x' 只作用于下一条。这里一律当成只作用于下一条 ——
@@ -211,7 +217,10 @@ class TarReader {
         }
 
         final type = switch (typeflag) {
-          0x30 || 0x00 || 0x37 => TarEntryType.regular, // '0', NUL, '7'(contiguous)
+          0x30 ||
+          0x00 ||
+          0x37 =>
+            TarEntryType.regular, // '0', NUL, '7'(contiguous)
           0x31 => TarEntryType.hardlink, // '1'
           0x32 => TarEntryType.symlink, // '2'
           0x35 => TarEntryType.directory, // '5'

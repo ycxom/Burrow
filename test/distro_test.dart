@@ -97,8 +97,7 @@ void main() {
       // 消费完整个流；抛异常就是这条用例失败
     }
 
-    expect(await mgr.isInstalled(d), isTrue,
-        reason: '根路径经软链可达不该被当成越界');
+    expect(await mgr.isInstalled(d), isTrue, reason: '根路径经软链可达不该被当成越界');
     final rootfs = mgr.rootfsDirFor(d);
     expect(await Directory('${rootfs.path}/tmp').exists(), isTrue);
     expect(await File('${rootfs.path}/usr/bin/busybox').exists(), isTrue);
@@ -154,12 +153,48 @@ void main() {
     expect(meta['files'], greaterThan(0));
   });
 
-  test('目录里 blocked 的项拒绝安装并说明原因', () async {
-    final mgr = _manager(Directory('${tmp.path}/distros'), File('nope'));
-    await expectLater(
-      mgr.install(DistroCatalog.debian).drain<void>(),
-      throwsA(isA<DistroInstallException>()),
-    );
+  test('Debian 已启用 XZ rootfs 并固定校验和', () {
+    expect(DistroCatalog.debian.isAvailableOn('arm64-v8a'), isTrue);
+    expect(DistroCatalog.debian.rootfsUrls['arm64-v8a'], endsWith('.tar.xz'));
+    expect(DistroCatalog.debian.sha256['arm64-v8a'], hasLength(64));
+  });
+
+  test('每个可安装基座同时提供大陆和国际来源', () {
+    for (final distro in DistroCatalog.installableFor('arm64-v8a')) {
+      expect(distro.sources.any((s) => s.region == MirrorRegion.china), isTrue,
+          reason: '${distro.displayName} 缺少中国大陆来源');
+      expect(distro.sources.any((s) => s.region == MirrorRegion.international),
+          isTrue,
+          reason: '${distro.displayName} 缺少国际来源');
+      expect(
+          distro.sources.any((s) =>
+              s.region == MirrorRegion.international &&
+              s.displayName.contains('官方')),
+          isTrue,
+          reason: '${distro.displayName} 缺少明确标注的官方来源');
+    }
+  });
+
+  test('tar.xz 会先流式解码再沿用安全 tar 解包流程', () async {
+    if (!await _hasTar()) {
+      markTestSkipped('系统上没有可用的 tar');
+      return;
+    }
+    final src = Directory('${tmp.path}/xz-src')..createSync();
+    File('${src.path}/hello').writeAsStringSync('debian-ready');
+    final archive = File('${tmp.path}/rootfs.tar.xz');
+    final made =
+        await Process.run('tar', ['-cJf', archive.path, '-C', src.path, '.']);
+    if (made.exitCode != 0) {
+      markTestSkipped('当前系统 tar 不支持 xz');
+      return;
+    }
+
+    final mgr = _manager(Directory('${tmp.path}/xz-distros'), archive);
+    final d = _testDistro('https://example.invalid/rootfs.tar.xz');
+    await mgr.install(d).drain<void>();
+    expect(await File('${mgr.rootfsDirFor(d).path}/hello').readAsString(),
+        'debian-ready');
   });
 
   test('按 ABI 屏蔽：同一个发行版可以只在某些架构上不可用', () {
@@ -171,8 +206,7 @@ void main() {
     expect(alpine.blockedReasonFor('x86_64'), contains('fork'));
     expect(alpine.blockedReasonFor('arm64-v8a'), isNull);
 
-    // 全局 blocked 的项在任何架构上都不可用
-    expect(DistroCatalog.debian.isAvailableOn('arm64-v8a'), isFalse);
+    expect(DistroCatalog.debian.isAvailableOn('arm64-v8a'), isTrue);
 
     // 每个受支持的架构都必须至少剩一个能装的，否则用户会看到一个空列表
     for (final abi in ['arm64-v8a', 'x86_64']) {

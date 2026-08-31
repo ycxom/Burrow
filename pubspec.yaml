@@ -10,6 +10,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_localizations:
+    sdk: flutter
 
   # 终端模拟与渲染。纯 Dart 实现，接原生 pty 的字节流。
   # 不用 termux 的 TerminalView（Android View）—— 见 docs/ARCHITECTURE.md §3。
@@ -29,6 +31,11 @@ dependencies:
 
   # LLM 流式响应
   http: ^1.2.1
+  shared_preferences: ^2.5.5
+  flutter_secure_storage: 10.3.1
+  flutter_markdown_plus: ^1.0.12
+  # Debian 官方 rootfs 使用 tar.xz；流式解成临时 tar 后复用安全 tar 解包器。
+  archive: ^4.0.9
 
 dev_dependencies:
   flutter_test:

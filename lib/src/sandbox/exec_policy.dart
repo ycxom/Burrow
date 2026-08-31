@@ -55,8 +55,9 @@ class PolicyVerdict {
         decision: Decision.max(decision, other.decision),
         scope: scope.index >= other.scope.index ? scope : other.scope,
         reason: decision.index >= other.decision.index ? reason : other.reason,
-        matchedRule:
-            decision.index >= other.decision.index ? matchedRule : other.matchedRule,
+        matchedRule: decision.index >= other.decision.index
+            ? matchedRule
+            : other.matchedRule,
       );
 }
 
@@ -137,7 +138,8 @@ class ExecPolicy {
 
     // 重定向就是写盘，哪怕命令本身是只读的：`cat a > b` 里的 cat 无辜，
     // `> b` 不无辜。规则表是按命令组织的，覆盖不到这一层，单独判。
-    final redirects = argv.any((t) => t == '>' || t == '>>' || t.startsWith('>'));
+    final redirects =
+        argv.any((t) => t == '>' || t == '>>' || t.startsWith('>'));
 
     PolicyVerdict? best;
     for (final rule in rules) {
@@ -245,9 +247,32 @@ class ExecPolicy {
   static final List<PrefixRule> defaultRules = [
     // ---- 只读，放行且不打检查点 ----
     for (final cmd in const [
-      'ls', 'cat', 'head', 'tail', 'grep', 'rg', 'find', 'file', 'stat',
-      'wc', 'diff', 'which', 'pwd', 'echo', 'date', 'env', 'uname',
-      'df', 'du', 'ps', 'top', 'tree', 'sort', 'uniq', 'awk', 'sed',
+      'ls',
+      'cat',
+      'head',
+      'tail',
+      'grep',
+      'rg',
+      'find',
+      'file',
+      'stat',
+      'wc',
+      'diff',
+      'which',
+      'pwd',
+      'echo',
+      'date',
+      'env',
+      'uname',
+      'df',
+      'du',
+      'ps',
+      'top',
+      'tree',
+      'sort',
+      'uniq',
+      'awk',
+      'sed',
     ])
       PrefixRule([cmd], decision: Decision.allow, scope: WriteScope.none),
 
@@ -259,7 +284,8 @@ class ExecPolicy {
 
     // ---- git：读放行，写打点，破坏性的问 ----
     for (final sub in const ['status', 'log', 'diff', 'show', 'branch'])
-      PrefixRule(['git', sub], decision: Decision.allow, scope: WriteScope.none),
+      PrefixRule(['git', sub],
+          decision: Decision.allow, scope: WriteScope.none),
     const PrefixRule(['git', 'add'],
         decision: Decision.allow, scope: WriteScope.workspace),
     const PrefixRule(['git', 'commit'],
@@ -286,7 +312,15 @@ class ExecPolicy {
         justification: 'push 是对外操作，改动会离开本机'),
 
     // ---- 包管理：走 prefix 那条快照路 ----
-    for (final mgr in const ['pkg', 'apt', 'apt-get', 'dpkg', 'pip', 'pip3', 'npm'])
+    for (final mgr in const [
+      'pkg',
+      'apt',
+      'apt-get',
+      'dpkg',
+      'pip',
+      'pip3',
+      'npm'
+    ])
       PrefixRule([mgr],
           decision: Decision.prompt,
           scope: WriteScope.prefix,
@@ -310,10 +344,8 @@ class ExecPolicy {
     const PrefixRule(['mkfs'],
         decision: Decision.forbidden, justification: '格式化设备'),
     const PrefixRule(['dd'],
-        decision: Decision.forbidden,
-        justification: 'dd 可绕过一切路径检查直写块设备'),
-    const PrefixRule(['su'],
-        decision: Decision.forbidden, justification: '提权'),
+        decision: Decision.forbidden, justification: 'dd 可绕过一切路径检查直写块设备'),
+    const PrefixRule(['su'], decision: Decision.forbidden, justification: '提权'),
     const PrefixRule(['sudo'],
         decision: Decision.forbidden, justification: '提权'),
     const PrefixRule(['chmod', '-R', '777', '/'],

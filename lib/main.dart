@@ -17,12 +17,15 @@ import 'src/context/context_limit_guard.dart';
 import 'src/context/memory_retrieval.dart';
 import 'src/context/output_distiller.dart';
 import 'src/context/overflow_manager.dart';
+import 'src/data/chat_store.dart';
+import 'src/data/task_runtime.dart';
 import 'src/llm/llm_client.dart';
 import 'src/sandbox/exec_policy.dart';
 import 'src/sandbox/prefix_generations.dart';
 import 'src/sandbox/pty_channel.dart';
 import 'src/sandbox/sandbox_session.dart';
 import 'src/sandbox/snapshot_store.dart';
+import 'src/settings/settings_store.dart';
 import 'src/ui/app.dart';
 
 Future<void> main() async {
@@ -129,12 +132,8 @@ Future<void> _boot({
   required _NativeBits native,
 }) async {
   final sandboxRoot = Directory('${files.path}/sandbox');
-  final workspace = Directory('${sandboxRoot.path}/workspace');
-  final archive = Directory('${sandboxRoot.path}/outputs');
   // proot 要一个可写的宿主临时目录来落 loader，见 SandboxSession.tmpPath。
   final tmp = Directory('${sandboxRoot.path}/tmp');
-  await workspace.create(recursive: true);
-  await archive.create(recursive: true);
   await tmp.create(recursive: true);
 
   // 环境代管理挂在当前发行版的 rootfs 上。没装发行版时给一个占位目录，
@@ -165,58 +164,69 @@ Future<void> _boot({
 
   final spawner = PtyChannel();
 
-  final snapshots = SnapshotStore(
-    workspace: workspace,
-    metaRoot: Directory('${sandboxRoot.path}/meta'),
-  );
-  await snapshots.open();
-
-  final sandbox = SandboxSession(
-    rootfsPath: active?.rootfs.path ?? '',
-    workspacePath: workspace.path,
-    caps: caps,
-    spawner: spawner,
-    distroReady: active != null,
-    launcherPath: native.launcher,
-    prootPath: native.proot,
-    prootLoaderPath: native.prootLoader,
-    prootLoader32Path: native.prootLoader32,
-    tmpPath: tmp.path,
-  );
+  Future<TaskRuntime> buildRuntime(String taskId) async {
+    final root = taskRootFor(sandboxRoot, taskId);
+    final workspace = Directory('${root.path}/workspace');
+    await workspace.create(recursive: true);
+    await Directory('${root.path}/outputs').create(recursive: true);
+    final snapshots = SnapshotStore(
+      workspace: workspace,
+      metaRoot: Directory('${root.path}/meta'),
+    );
+    await snapshots.open();
+    return TaskRuntime(
+      id: taskId,
+      root: root,
+      snapshots: snapshots,
+      sandbox: SandboxSession(
+        rootfsPath: active?.rootfs.path ?? '',
+        workspacePath: workspace.path,
+        caps: caps,
+        spawner: spawner,
+        distroReady: active != null,
+        launcherPath: native.launcher,
+        prootPath: native.proot,
+        prootLoaderPath: native.prootLoader,
+        prootLoader32Path: native.prootLoader32,
+        tmpPath: tmp.path,
+      ),
+    );
+  }
 
   // LLM 客户端等设置页配置完成后才可用。没配也要能进主界面 ——
   // 手动开终端、看检查点这些都不依赖模型。
-  final llm = ConfigurableLlmClient();
-
-  final overflow = OverflowManager(
-    summarize: llm.summarize,
-    // 手机上默认按 token 触发而不是消息数：本地模型窗口小，
-    // 20 条带命令输出的消息就能撑爆一个 4k 窗口，而 20 条闲聊撑不爆。
-    trigger: OverflowTrigger.either,
-    messageThreshold: 30,
-    tokenThreshold: 4000,
-  );
+  final settings = await SettingsStore.load();
+  final chats = await ChatStore.open();
+  final llm = ConfigurableLlmClient(config: settings.config);
 
   runApp(BurrowApp(
-    buildAgent: (host) => AgentLoop(
+    buildRuntime: buildRuntime,
+    buildAgent: (host, runtime) => AgentLoop(
       llm: llm,
       host: host,
       // 包管理器的名字随发行版变（apk / apt），策略表要跟着走。
       policy: ExecPolicy(),
-      sandbox: sandbox,
-      snapshots: snapshots,
+      sandbox: runtime.sandbox,
+      snapshots: runtime.snapshots,
       prefixGens: gens,
-      overflow: overflow,
+      overflow: OverflowManager(
+        summarize: llm.summarize,
+        trigger: OverflowTrigger.either,
+        messageThreshold: 30,
+        tokenThreshold: 4000,
+      ),
       retrieval: MemoryRetrieval(),
       distiller: OutputDistiller(),
       limitGuard: ContextLimitGuard(),
-      outputArchiveDir: archive,
+      outputArchiveDir:
+          Directory('${sandboxRoot.path}/tasks/${runtime.id}/outputs'),
     ),
     capabilities: caps,
-    snapshots: snapshots,
     prefixGens: gens,
     spawner: spawner,
-    sandbox: sandbox,
     activeDistro: active,
+    llm: llm,
+    settings: settings,
+    chats: chats,
   ));
 }

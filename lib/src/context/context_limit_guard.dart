@@ -116,7 +116,8 @@ class ContextLimitGuard {
     RegExp(r'"context_length"\s*:\s*(\d+)', caseSensitive: false),
     RegExp(r'context size\s*\(?\s*(\d+)', caseSensitive: false),
     RegExp(r'context length is\s*(\d+)', caseSensitive: false),
-    RegExp(r'context (?:length|window) of (?:only )?(\d+)', caseSensitive: false),
+    RegExp(r'context (?:length|window) of (?:only )?(\d+)',
+        caseSensitive: false),
     RegExp(r'maximum(?:\s+\w+)?\s+(\d+)\s+tokens', caseSensitive: false),
   ];
 

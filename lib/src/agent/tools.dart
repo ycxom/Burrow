@@ -45,7 +45,13 @@ class ToolResult {
         rejected = true;
 }
 
-const readOnlyTools = {'read_file', 'list_dir', 'grep', 'grep_output', 'recall_memory'};
+const readOnlyTools = {
+  'read_file',
+  'list_dir',
+  'grep',
+  'grep_output',
+  'recall_memory'
+};
 
 // ---------------------------------------------------------------------------
 // 定义
@@ -54,8 +60,10 @@ const readOnlyTools = {'read_file', 'list_dir', 'grep', 'grep_output', 'recall_m
 Map<String, Object?> _obj(Map<String, Object?> props, List<String> required) =>
     {'type': 'object', 'properties': props, 'required': required};
 
-Map<String, Object?> _str(String desc) => {'type': 'string', 'description': desc};
-Map<String, Object?> _int(String desc) => {'type': 'integer', 'description': desc};
+Map<String, Object?> _str(String desc) =>
+    {'type': 'string', 'description': desc};
+Map<String, Object?> _int(String desc) =>
+    {'type': 'integer', 'description': desc};
 
 final allToolSpecs = <ToolSpec>[
   ToolSpec(
@@ -67,47 +75,66 @@ final allToolSpecs = <ToolSpec>[
     _obj({
       'command': _str('要执行的命令行'),
       'timeout': _int('超时秒数，默认 300'),
-    }, ['command']),
+    }, [
+      'command'
+    ]),
   ),
-
-  ToolSpec('read_file', '读取 workspace 内的文件',
-      _obj({'path': _str('相对 workspace 的路径'), 'offset': _int('起始行，从 1 开始'), 'limit': _int('读多少行，默认 2000')}, ['path'])),
-
-  ToolSpec('list_dir', '列出目录内容',
-      _obj({'path': _str('相对 workspace 的路径，默认 .')}, [])),
-
-  ToolSpec('grep', '在 workspace 内按正则搜索文件内容',
-      _obj({'pattern': _str('正则'), 'path': _str('搜索起点，默认 .'), 'glob': _str('文件名过滤，如 *.dart')}, ['pattern'])),
-
+  ToolSpec(
+      'read_file',
+      '读取 workspace 内的文件',
+      _obj({
+        'path': _str('相对 workspace 的路径'),
+        'offset': _int('起始行，从 1 开始'),
+        'limit': _int('读多少行，默认 2000')
+      }, [
+        'path'
+      ])),
+  ToolSpec(
+      'list_dir', '列出目录内容', _obj({'path': _str('相对 workspace 的路径，默认 .')}, [])),
+  ToolSpec(
+      'grep',
+      '在 workspace 内按正则搜索文件内容',
+      _obj({
+        'pattern': _str('正则'),
+        'path': _str('搜索起点，默认 .'),
+        'glob': _str('文件名过滤，如 *.dart')
+      }, [
+        'pattern'
+      ])),
   ToolSpec(
     'write_file',
     '写入文件（覆盖）。旧内容会在写入前自动存档，可精确回滚。',
-    _obj({'path': _str('相对 workspace 的路径'), 'content': _str('完整内容')}, ['path', 'content']),
+    _obj({'path': _str('相对 workspace 的路径'), 'content': _str('完整内容')},
+        ['path', 'content']),
   ),
-
   ToolSpec(
     'apply_patch',
     '对已有文件做精确替换。old 必须在文件中唯一出现，否则报错 —— '
         '这是刻意的：不唯一说明你对文件内容的理解有偏差，盲目替换会改错地方。',
-    _obj({'path': _str('相对 workspace 的路径'), 'old': _str('要被替换的原文'), 'new': _str('替换成的内容')},
-        ['path', 'old', 'new']),
+    _obj({
+      'path': _str('相对 workspace 的路径'),
+      'old': _str('要被替换的原文'),
+      'new': _str('替换成的内容')
+    }, [
+      'path',
+      'old',
+      'new'
+    ]),
   ),
-
   ToolSpec('checkpoint', '创建一个检查点。动手做有风险的改动之前调用它。',
       _obj({'reason': _str('一句话说明这个检查点对应什么阶段')}, [])),
-
   ToolSpec('list_checkpoints', '列出可回滚的检查点', _obj({}, [])),
-
   ToolSpec(
     'rollback',
     '回滚 workspace 到指定检查点。'
         '搞砸了就用它 —— 回滚很便宜，不要因为怕丢工作而在坏状态上继续修补。',
     _obj({'generation': _int('目标检查点编号')}, ['generation']),
   ),
-
-  ToolSpec('grep_output', '在某次命令的完整输出里按正则检索（输出被压缩后用这个看细节）',
-      _obj({'ref': _str('命令返回里的 ref'), 'pattern': _str('正则')}, ['ref', 'pattern'])),
-
+  ToolSpec(
+      'grep_output',
+      '在某次命令的完整输出里按正则检索（输出被压缩后用这个看细节）',
+      _obj({'ref': _str('命令返回里的 ref'), 'pattern': _str('正则')},
+          ['ref', 'pattern'])),
   ToolSpec('recall_memory', '检索被摘要挤出上下文的早期对话记录',
       _obj({'query': _str('检索关键词')}, ['query'])),
 ];
@@ -133,7 +160,9 @@ Future<ToolResult> runReadOnlyTool(ToolCall call, String workspace) async {
     switch (call.name) {
       case 'read_file':
         final f = File(resolve(call.args['path'] as String?));
-        if (!await f.exists()) return ToolResult.ok('文件不存在：${call.args['path']}');
+        if (!await f.exists()) {
+          return ToolResult.ok('文件不存在：${call.args['path']}');
+        }
         final lines = await f.readAsLines();
         final offset = ((call.args['offset'] as num?)?.toInt() ?? 1) - 1;
         final limit = (call.args['limit'] as num?)?.toInt() ?? 2000;
@@ -162,8 +191,13 @@ Future<ToolResult> runReadOnlyTool(ToolCall call, String workspace) async {
         // 交给 rg/grep 而不是在 Dart 里遍历：几万个文件时差着数量级，
         // 而且 rg 自带 .gitignore 处理。
         final args = [
-          '--line-number', '--no-heading', '--color=never',
-          if (call.args['glob'] != null) ...['--glob', call.args['glob'] as String],
+          '--line-number',
+          '--no-heading',
+          '--color=never',
+          if (call.args['glob'] != null) ...[
+            '--glob',
+            call.args['glob'] as String
+          ],
           call.args['pattern'] as String,
           resolve(call.args['path'] as String?),
         ];

@@ -125,9 +125,8 @@ class PrefixGenerations {
       final raw = jsonDecode(await _indexFile.readAsString()) as List;
       _generations
         ..clear()
-        ..addAll(raw
-            .cast<Map<String, Object?>>()
-            .map(PrefixGeneration.fromJson));
+        ..addAll(
+            raw.cast<Map<String, Object?>>().map(PrefixGeneration.fromJson));
     }
     // 上次崩在事务中间会留下 usr.staging。它一定是不完整的，清掉。
     // （TermuxInstaller 开头也做同一件事，理由相同。）
@@ -266,8 +265,8 @@ class PrefixGenerations {
   Future<void> _prune() async {
     while (_generations.length > keepGenerations) {
       final oldest = _generations.removeAt(0);
-      final dir = Directory(
-          '${_genRoot.path}/${oldest.id.toString().padLeft(6, '0')}');
+      final dir =
+          Directory('${_genRoot.path}/${oldest.id.toString().padLeft(6, '0')}');
       if (await dir.exists()) await dir.delete(recursive: true);
     }
     await _persist();

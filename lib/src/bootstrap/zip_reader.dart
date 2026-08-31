@@ -112,8 +112,7 @@ class ZipReader {
       final head = await _readAt(offset, 46);
       final b = head.buffer.asByteData();
       if (b.getUint32(0, Endian.little) != 0x02014b50) {
-        throw ZipFormatException(
-            '第 $i 个 central directory 条目签名不对（偏移 $offset）');
+        throw ZipFormatException('第 $i 个 central directory 条目签名不对（偏移 $offset）');
       }
 
       final versionMadeBy = b.getUint16(4, Endian.little);
@@ -127,7 +126,8 @@ class ZipReader {
       var localOffset = b.getUint32(42, Endian.little);
 
       final varPart = await _readAt(offset + 46, nameLen + extraLen);
-      final name = _decodeName(varPart.sublist(0, nameLen), b.getUint16(8, Endian.little));
+      final name = _decodeName(
+          varPart.sublist(0, nameLen), b.getUint16(8, Endian.little));
 
       // ZIP64 extra field：只补那些被 0xFFFFFFFF 顶满的字段，且顺序固定。
       if (uncompressedSize == 0xFFFFFFFF ||
@@ -195,8 +195,7 @@ class ZipReader {
         // 用默认的 ZLibCodec 会因为找不到 zlib 头而报 "invalid argument"。
         return Uint8List.fromList(ZLibCodec(raw: true).decode(raw));
       default:
-        throw ZipFormatException(
-            '${entry.name} 用了不支持的压缩方法 ${entry.method}'
+        throw ZipFormatException('${entry.name} 用了不支持的压缩方法 ${entry.method}'
             '（只支持 0=stored 和 8=deflate）');
     }
   }

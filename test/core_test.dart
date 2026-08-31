@@ -115,8 +115,9 @@ void main() {
           body: '{"n_ctx":4096,"n_prompt_tokens":5000,'
               '"type":"exceed_context_size_error"}',
           ourEstimate: 5000);
-      expect(g.budgetFor(ContextLimitGuard.makeKey('openai', 'cloud', 'gpt')),
-          0, reason: '另一个节点不该被裁短');
+      expect(
+          g.budgetFor(ContextLimitGuard.makeKey('openai', 'cloud', 'gpt')), 0,
+          reason: '另一个节点不该被裁短');
     });
   });
 

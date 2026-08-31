@@ -33,11 +33,31 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:archive/archive_io.dart';
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import 'tar_reader.dart';
+
+enum MirrorRegion { china, international }
+
+/// rootfs 下载地址与安装后的包管理器地址必须成对切换。
+class DistroSource {
+  final String id;
+  final String displayName;
+  final MirrorRegion region;
+  final Map<String, String> rootfsUrls;
+  final String packageBaseUrl;
+
+  const DistroSource({
+    required this.id,
+    required this.displayName,
+    required this.region,
+    required this.rootfsUrls,
+    required this.packageBaseUrl,
+  });
+}
 
 /// 一个可选的发行版。
 class Distro {
@@ -49,6 +69,9 @@ class Distro {
 
   /// 按 ABI 给出 rootfs tarball 的地址。key 是 Android 的 ABI 名。
   final Map<String, String> rootfsUrls;
+
+  /// 可由用户选择的下载源。空列表时使用 [rootfsUrls]。
+  final List<DistroSource> sources;
 
   /// 按 ABI 给出 sha256。**不是可选项** —— 这是从网上下一坨东西然后
   /// 在里面执行代码，不校验等于把设备交给任何能劫持这条连接的人。
@@ -84,6 +107,7 @@ class Distro {
     required this.displayName,
     required this.description,
     required this.rootfsUrls,
+    this.sources = const [],
     required this.sha256,
     required this.approxInstalledBytes,
     required this.packageManager,
@@ -92,6 +116,13 @@ class Distro {
   });
 
   bool supports(String abi) => rootfsUrls.containsKey(abi);
+
+  DistroSource? defaultSource(MirrorRegion region) {
+    for (final source in sources) {
+      if (source.region == region) return source;
+    }
+    return sources.isEmpty ? null : sources.first;
+  }
 }
 
 /// 内置目录。
@@ -112,6 +143,75 @@ class DistroCatalog {
       'x86_64':
           'https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz',
     },
+    sources: [
+      DistroSource(
+          id: 'alpine-tuna',
+          displayName: '清华 TUNA',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/alpine'),
+      DistroSource(
+          id: 'alpine-ustc',
+          displayName: '中科大 USTC',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.ustc.edu.cn/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://mirrors.ustc.edu.cn/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.ustc.edu.cn/alpine'),
+      DistroSource(
+          id: 'alpine-nju',
+          displayName: '南京大学 NJU',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.nju.edu.cn/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://mirrors.nju.edu.cn/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.nju.edu.cn/alpine'),
+      DistroSource(
+          id: 'alpine-official',
+          displayName: 'Alpine 官方 CDN',
+          region: MirrorRegion.international,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl: 'https://dl-cdn.alpinelinux.org/alpine'),
+      DistroSource(
+          id: 'alpine-princeton',
+          displayName: 'Princeton',
+          region: MirrorRegion.international,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirror.math.princeton.edu/pub/alpinelinux/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://mirror.math.princeton.edu/pub/alpinelinux/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl:
+              'https://mirror.math.princeton.edu/pub/alpinelinux/alpine'),
+      DistroSource(
+          id: 'alpine-rwth',
+          displayName: 'RWTH Aachen',
+          region: MirrorRegion.international,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://ftp.halifax.rwth-aachen.de/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz',
+            'x86_64':
+                'https://ftp.halifax.rwth-aachen.de/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz'
+          },
+          packageBaseUrl: 'https://ftp.halifax.rwth-aachen.de/alpine'),
+    ],
     // 取自官方 .tar.gz.sha256；x86_64 那条已用实际下载的文件复核过。
     sha256: {
       'arm64-v8a':
@@ -146,22 +246,42 @@ class DistroCatalog {
         'glibc，包管理器 apt。兼容性最好，预编译二进制基本都能跑。',
     rootfsUrls: {
       'arm64-v8a':
-          'https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-arm64v8/bookworm/rootfs.tar.xz',
+          'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/fb7215b47dab72bdbdd59204a7b7914311431d90/bookworm/rootfs.tar.xz',
       'x86_64':
-          'https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-amd64/bookworm/rootfs.tar.xz',
+          'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/2b9b380c71ad8a3b6ce55c083c9ecfb901dabf71/bookworm/rootfs.tar.xz',
     },
-    // Debian 官方不发布 .tar.gz 的 base rootfs，只有 debuerreotype 的
-    // .tar.xz。Dart 没有内置 xz 解码，而纯 Dart 的 LZMA 实现解 30MB
-    // 在手机上慢到不可用。所以这一项先标为不可用，而不是让用户点了才失败。
-    //
-    // 要放开它有两条路，都不是小工程：
-    //   (a) 原生层接 liblzma（约 150KB，NDK 编译，和 proot 一起打包）
-    //   (b) 走 Docker Registry 的匿名 token 拉 gzip 层（协议复杂，digest 会变）
-    // 在此之前 Ubuntu 已经覆盖了「要 glibc + apt」这个需求。
-    sha256: {},
+    sources: [
+      DistroSource(
+          id: 'debian-github-cn',
+          displayName: 'Debian 官方构建（大陆线路）',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/fb7215b47dab72bdbdd59204a7b7914311431d90/bookworm/rootfs.tar.xz',
+            'x86_64':
+                'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/2b9b380c71ad8a3b6ce55c083c9ecfb901dabf71/bookworm/rootfs.tar.xz'
+          },
+          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/debian'),
+      DistroSource(
+          id: 'debian-github',
+          displayName: 'Debian 官方构建',
+          region: MirrorRegion.international,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/fb7215b47dab72bdbdd59204a7b7914311431d90/bookworm/rootfs.tar.xz',
+            'x86_64':
+                'https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/2b9b380c71ad8a3b6ce55c083c9ecfb901dabf71/bookworm/rootfs.tar.xz'
+          },
+          packageBaseUrl: 'https://deb.debian.org/debian'),
+    ],
+    sha256: {
+      'arm64-v8a':
+          '202ecca447dbf1b3ac1b1e983d9363381ac6a34f8e22d7d786125d06754ebb76',
+      'x86_64':
+          '6d823876698ad6e575a82fddf4166fe4d8c326698e01f8f9aafac64004b6dc44',
+    },
     approxInstalledBytes: 120 * 1024 * 1024,
     packageManager: 'apt',
-    blockedReason: 'rootfs 只有 .tar.xz 格式，尚未支持 xz 解码',
   );
 
   static const ubuntu = Distro(
@@ -175,6 +295,52 @@ class DistroCatalog {
       'x86_64':
           'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz',
     },
+    sources: [
+      DistroSource(
+          id: 'ubuntu-tuna',
+          displayName: '清华 TUNA',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+            'x86_64':
+                'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu'),
+      DistroSource(
+          id: 'ubuntu-ustc',
+          displayName: '中科大 USTC',
+          region: MirrorRegion.china,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+            'x86_64':
+                'https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.ustc.edu.cn/ubuntu'),
+      DistroSource(
+          id: 'ubuntu-official',
+          displayName: 'Canonical 官方',
+          region: MirrorRegion.international,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+            'x86_64':
+                'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          },
+          packageBaseUrl: 'https://ports.ubuntu.com/ubuntu-ports'),
+      DistroSource(
+          id: 'ubuntu-mit',
+          displayName: 'MIT',
+          region: MirrorRegion.international,
+          rootfsUrls: {
+            'arm64-v8a':
+                'https://mirrors.mit.edu/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+            'x86_64':
+                'https://mirrors.mit.edu/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          },
+          packageBaseUrl: 'https://mirrors.mit.edu/ubuntu'),
+    ],
     // 取自 cdimage 的 SHA256SUMS。**版本号是路径的一部分**，
     // Ubuntu 会在同一个 24.04 目录下不断发新的点版本（.3 / .4 …），
     // 老的会被清掉 —— 所以升级点版本时 URL 和校验和必须一起改。
@@ -273,17 +439,17 @@ class DistroManager {
   /// 全程在 staging 目录里做，最后**原子 rename** 成 rootfs ——
   /// 和 PrefixGenerations 用的是同一招（也是 TermuxInstaller 的原始手法）：
   /// 中途失败等于什么都没发生，绝不留下半个环境。
-  Stream<DistroProgress> install(Distro d) async* {
+  Stream<DistroProgress> install(Distro d, {DistroSource? source}) async* {
     if (!d.supports(abi)) {
-      throw DistroInstallException(
-          '${d.displayName} 没有 $abi 的 rootfs');
+      throw DistroInstallException('${d.displayName} 没有 $abi 的 rootfs');
     }
 
     final blocked = d.blockedReasonFor(abi);
     if (blocked != null) {
       throw DistroInstallException('${d.displayName} 暂不可用：$blocked');
     }
-    final url = d.rootfsUrls[abi]!;
+    final chosenSource = source ?? (d.sources.isEmpty ? null : d.sources.first);
+    final url = chosenSource?.rootfsUrls[abi] ?? d.rootfsUrls[abi]!;
 
     final staging = _stagingFor(d);
     final rootfs = rootfsDirFor(d);
@@ -300,15 +466,16 @@ class DistroManager {
 
     // 先整包落盘再解压，而不是边下边解：
     // 校验和要对**完整文件**算，边下边解就没法在执行任何东西之前验证它。
-    final archive = File('${staging.path}/.rootfs.tar.gz');
+    final isXz = url.endsWith('.xz');
+    final archive =
+        File('${staging.path}/.rootfs.${isXz ? 'tar.xz' : 'tar.gz'}');
     final sink = archive.openWrite();
     var downloaded = 0;
     try {
       await for (final chunk in await fetch(url)) {
         sink.add(chunk);
         downloaded += chunk.length;
-        yield DistroProgress(
-            '下载 ${d.displayName}（${_mb(downloaded)}）', -1);
+        yield DistroProgress('下载 ${d.displayName}（${_mb(downloaded)}）', -1);
       }
     } finally {
       await sink.close();
@@ -347,8 +514,20 @@ class DistroManager {
     var lastYield = 0;
     final progressEvents = <DistroProgress>[];
 
+    File tarInput = archive;
+    if (isXz) {
+      yield const DistroProgress('解码 XZ', -1);
+      tarInput = File('${staging.path}/.rootfs.tar');
+      final input = InputFileStream(archive.path);
+      final output = OutputFileStream(tarInput.path);
+      XZDecoder().decodeStream(input, output);
+      await input.close();
+      await output.close();
+    }
+
     await TarReader.extract(
-      archive.openRead(),
+      tarInput.openRead(),
+      gzipCompressed: !isXz,
       onEntry: (entry, content) =>
           _writeEntry(target, entry, content).then((_) => files++),
       onSkipped: (entry, reason) => skipped.add(entry.name),
@@ -357,8 +536,7 @@ class DistroManager {
         // 超过 1 就夹住。宁可进度条走得快些也不要停在 90% 不动。
         if (read - lastYield < 2 * 1024 * 1024) return;
         lastYield = read;
-        progressEvents.add(DistroProgress(
-            '解压 rootfs（$files 个文件）',
+        progressEvents.add(DistroProgress('解压 rootfs（$files 个文件）',
             (read / (totalBytes * 3)).clamp(0.0, 0.99)));
       },
     );
@@ -368,8 +546,9 @@ class DistroManager {
     }
 
     yield const DistroProgress('配置环境', 0.99);
-    await _postInstall(target, d);
+    await _postInstall(target, d, chosenSource);
     await archive.delete();
+    if (isXz && await tarInput.exists()) await tarInput.delete();
 
     // 原子切换。到这一步之前失败，用户的已有环境毫发无损。
     if (await rootfs.exists()) await rootfs.delete(recursive: true);
@@ -383,6 +562,7 @@ class DistroManager {
       'files': files,
       'skipped': skipped.length,
       'installed_at': DateTime.now().toIso8601String(),
+      'source': chosenSource?.id,
     }));
 
     yield DistroProgress(
@@ -434,8 +614,7 @@ class DistroManager {
     // ---- 第一道：字面路径检查 ----
     // 挡 `../../../etc/passwd` 这种（zip slip 的 tar 版本）。
     if (!_isInside(full, _rootLexical)) {
-      throw DistroInstallException(
-          'rootfs 里有越界路径 ${entry.name}，拒绝解压（可能是恶意归档）');
+      throw DistroInstallException('rootfs 里有越界路径 ${entry.name}，拒绝解压（可能是恶意归档）');
     }
 
     // ---- 第二道：软链穿透检查 ----
@@ -454,8 +633,7 @@ class DistroManager {
         // 和 _rootReal 比，不是和 _rootLexical 比 —— 两边都必须是解析后的路径。
         final resolved = await parent.resolveSymbolicLinks();
         if (!_isInside(resolved, _rootReal)) {
-          throw DistroInstallException(
-              '${entry.name} 的父目录经软链解析后落在 rootfs 之外'
+          throw DistroInstallException('${entry.name} 的父目录经软链解析后落在 rootfs 之外'
               '（$resolved 不在 $_rootReal 内），拒绝解压（可能是恶意归档）');
         }
       } on FileSystemException {
@@ -501,6 +679,7 @@ class DistroManager {
   }
 
   static Future<void> _chmod(String path, int mode) async {
+    if (Platform.isWindows) return;
     if (mode == 0) return;
     // Dart 没有 chmod。这是解压路径上的热点（几千次调用），
     // 每次 fork 一个 chmod 进程会非常慢 —— 所以只对**需要执行位**的
@@ -510,7 +689,8 @@ class DistroManager {
   }
 
   /// 解压之后必须补的东西。缺任何一样，rootfs 起来都是残的。
-  Future<void> _postInstall(Directory rootfs, Distro d) async {
+  Future<void> _postInstall(
+      Directory rootfs, Distro d, DistroSource? source) async {
     // DNS。rootfs 里的 resolv.conf 要么不存在要么指向宿主拿不到的地址，
     // 不写这个的话 apk/apt 全部「暂时不能解析域名」。
     final resolv = File('${rootfs.path}/etc/resolv.conf');
@@ -539,13 +719,40 @@ class DistroManager {
     if (d.packageManager == 'apk') {
       final repos = File('${rootfs.path}/etc/apk/repositories');
       await repos.parent.create(recursive: true);
-      if (!await repos.exists() || (await repos.readAsString()).trim().isEmpty) {
+      if (!await repos.exists() ||
+          (await repos.readAsString()).trim().isEmpty) {
         final ver = d.id.split('-').last;
+        final base =
+            source?.packageBaseUrl ?? 'https://dl-cdn.alpinelinux.org/alpine';
         await repos.writeAsString(
-          'https://dl-cdn.alpinelinux.org/alpine/v$ver/main\n'
-          'https://dl-cdn.alpinelinux.org/alpine/v$ver/community\n',
+          '$base/v$ver/main\n'
+          '$base/v$ver/community\n',
         );
       }
+    }
+
+    if (d.packageManager == 'apt' && source != null) {
+      final sources = File('${rootfs.path}/etc/apt/sources.list');
+      await sources.parent.create(recursive: true);
+      final isDebian = d.id.startsWith('debian');
+      final suite = isDebian ? 'bookworm' : 'noble';
+      final packageBase =
+          !isDebian && source.id == 'ubuntu-official' && abi == 'x86_64'
+              ? 'https://archive.ubuntu.com/ubuntu'
+              : source.packageBaseUrl;
+      final components = isDebian
+          ? 'main contrib non-free non-free-firmware'
+          : 'main restricted universe multiverse';
+      final debianSecurity = source.packageBaseUrl.contains('tuna.tsinghua')
+          ? 'https://mirrors.tuna.tsinghua.edu.cn/debian-security'
+          : 'https://security.debian.org/debian-security';
+      await sources.writeAsString(isDebian
+          ? 'deb $packageBase $suite $components\n'
+              'deb $packageBase $suite-updates $components\n'
+              'deb $debianSecurity $suite-security $components\n'
+          : 'deb $packageBase $suite $components\n'
+              'deb $packageBase $suite-updates $components\n'
+              'deb $packageBase $suite-security $components\n');
     }
 
     // 临时目录。很多包管理器会直接假设它存在且可写。

@@ -106,8 +106,8 @@ class _PtyHandleImpl implements PtyHandle {
 
   @override
   void resize(int rows, int cols) {
-    PtyChannel._method
-        .invokeMethod('resize', {'session': sessionId, 'rows': rows, 'cols': cols});
+    PtyChannel._method.invokeMethod(
+        'resize', {'session': sessionId, 'rows': rows, 'cols': cols});
   }
 
   @override
