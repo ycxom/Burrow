@@ -153,8 +153,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         ),
                       ],
                       selected: {_provider.apiFormat},
-                      onSelectionChanged: (value) =>
-                          _selectFormat(value.first),
+                      onSelectionChanged: (value) => _selectFormat(value.first),
                     ),
                   ),
                   const SizedBox(height: 16),
@@ -282,8 +281,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   title: const Text('流式输出'),
                   subtitle: const Text('生成内容实时显示，Markdown 平滑刷新'),
                   value: _streamOutput,
-                  onChanged: (value) =>
-                      setState(() => _streamOutput = value),
+                  onChanged: (value) => setState(() => _streamOutput = value),
                 ),
                 const Divider(height: 1),
                 ListTile(
@@ -295,8 +293,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     min: 0,
                     max: _provider.apiFormat == 'anthropic' ? 1 : 2,
                     divisions: _provider.apiFormat == 'anthropic' ? 10 : 20,
-                    onChanged: (value) =>
-                        setState(() => _temperature = value),
+                    onChanged: (value) => setState(() => _temperature = value),
                   ),
                 ),
               ],

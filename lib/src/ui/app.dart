@@ -814,9 +814,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                       decoration: InputDecoration(
                         hintText: '描述你希望 Agent 完成的任务',
                         filled: true,
-                        fillColor: Theme.of(context)
-                            .colorScheme
-                            .surfaceContainerLow,
+                        fillColor:
+                            Theme.of(context).colorScheme.surfaceContainerLow,
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(16),
                         ),

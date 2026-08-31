@@ -209,14 +209,18 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     final text = message?['content']?.toString() ?? '';
     if (text.isNotEmpty) onDelta(text);
     final rawCalls = message?['tool_calls'] as List? ?? const [];
-    final calls = rawCalls.whereType<Map>().map((raw) {
-      final function = raw['function'] as Map? ?? const {};
-      return ToolCall(
-        id: raw['id']?.toString() ?? 'call_0',
-        name: function['name']?.toString() ?? '',
-        args: repairAndDecode(function['arguments']?.toString() ?? ''),
-      );
-    }).where((call) => call.name.isNotEmpty).toList();
+    final calls = rawCalls
+        .whereType<Map>()
+        .map((raw) {
+          final function = raw['function'] as Map? ?? const {};
+          return ToolCall(
+            id: raw['id']?.toString() ?? 'call_0',
+            name: function['name']?.toString() ?? '',
+            args: repairAndDecode(function['arguments']?.toString() ?? ''),
+          );
+        })
+        .where((call) => call.name.isNotEmpty)
+        .toList();
     return LlmTurn(text: text, toolCalls: calls);
   }
 
