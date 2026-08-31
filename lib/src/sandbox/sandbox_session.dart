@@ -21,7 +21,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-
 /// 沙箱的强度档位。语义对齐 codex 的 `SandboxPolicy`。
 enum SandboxLevel {
   /// 只读：workspace 也不可写。适合"先看看代码"的探索阶段。
@@ -131,6 +130,8 @@ class ExecResult {
 }
 
 class SandboxSession {
+  PtyHandle? _activeHandle;
+
   /// 发行版 rootfs 的路径（`distros/<id>/rootfs`）。proot 的 `-r` 指向它。
   final String rootfsPath;
 
@@ -353,6 +354,7 @@ class SandboxSession {
       env: buildEnv(level),
       cwd: workspacePath,
     );
+    _activeHandle = handle;
 
     var timedOut = false;
     final timer = Timer(timeout, () {
@@ -370,6 +372,7 @@ class SandboxSession {
     }
 
     final exitCode = await handle.exitCode;
+    if (identical(_activeHandle, handle)) _activeHandle = null;
     timer.cancel();
     await sink.close();
 
@@ -381,6 +384,11 @@ class SandboxSession {
       timedOut: timedOut,
       sandboxDenials: denials,
     );
+  }
+
+  void cancelActive() {
+    _activeHandle?.killGroup();
+    _activeHandle = null;
   }
 
   /// 从输出里认出「这是被沙箱拦的，不是程序自己坏了」。

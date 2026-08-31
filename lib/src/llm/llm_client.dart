@@ -15,6 +15,7 @@
 ///    而修一下往往就能用 —— 思路取自 chatbox 的 `tool-call-json-repair`。
 library;
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -24,6 +25,7 @@ import '../agent/tools.dart';
 import '../context/overflow_manager.dart';
 
 class LlmConfig {
+  final String apiFormat;
   final String baseUrl; // 例如 https://api.openai.com/v1
   final String apiKey;
   final String model;
@@ -33,13 +35,16 @@ class LlmConfig {
   final String? summaryModel;
 
   final double temperature;
+  final bool streamOutput;
 
   const LlmConfig({
+    this.apiFormat = 'openAI',
     required this.baseUrl,
     required this.apiKey,
     required this.model,
     this.summaryModel,
     this.temperature = 0.3,
+    this.streamOutput = true,
   });
 
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
@@ -47,13 +52,92 @@ class LlmConfig {
   bool get isConfigured => baseUrl.isNotEmpty && model.isNotEmpty;
 }
 
-class ConfigurableLlmClient implements LlmClient {
+class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
   LlmConfig config;
-  final http.Client _http;
+  http.Client _http;
+  final bool _ownsClient;
+  final Duration connectionTimeout;
 
-  ConfigurableLlmClient({LlmConfig? config, http.Client? httpClient})
-      : config = config ?? LlmConfig.empty,
-        _http = httpClient ?? http.Client();
+  ConfigurableLlmClient({
+    LlmConfig? config,
+    http.Client? httpClient,
+    this.connectionTimeout = const Duration(seconds: 45),
+  })  : config = config ?? LlmConfig.empty,
+        _http = httpClient ?? http.Client(),
+        _ownsClient = httpClient == null;
+
+  @override
+  void cancel() {
+    _http.close();
+    if (_ownsClient) _http = http.Client();
+  }
+
+  Future<void> testConnection([LlmConfig? draft]) async {
+    final value = draft ?? config;
+    if (!value.isConfigured) {
+      throw StateError('请先填写 Base URL 和模型');
+    }
+    final anthropic = value.apiFormat == 'anthropic';
+    final uri = _endpoint(
+        value.baseUrl, anthropic ? '/v1/messages' : '/chat/completions');
+    http.Response response;
+    try {
+      response = await _http
+          .post(
+            uri,
+            headers: <String, String>{
+              'Content-Type': 'application/json',
+              if (anthropic) 'anthropic-version': '2023-06-01',
+              if (anthropic && value.apiKey.isNotEmpty)
+                'x-api-key': value.apiKey,
+              if (!anthropic && value.apiKey.isNotEmpty)
+                'Authorization': 'Bearer ${value.apiKey}',
+            },
+            body: jsonEncode(<String, Object?>{
+              'model': value.model,
+              // OpenAI 兼容服务普遍支持 max_tokens；max_completion_tokens
+              // 是较新的 OpenAI 专用字段，很多国内服务会拒绝。
+              if (uri.host == 'api.openai.com')
+                'max_completion_tokens': 1
+              else
+                'max_tokens': 1,
+              'stream': false,
+              'messages': <Map<String, String>>[
+                <String, String>{'role': 'user', 'content': 'Hi'},
+              ],
+            }),
+          )
+          .timeout(connectionTimeout);
+    } on TimeoutException {
+      throw LlmConnectionException(
+        '连接超时（${connectionTimeout.inSeconds} 秒）。请检查 Base URL、手机网络、代理设置，'
+        '以及本地 Gateway 是否已启动。',
+      );
+    } on FormatException {
+      throw const LlmConnectionException('Base URL 格式不正确，请填写完整的 http(s) 地址');
+    } on http.ClientException catch (error) {
+      throw LlmConnectionException('无法连接模型服务：${error.message}');
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw LlmConnectionException(
+        '连接失败 HTTP ${response.statusCode}: ${_brief(response.body)}',
+      );
+    }
+  }
+
+  /// 同时接受服务根地址和用户直接粘贴的完整接口地址，避免出现
+  /// `/v1/chat/completions/chat/completions` 这种很难看出的重复路径。
+  static Uri _endpoint(String baseUrl, String suffix) {
+    var base = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    if (base.endsWith(suffix)) return Uri.parse(base);
+    if (base.endsWith('/v1') && suffix.startsWith('/v1/')) {
+      return Uri.parse('$base${suffix.substring(3)}');
+    }
+    if (suffix == '/chat/completions' && base.endsWith('/v1')) {
+      return Uri.parse('$base$suffix');
+    }
+    return Uri.parse('$base$suffix');
+  }
 
   @override
   String get limitKey => ContextLimitKey.of(config.baseUrl, config.model);
@@ -68,6 +152,21 @@ class ConfigurableLlmClient implements LlmClient {
       throw StateError('尚未配置模型服务，请先在设置里填 baseUrl 和 model');
     }
 
+    if (config.apiFormat == 'anthropic') {
+      return _completeAnthropic(
+        messages: messages,
+        tools: tools,
+        onDelta: onDelta,
+      );
+    }
+    return _completeOpenAi(messages: messages, tools: tools, onDelta: onDelta);
+  }
+
+  Future<LlmTurn> _completeOpenAi({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required void Function(String delta) onDelta,
+  }) async {
     final request = http.Request(
       'POST',
       Uri.parse('${config.baseUrl.replaceAll(RegExp(r'/$'), '')}'
@@ -81,9 +180,10 @@ class ConfigurableLlmClient implements LlmClient {
       ..body = jsonEncode({
         'model': config.model,
         'temperature': config.temperature,
-        'stream': true,
+        'stream': config.streamOutput,
         'messages': messages.map(_toWire).toList(),
-        if (tools.isNotEmpty) 'tools': tools.map((t) => t.toOpenAiJson()).toList(),
+        if (tools.isNotEmpty)
+          'tools': tools.map((t) => t.toOpenAiJson()).toList(),
       });
 
     final response = await _http.send(request);
@@ -99,7 +199,165 @@ class ConfigurableLlmClient implements LlmClient {
           'LLM 返回 ${response.statusCode}: ${_brief(body)}');
     }
 
-    return _readStream(response.stream, onDelta);
+    if (config.streamOutput) return _readStream(response.stream, onDelta);
+    final body = jsonDecode(await response.stream.bytesToString())
+        as Map<String, Object?>;
+    final choices = body['choices'] as List?;
+    final message = choices == null || choices.isEmpty
+        ? null
+        : (choices.first as Map)['message'] as Map?;
+    final text = message?['content']?.toString() ?? '';
+    if (text.isNotEmpty) onDelta(text);
+    final rawCalls = message?['tool_calls'] as List? ?? const [];
+    final calls = rawCalls
+        .whereType<Map>()
+        .map((raw) {
+          final function = raw['function'] as Map? ?? const {};
+          return ToolCall(
+            id: raw['id']?.toString() ?? 'call_0',
+            name: function['name']?.toString() ?? '',
+            args: repairAndDecode(function['arguments']?.toString() ?? ''),
+          );
+        })
+        .where((call) => call.name.isNotEmpty)
+        .toList();
+    return LlmTurn(text: text, toolCalls: calls);
+  }
+
+  Future<LlmTurn> _completeAnthropic({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required void Function(String delta) onDelta,
+  }) async {
+    final system = messages
+        .where((message) => message.role == 'system')
+        .map((message) => message.content)
+        .join('\n\n');
+    final request = http.Request(
+      'POST',
+      Uri.parse('${config.baseUrl.replaceAll(RegExp(r'/$'), '')}/v1/messages'),
+    )
+      ..headers.addAll(<String, String>{
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        if (config.apiKey.isNotEmpty) 'x-api-key': config.apiKey,
+      })
+      ..body = jsonEncode(<String, Object?>{
+        'model': config.model,
+        'max_tokens': 4096,
+        'temperature': config.temperature.clamp(0, 1),
+        'stream': config.streamOutput,
+        if (system.isNotEmpty) 'system': system,
+        'messages': messages
+            .where((message) => message.role != 'system')
+            .map((message) => <String, Object?>{
+                  'role': message.role == 'assistant' ? 'assistant' : 'user',
+                  'content': message.role == 'tool'
+                      ? '[工具结果]\n${message.content}'
+                      : message.content,
+                })
+            .toList(),
+        if (tools.isNotEmpty)
+          'tools': tools
+              .map((tool) => <String, Object?>{
+                    'name': tool.name,
+                    'description': tool.description,
+                    'input_schema': tool.parameters,
+                  })
+              .toList(),
+      });
+    final response = await _http.send(request);
+    if (response.statusCode >= 400) {
+      final body = await response.stream.bytesToString();
+      if (_guard.isContextLimitError(response.statusCode, body)) {
+        throw ContextOverflowException(response.statusCode, body);
+      }
+      throw http.ClientException(
+          'LLM 返回 ${response.statusCode}: ${_brief(body)}');
+    }
+    if (config.streamOutput) {
+      return _readAnthropicStream(response.stream, onDelta);
+    }
+    final body = jsonDecode(await response.stream.bytesToString())
+        as Map<String, Object?>;
+    final content = body['content'] as List? ?? const [];
+    final text = content
+        .whereType<Map>()
+        .where((block) => block['type'] == 'text')
+        .map((block) => block['text']?.toString() ?? '')
+        .join();
+    if (text.isNotEmpty) onDelta(text);
+    final calls = content
+        .whereType<Map>()
+        .where((block) => block['type'] == 'tool_use')
+        .map((block) => ToolCall(
+              id: block['id']?.toString() ?? 'call_0',
+              name: block['name']?.toString() ?? '',
+              args: (block['input'] as Map?)
+                      ?.map((key, value) => MapEntry(key.toString(), value)) ??
+                  const {},
+            ))
+        .where((call) => call.name.isNotEmpty)
+        .toList();
+    return LlmTurn(text: text, toolCalls: calls);
+  }
+
+  Future<LlmTurn> _readAnthropicStream(
+    http.ByteStream stream,
+    void Function(String) onDelta,
+  ) async {
+    final text = StringBuffer();
+    final partial = <int, _PartialToolCall>{};
+    await for (final line
+        in stream.transform(utf8.decoder).transform(const LineSplitter())) {
+      if (!line.startsWith('data:')) continue;
+      final payload = line.substring(5).trim();
+      if (payload.isEmpty) continue;
+      Map<String, Object?> event;
+      try {
+        event = jsonDecode(payload) as Map<String, Object?>;
+      } catch (_) {
+        continue;
+      }
+      final type = event['type'];
+      final index = (event['index'] as num?)?.toInt() ?? 0;
+      if (type == 'content_block_start') {
+        final block = event['content_block'] as Map<String, Object?>?;
+        if (block?['type'] == 'tool_use') {
+          final slot = partial.putIfAbsent(index, _PartialToolCall.new);
+          slot.id = block?['id']?.toString() ?? 'call_$index';
+          slot.name = block?['name']?.toString() ?? '';
+          final input = block?['input'];
+          if (input is Map && input.isNotEmpty) {
+            slot.args.write(jsonEncode(input));
+          }
+        }
+      } else if (type == 'content_block_delta') {
+        final delta = event['delta'] as Map<String, Object?>?;
+        if (delta?['type'] == 'text_delta') {
+          final value = delta?['text']?.toString() ?? '';
+          text.write(value);
+          onDelta(value);
+        } else if (delta?['type'] == 'input_json_delta') {
+          partial.putIfAbsent(index, _PartialToolCall.new).args.write(
+                delta?['partial_json']?.toString() ?? '',
+              );
+        }
+      }
+    }
+    return LlmTurn(
+      text: text.toString(),
+      toolCalls: partial.entries
+          .where((entry) => entry.value.name.isNotEmpty)
+          .map((entry) => ToolCall(
+                id: entry.value.id.isEmpty
+                    ? 'call_${entry.key}'
+                    : entry.value.id,
+                name: entry.value.name,
+                args: repairAndDecode(entry.value.args.toString()),
+              ))
+          .toList(),
+    );
   }
 
   /// 需要一个 guard 实例来做错误识别。它和 AgentLoop 持有的那个是两份 ——
@@ -117,9 +375,8 @@ class ConfigurableLlmClient implements LlmClient {
     // 必须按 index 攒起来，不能收到一片就当一次调用。
     final partial = <int, _PartialToolCall>{};
 
-    await for (final line in stream
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())) {
+    await for (final line
+        in stream.transform(utf8.decoder).transform(const LineSplitter())) {
       if (!line.startsWith('data:')) continue;
       final payload = line.substring(5).trim();
       if (payload.isEmpty || payload == '[DONE]') continue;
@@ -193,8 +450,8 @@ class ConfigurableLlmClient implements LlmClient {
       }),
     );
     if (response.statusCode >= 400) return '';
-    final body = jsonDecode(utf8.decode(response.bodyBytes))
-        as Map<String, Object?>;
+    final body =
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, Object?>;
     final choices = body['choices'] as List?;
     if (choices == null || choices.isEmpty) return '';
     final msg = (choices.first as Map)['message'] as Map<String, Object?>?;
@@ -211,6 +468,14 @@ class ConfigurableLlmClient implements LlmClient {
 
   static String _brief(String s) =>
       s.length > 300 ? '${s.substring(0, 300)}…' : s;
+}
+
+class LlmConnectionException implements Exception {
+  final String message;
+  const LlmConnectionException(this.message);
+
+  @override
+  String toString() => message;
 }
 
 class _PartialToolCall {

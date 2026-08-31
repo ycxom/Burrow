@@ -180,8 +180,7 @@ class SnapshotStore {
     if (await _logFile.exists()) {
       for (final line in await _logFile.readAsLines()) {
         if (line.trim().isEmpty) continue;
-        _log.add(
-            Checkpoint.fromJson(jsonDecode(line) as Map<String, Object?>));
+        _log.add(Checkpoint.fromJson(jsonDecode(line) as Map<String, Object?>));
       }
     }
     // 首次打开时建立基线，否则第一个 checkpoint 会把整个 workspace
@@ -352,7 +351,7 @@ class SnapshotStore {
             }
             await f.parent.create(recursive: true);
             await blob.copy(f.path);
-            if (change.oldMode != null) {
+            if (change.oldMode != null && !Platform.isWindows) {
               // Dart 没有 chmod，交给 shell。可执行位丢了会让回滚"看起来成功
               // 但脚本跑不起来"，比明着失败更难查。
               await Process.run('chmod', [

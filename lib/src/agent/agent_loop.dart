@@ -65,6 +65,14 @@ abstract class LlmClient {
   String get limitKey;
 }
 
+abstract interface class CancellableLlmClient {
+  void cancel();
+}
+
+class AgentCancelledException implements Exception {
+  const AgentCancelledException();
+}
+
 class LlmTurn {
   final String text;
   final List<ToolCall> toolCalls;
@@ -99,6 +107,7 @@ class AgentLoop {
   /// 单个 turn 内最多几轮工具调用。防止模型陷入
   /// 「跑命令 → 看输出 → 再跑同一条命令」的死循环。
   final int maxToolRounds;
+  int _cancelEpoch = 0;
 
   AgentLoop({
     required this.llm,
@@ -118,6 +127,7 @@ class AgentLoop {
   });
 
   Future<void> send(String userInput) async {
+    final epoch = _cancelEpoch;
     // 每个 turn 开头自动打检查点。绝大多数 turn 没改文件，diff 为空，
     // checkpoint() 直接返回 null 且不推进代号 —— 所以这是免费的。
     // 它换来的是「任何一轮都能整体撤销」这个非常好用的性质。
@@ -147,6 +157,7 @@ class AgentLoop {
 
     for (var round = 0; round < maxToolRounds; round++) {
       final turn = await _completeWithRetry();
+      if (epoch != _cancelEpoch) throw const AgentCancelledException();
 
       if (turn.text.isNotEmpty) {
         history.add(ChatMessage(
@@ -156,6 +167,7 @@ class AgentLoop {
 
       for (final call in turn.toolCalls) {
         final result = await _dispatch(call);
+        if (epoch != _cancelEpoch) throw const AgentCancelledException();
         history.add(ChatMessage(
           role: 'tool',
           content: result.content,
@@ -168,6 +180,23 @@ class AgentLoop {
         host.onStatus('已整理长期记忆（摘要覆盖到第 ${overflow.checkpoint} 条）');
       }
     }
+  }
+
+  void cancel() {
+    _cancelEpoch++;
+    final currentLlm = llm;
+    if (currentLlm is CancellableLlmClient) {
+      (currentLlm as CancellableLlmClient).cancel();
+    }
+    sandbox.cancelActive();
+  }
+
+  Future<void> retryLastUserTurn() async {
+    final index = history.lastIndexWhere((message) => message.role == 'user');
+    if (index < 0) return;
+    final input = history[index].content;
+    history.removeRange(index, history.length);
+    await send(input);
   }
 
   /// 撞到上下文超长时：学一次真实窗口，裁剪，重试一次。
@@ -289,8 +318,8 @@ class AgentLoop {
           '请换一种做法，不要重试同一条命令。');
     }
 
-    final needsApproval = verdict.decision == Decision.prompt &&
-        mode == ApprovalMode.onRequest;
+    final needsApproval =
+        verdict.decision == Decision.prompt && mode == ApprovalMode.onRequest;
     if (needsApproval && !await host.requestApproval(call, verdict)) {
       return ToolResult.rejected('用户拒绝了这次操作（${verdict.reason}）。'
           '请说明你为什么需要它，或换一种做法。');
@@ -315,18 +344,21 @@ class AgentLoop {
       return runWriteTool(call, sandbox.workspacePath, snapshots);
     }
 
-    final ref = 'out_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    final ref =
+        'out_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
     final sinkFile = File('${outputArchiveDir.path}/$ref.log');
     await sinkFile.parent.create(recursive: true);
 
-    final level =
-        mode == ApprovalMode.yolo ? SandboxLevel.dangerFullAccess : sandboxLevel;
+    final level = mode == ApprovalMode.yolo
+        ? SandboxLevel.dangerFullAccess
+        : sandboxLevel;
 
     final result = await sandbox.run(
       commandLine,
       level: level,
       outputSink: sinkFile,
-      timeout: Duration(seconds: (call.args['timeout'] as num?)?.toInt() ?? 300),
+      timeout:
+          Duration(seconds: (call.args['timeout'] as num?)?.toInt() ?? 300),
       onChunk: host.onTerminalChunk,
     );
 
@@ -353,7 +385,8 @@ class AgentLoop {
     final tx = await prefixGens.begin(reason: _brief(commandLine));
     host.onStatus('已创建环境暂存副本，改动不会直接落到当前环境');
 
-    final ref = 'out_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    final ref =
+        'out_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
     final sinkFile = File('${outputArchiveDir.path}/$ref.log');
     await sinkFile.parent.create(recursive: true);
 
@@ -398,14 +431,18 @@ class AgentLoop {
       final fixed = await prefixGens.verifyEtc(gen.id);
       host.onStatus('环境已更新（第 ${gen.id} 代）'
           '${fixed.isEmpty ? '' : '，修复 ${fixed.length} 处 hardlink 穿透'}');
-      return ToolResult.ok('${distilled.text}\n'
-          '[环境变更已提交为第 ${gen.id} 代，可用 rollback_env 回退]', outputRef: ref);
+      return ToolResult.ok(
+          '${distilled.text}\n'
+          '[环境变更已提交为第 ${gen.id} 代，可用 rollback_env 回退]',
+          outputRef: ref);
     }
 
     await tx.abort();
     host.onStatus('装包失败，环境已回到操作前状态');
-    return ToolResult.ok('${distilled.text}\n'
-        '[命令失败，环境暂存副本已丢弃，当前环境未发生任何变化]', outputRef: ref);
+    return ToolResult.ok(
+        '${distilled.text}\n'
+        '[命令失败，环境暂存副本已丢弃，当前环境未发生任何变化]',
+        outputRef: ref);
   }
 
   // -------------------------------------------------------------------------

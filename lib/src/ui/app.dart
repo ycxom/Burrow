@@ -8,17 +8,40 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:xterm/xterm.dart';
 
 import '../agent/agent_loop.dart';
 import '../agent/tools.dart';
 import '../bootstrap/distro.dart';
 import '../context/overflow_manager.dart';
+import '../data/chat_store.dart';
+import '../data/task_runtime.dart';
 import '../sandbox/exec_policy.dart';
 import '../sandbox/prefix_generations.dart';
 import '../sandbox/pty_channel.dart';
 import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
+import '../llm/llm_client.dart';
+import '../settings/settings_store.dart';
+import 'settings_page.dart';
+import 'thread_list_page.dart';
+
+/// 当前 UI 文案是中文。把 locale 明确交给 Material 本地化后，TextField 的
+/// 原生操作菜单也会使用“剪切 / 复制 / 粘贴 / 全选”，而不是落回英文。
+/// 将来加入应用语言设置时，只需把这里替换成设置值，所有输入控件会一起切换。
+const _appLocale = Locale('zh', 'CN');
+const _supportedLocales = <Locale>[
+  Locale('zh', 'CN'),
+  Locale('en'),
+];
+const _localizationsDelegates = <LocalizationsDelegate<dynamic>>[
+  GlobalMaterialLocalizations.delegate,
+  GlobalWidgetsLocalizations.delegate,
+  GlobalCupertinoLocalizations.delegate,
+];
 
 // ---------------------------------------------------------------------------
 // 首次启动：选一个发行版基座
@@ -45,6 +68,9 @@ class DistroSetupApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'Burrow',
+        locale: _appLocale,
+        supportedLocales: _supportedLocales,
+        localizationsDelegates: _localizationsDelegates,
         theme: ThemeData.dark(useMaterial3: true),
         home: DistroSetupScreen(
           manager: manager,
@@ -75,6 +101,7 @@ class DistroSetupScreen extends StatefulWidget {
 
 class _DistroSetupScreenState extends State<DistroSetupScreen> {
   Distro? _installing;
+  final Map<String, DistroSource> _selectedSources = {};
   DistroProgress _progress = const DistroProgress('');
   Object? _error;
 
@@ -85,11 +112,11 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
       _progress = const DistroProgress('准备中');
     });
     try {
-      await for (final p in widget.manager.install(d)) {
+      final source = _sourceFor(d);
+      await for (final p in widget.manager.install(d, source: source)) {
         if (mounted) setState(() => _progress = p);
       }
-      await widget.onReady(
-          InstalledDistro(d, widget.manager.rootfsDirFor(d)));
+      await widget.onReady(InstalledDistro(d, widget.manager.rootfsDirFor(d)));
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -99,6 +126,15 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
       }
     }
   }
+
+  DistroSource? _sourceFor(Distro distro) =>
+      _selectedSources[distro.id] ??
+      distro.defaultSource(MirrorRegion.china) ??
+      (distro.sources.isEmpty ? null : distro.sources.first);
+
+  static String _sourceLabel(DistroSource source) =>
+      '${source.region == MirrorRegion.china ? '中国大陆' : '国际'} · '
+      '${source.displayName}';
 
   @override
   Widget build(BuildContext context) {
@@ -121,6 +157,10 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
         children: [
           Text('正在安装 ${_installing!.displayName}',
               style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          if (_sourceFor(_installing!) case final source?)
+            Text('下载源：${_sourceLabel(source)}',
+                style: const TextStyle(fontSize: 11)),
           const SizedBox(height: 20),
           Text(_progress.stage, style: const TextStyle(fontSize: 12)),
           const SizedBox(height: 12),
@@ -143,8 +183,20 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
             '之后可以随时增删或切换。',
             style: TextStyle(fontSize: 12),
           ),
+          const SizedBox(height: 8),
+          const Row(
+            children: [
+              Icon(Icons.language, size: 16),
+              SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '每个基座的下载源同时列出中国大陆与国际镜像，默认选择大陆镜像。',
+                  style: TextStyle(fontSize: 11),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 20),
-
           if (_error != null)
             Card(
               color: Theme.of(context).colorScheme.errorContainer,
@@ -153,45 +205,68 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
                 child: Text('$_error', style: const TextStyle(fontSize: 12)),
               ),
             ),
-
           for (final d in available)
             Card(
-              child: ListTile(
-                enabled: d.isAvailableOn(widget.abi),
-                title: Row(children: [
-                  Text(d.displayName),
-                  if (d.id == DistroCatalog.defaultDistro.id &&
-                      d.isAvailableOn(widget.abi))
-                    const Padding(
-                      padding: EdgeInsets.only(left: 8),
-                      child: Chip(
-                        label: Text('推荐', style: TextStyle(fontSize: 10)),
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
+              child: Column(children: [
+                ListTile(
+                  enabled: d.isAvailableOn(widget.abi),
+                  title: Row(children: [
+                    Text(d.displayName),
+                    if (d.id == DistroCatalog.defaultDistro.id &&
+                        d.isAvailableOn(widget.abi))
+                      const Padding(
+                        padding: EdgeInsets.only(left: 8),
+                        child: Chip(
+                          label: Text('推荐', style: TextStyle(fontSize: 10)),
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                        ),
                       ),
+                  ]),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      // 不可用时把原因顶到最前面 —— 用户扫一眼就该知道
+                      // 为什么这一项点不动，而不是以为 app 坏了。
+                      d.isAvailableOn(widget.abi)
+                          ? d.description
+                          : '暂不可用：${d.blockedReasonFor(widget.abi)}\n'
+                              '${d.description}',
+                      style: const TextStyle(fontSize: 11),
                     ),
-                ]),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(
-                    // 不可用时把原因顶到最前面 —— 用户扫一眼就该知道
-                    // 为什么这一项点不动，而不是以为 app 坏了。
-                    d.isAvailableOn(widget.abi)
-                        ? d.description
-                        : '暂不可用：${d.blockedReasonFor(widget.abi)}\n'
-                            '${d.description}',
-                    style: const TextStyle(fontSize: 11),
                   ),
+                  trailing: Icon(d.isAvailableOn(widget.abi)
+                      ? Icons.download
+                      : Icons.block),
+                  onTap: d.isAvailableOn(widget.abi) ? () => _install(d) : null,
                 ),
-                trailing: Icon(d.isAvailableOn(widget.abi)
-                    ? Icons.download
-                    : Icons.block),
-                onTap: d.isAvailableOn(widget.abi)
-                    ? () => _install(d)
-                    : null,
-              ),
+                if (d.isAvailableOn(widget.abi) && d.sources.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: DropdownButtonFormField<DistroSource>(
+                      isExpanded: true,
+                      initialValue: _sourceFor(d),
+                      decoration: const InputDecoration(
+                        labelText: '下载源（中国大陆 / 国际）',
+                        prefixIcon: Icon(Icons.public),
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      items: d.sources
+                          .map((s) => DropdownMenuItem(
+                                value: s,
+                                child: Text(_sourceLabel(s)),
+                              ))
+                          .toList(),
+                      onChanged: (source) {
+                        if (source != null) {
+                          setState(() => _selectedSources[d.id] = source);
+                        }
+                      },
+                    ),
+                  ),
+              ]),
             ),
-
           if (available.isEmpty)
             Card(
               child: Padding(
@@ -203,7 +278,6 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
                 ),
               ),
             ),
-
           const SizedBox(height: 16),
           TextButton(
             onPressed: () => widget.onSkip(),
@@ -218,59 +292,101 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
 // ---------------------------------------------------------------------------
 
 class BurrowApp extends StatelessWidget {
-  final AgentLoop Function(AgentHost host) buildAgent;
+  final AgentLoop Function(AgentHost host, TaskRuntime runtime) buildAgent;
+  final Future<TaskRuntime> Function(String taskId) buildRuntime;
   final SandboxCapabilities capabilities;
-  final SnapshotStore snapshots;
   final PrefixGenerations prefixGens;
   final PtyChannel spawner;
-  final SandboxSession sandbox;
   final InstalledDistro? activeDistro;
+  final ConfigurableLlmClient llm;
+  final SettingsStore settings;
+  final ChatStore chats;
 
   const BurrowApp({
     super.key,
     required this.buildAgent,
+    required this.buildRuntime,
     required this.capabilities,
-    required this.snapshots,
     required this.prefixGens,
     required this.spawner,
-    required this.sandbox,
     required this.activeDistro,
+    required this.llm,
+    required this.settings,
+    required this.chats,
   });
 
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'Burrow',
-        theme: ThemeData.dark(useMaterial3: true),
-        home: HomeShell(
-          buildAgent: buildAgent,
-          capabilities: capabilities,
-          snapshots: snapshots,
-          prefixGens: prefixGens,
-          spawner: spawner,
-          sandbox: sandbox,
-          activeDistro: activeDistro,
+        locale: _appLocale,
+        supportedLocales: _supportedLocales,
+        localizationsDelegates: _localizationsDelegates,
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF5065A8),
+            brightness: Brightness.light,
+          ),
+          useMaterial3: true,
+        ),
+        darkTheme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF9CABFF),
+            brightness: Brightness.dark,
+          ),
+          useMaterial3: true,
+        ),
+        home: ThreadListPage(
+          store: chats,
+          buildThread: (threadId, title) {
+            final runtimeId = threadId ??
+                'draft_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+            return HomeShell(
+              buildAgent: buildAgent,
+              runtime: buildRuntime(runtimeId),
+              runtimeId: runtimeId,
+              capabilities: capabilities,
+              prefixGens: prefixGens,
+              spawner: spawner,
+              activeDistro: activeDistro,
+              llm: llm,
+              settings: settings,
+              chats: chats,
+              threadId: threadId,
+              title: title,
+            );
+          },
         ),
       );
 }
 
 class HomeShell extends StatefulWidget {
-  final AgentLoop Function(AgentHost host) buildAgent;
+  final AgentLoop Function(AgentHost host, TaskRuntime runtime) buildAgent;
+  final Future<TaskRuntime> runtime;
+  final String runtimeId;
   final SandboxCapabilities capabilities;
-  final SnapshotStore snapshots;
   final PrefixGenerations prefixGens;
   final PtyChannel spawner;
-  final SandboxSession sandbox;
   final InstalledDistro? activeDistro;
+  final ConfigurableLlmClient llm;
+  final SettingsStore settings;
+  final ChatStore chats;
+  final String? threadId;
+  final String title;
 
   const HomeShell({
     super.key,
     required this.buildAgent,
+    required this.runtime,
+    required this.runtimeId,
     required this.capabilities,
-    required this.snapshots,
     required this.prefixGens,
     required this.spawner,
-    required this.sandbox,
     required this.activeDistro,
+    required this.llm,
+    required this.settings,
+    required this.chats,
+    required this.threadId,
+    required this.title,
   });
 
   @override
@@ -279,6 +395,7 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> implements AgentHost {
   late final AgentLoop _agent;
+  late final TaskRuntime _runtime;
   late final Terminal _terminal;
 
   final List<ChatMessage> _visible = [];
@@ -288,10 +405,15 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   int _tab = 0;
   String? _status;
   bool _busy = false;
+  bool _loadingHistory = true;
+  bool _cancelRequested = false;
+  bool _runtimeReady = false;
+  String? _threadId;
 
   /// 助手当前这一轮的流式文本。单独存而不是每个 delta 都往 _visible 里塞，
   /// 否则每个 token 都触发一次列表重建，长回复时会明显掉帧。
   final _streaming = StringBuffer();
+  Timer? _streamPaintTimer;
 
   /// 用户手动敲命令的那个 shell。**和 Agent 用的是两个不同的会话** ——
   /// 共用一个的话，Agent 的 cd 会污染用户的会话，用户的 export 会污染
@@ -301,9 +423,27 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   @override
   void initState() {
     super.initState();
-    _agent = widget.buildAgent(this);
     _terminal = Terminal(maxLines: 5000);
-    _startShell();
+    _threadId = widget.threadId;
+    _prepareRuntime();
+  }
+
+  Future<void> _prepareRuntime() async {
+    _runtime = await widget.runtime;
+    _agent = widget.buildAgent(this, _runtime);
+    await _loadHistory();
+    await _startShell();
+    if (mounted) setState(() => _runtimeReady = true);
+  }
+
+  Future<void> _loadHistory() async {
+    final id = _threadId;
+    if (id != null) {
+      final messages = await widget.chats.messages(id);
+      _agent.history.addAll(messages);
+      _visible.addAll(messages.where((message) => message.role != 'tool'));
+    }
+    if (mounted) setState(() => _loadingHistory = false);
   }
 
   Future<void> _startShell() async {
@@ -319,17 +459,17 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 用联网档而不是 workspaceWrite：用户手动敲命令时会想 `apk add`，
     // 断网档会让他对着一个没有解释的失败发呆。Agent 才需要默认断网。
     const level = SandboxLevel.workspaceWriteNetwork;
-    final argv = widget.sandbox.buildArgv(
+    final argv = _runtime.sandbox.buildArgv(
       widget.activeDistro != null ? 'exec /bin/sh -l' : 'exec sh',
       level,
     );
-    final env = widget.sandbox.buildEnv(level);
+    final env = _runtime.sandbox.buildEnv(level);
 
     try {
       final handle = await widget.spawner.spawn(
         argv: argv,
         env: env,
-        cwd: widget.sandbox.workspacePath,
+        cwd: _runtime.sandbox.workspacePath,
         rows: 24,
         cols: 80,
       );
@@ -344,8 +484,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         (chunk) => _terminal.write(String.fromCharCodes(chunk)),
         onDone: () => _terminal.write('\r\n[会话已结束]\r\n'),
       );
-      handle.exitCode.then(
-          (code) => _terminal.write('\r\n[shell 退出，code=$code]\r\n'));
+      handle.exitCode
+          .then((code) => _terminal.write('\r\n[shell 退出，code=$code]\r\n'));
     } catch (e) {
       _terminal.write('无法启动 shell：$e\r\n');
     }
@@ -354,8 +494,12 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   @override
   void dispose() {
     _shell?.killGroup();
+    if (_runtimeReady && _threadId == null) {
+      unawaited(_runtime.root.delete(recursive: true));
+    }
     _input.dispose();
     _scroll.dispose();
+    _streamPaintTimer?.cancel();
     super.dispose();
   }
 
@@ -413,7 +557,15 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   @override
   void onAssistantDelta(String text) {
     _streaming.write(text);
-    setState(() {});
+    // 网络分片可能细到一个字符一次。最多约 30fps 刷新，既保持实时感，
+    // 又避免 Markdown 每个 token 全量排版造成跳动和掉帧。
+    _streamPaintTimer ??= Timer(const Duration(milliseconds: 33), () {
+      _streamPaintTimer = null;
+      if (mounted) {
+        setState(() {});
+        _scrollToEnd(animated: true);
+      }
+    });
   }
 
   @override
@@ -429,20 +581,37 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   Future<void> _send() async {
     final text = _input.text.trim();
-    if (text.isEmpty || _busy) return;
+    if (text.isEmpty || _busy || _loadingHistory) return;
+    var id = _threadId;
+    if (id == null) {
+      id = await widget.chats.createThread(
+        text,
+        preferredId: widget.runtimeId,
+      );
+      _threadId = id;
+    }
     _input.clear();
     setState(() {
       _busy = true;
-      _visible.add(
-          ChatMessage(role: 'user', content: text, at: DateTime.now()));
+      _cancelRequested = false;
+      _visible
+          .add(ChatMessage(role: 'user', content: text, at: DateTime.now()));
       _streaming.clear();
     });
+    await widget.chats.append(id, _visible.last);
 
     try {
       await _agent.send(text);
     } catch (e) {
-      setState(() => _visible.add(ChatMessage(
-          role: 'system', content: '出错：$e', at: DateTime.now())));
+      if (!_cancelRequested) {
+        final error = ChatMessage(
+          role: 'system',
+          content: '出错：$e',
+          at: DateTime.now(),
+        );
+        _agent.history.add(error);
+        setState(() => _visible.add(error));
+      }
     } finally {
       setState(() {
         if (_streaming.isNotEmpty) {
@@ -454,23 +623,71 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         }
         _busy = false;
       });
+      await widget.chats.replaceMessages(id, _agent.history);
       _scrollToEnd();
     }
   }
 
-  void _scrollToEnd() {
+  void _stop() {
+    _cancelRequested = true;
+    _agent.cancel();
+    setState(() => _status = '正在停止当前请求和命令…');
+  }
+
+  Future<void> _retry() async {
+    if (_busy) return;
+    final userIndex =
+        _visible.lastIndexWhere((message) => message.role == 'user');
+    if (userIndex < 0) return;
+    final text = _visible[userIndex].content;
+    setState(() {
+      _visible.removeRange(userIndex, _visible.length);
+      _input.text = text;
+    });
+    final historyIndex =
+        _agent.history.lastIndexWhere((message) => message.role == 'user');
+    if (historyIndex >= 0) {
+      _agent.history.removeRange(historyIndex, _agent.history.length);
+    }
+    final id = _threadId;
+    if (id != null) await widget.chats.replaceMessages(id, _agent.history);
+    await _send();
+  }
+
+  void _scrollToEnd({bool animated = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
-        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+        final end = _scroll.position.maxScrollExtent;
+        if (animated) {
+          _scroll.animateTo(end,
+              duration: const Duration(milliseconds: 90),
+              curve: Curves.easeOut);
+        } else {
+          _scroll.jumpTo(end);
+        }
       }
     });
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!_runtimeReady) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Burrow')),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Burrow'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(widget.title, overflow: TextOverflow.ellipsis),
+            Text(_runtime.sandbox.workspacePath,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11)),
+          ],
+        ),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(28),
           child: _SandboxBar(
@@ -481,14 +698,30 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           ),
         ),
         actions: [
+          IconButton(
+            tooltip: '打开终端',
+            onPressed: () => setState(() => _tab = 1),
+            icon: const Icon(Icons.terminal_outlined),
+          ),
+          IconButton(
+            tooltip: '设置',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => SettingsPage(
+                  store: widget.settings,
+                  client: widget.llm,
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.settings_outlined),
+          ),
           PopupMenuButton<ApprovalMode>(
             icon: const Icon(Icons.shield_outlined),
             initialValue: _agent.mode,
             onSelected: (m) => setState(() => _agent.mode = m),
             itemBuilder: (_) => const [
               PopupMenuItem(value: ApprovalMode.readOnly, child: Text('只读')),
-              PopupMenuItem(
-                  value: ApprovalMode.onRequest, child: Text('按需审批')),
+              PopupMenuItem(value: ApprovalMode.onRequest, child: Text('按需审批')),
               PopupMenuItem(value: ApprovalMode.auto, child: Text('自动执行')),
               PopupMenuItem(value: ApprovalMode.yolo, child: Text('关闭沙箱')),
             ],
@@ -514,7 +747,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             Expanded(child: TerminalView(_terminal)),
           ]),
           _CheckpointTimeline(
-            snapshots: widget.snapshots,
+            snapshots: _runtime.snapshots,
             prefixGens: widget.prefixGens,
             onRolledBack: (msg) => setState(() => _status = msg),
           ),
@@ -539,7 +772,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           Expanded(
             child: ListView.builder(
               controller: _scroll,
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 18),
               itemCount: _visible.length + (_streaming.isEmpty ? 0 : 1),
               itemBuilder: (_, i) {
                 if (i == _visible.length) {
@@ -547,13 +780,29 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                       role: 'assistant', text: _streaming.toString());
                 }
                 return _Bubble(
-                    role: _visible[i].role, text: _visible[i].content);
+                  role: _visible[i].role,
+                  text: _visible[i].content,
+                  onRetry: i == _visible.length - 1 &&
+                          _visible[i].role == 'assistant' &&
+                          !_busy
+                      ? _retry
+                      : null,
+                );
               },
             ),
           ),
           SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            top: false,
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                border: Border(
+                  top: BorderSide(
+                    color: Theme.of(context).colorScheme.outlineVariant,
+                  ),
+                ),
+              ),
               child: Row(
                 children: [
                   Expanded(
@@ -562,22 +811,23 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                       enabled: !_busy,
                       minLines: 1,
                       maxLines: 5,
-                      decoration: const InputDecoration(
-                        hintText: '让 agent 做点什么…',
-                        border: OutlineInputBorder(),
-                        isDense: true,
+                      decoration: InputDecoration(
+                        hintText: '描述你希望 Agent 完成的任务',
+                        filled: true,
+                        fillColor:
+                            Theme.of(context).colorScheme.surfaceContainerLow,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
                       ),
                       onSubmitted: (_) => _send(),
                     ),
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
-                    onPressed: _busy ? null : _send,
+                    onPressed: _busy ? _stop : _send,
                     icon: _busy
-                        ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2))
+                        ? const Icon(Icons.stop_rounded)
                         : const Icon(Icons.arrow_upward),
                   ),
                 ],
@@ -625,7 +875,8 @@ class _SandboxBar extends StatelessWidget {
 class _Bubble extends StatelessWidget {
   final String role;
   final String text;
-  const _Bubble({required this.role, required this.text});
+  final VoidCallback? onRetry;
+  const _Bubble({required this.role, required this.text, this.onRetry});
 
   @override
   Widget build(BuildContext context) {
@@ -634,22 +885,71 @@ class _Bubble extends StatelessWidget {
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.all(10),
-        constraints: BoxConstraints(
-            maxWidth: MediaQuery.of(context).size.width * 0.85),
+        margin: const EdgeInsets.symmetric(vertical: 8),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+        constraints:
+            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.85),
         decoration: BoxDecoration(
-          color: isUser
-              ? scheme.primaryContainer
-              : scheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(12),
+          color:
+              isUser ? scheme.primaryContainer : scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: scheme.outlineVariant),
         ),
-        child: SelectableText(
-          text,
-          // 工具结果里全是命令和路径，等宽字体可读性差别很大。
-          style: role == 'tool'
-              ? const TextStyle(fontFamily: 'monospace', fontSize: 12)
-              : null,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(isUser ? Icons.person_outline : Icons.auto_awesome,
+                    size: 18),
+                const SizedBox(width: 8),
+                Text(isUser ? '你' : 'Burrow',
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(width: 8),
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF66BB6A),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            MarkdownBody(
+              data: text,
+              selectable: true,
+              styleSheet: role == 'tool'
+                  ? MarkdownStyleSheet(
+                      p: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                    )
+                  : null,
+            ),
+            if (!isUser && text.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 4),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '复制',
+                    onPressed: () =>
+                        Clipboard.setData(ClipboardData(text: text)),
+                    icon: const Icon(Icons.copy_outlined, size: 17),
+                  ),
+                  if (onRetry != null)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '重新生成',
+                      onPressed: onRetry,
+                      icon: const Icon(Icons.refresh, size: 18),
+                    ),
+                ],
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -707,8 +1007,7 @@ class _CheckpointTimelineState extends State<_CheckpointTimeline> {
               '${report.unrecoverable.join('\n')}'),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('知道了')),
+                onPressed: () => Navigator.pop(ctx), child: const Text('知道了')),
           ],
         ),
       );
@@ -737,10 +1036,11 @@ class _CheckpointTimelineState extends State<_CheckpointTimeline> {
             child: ListTile(
               dense: true,
               leading: CircleAvatar(
-                  radius: 14, child: Text('${cp.generation}',
+                  radius: 14,
+                  child: Text('${cp.generation}',
                       style: const TextStyle(fontSize: 11))),
-              title: Text(cp.reason, maxLines: 2,
-                  overflow: TextOverflow.ellipsis),
+              title:
+                  Text(cp.reason, maxLines: 2, overflow: TextOverflow.ellipsis),
               subtitle: Text('${cp.changes.length} 处变更 · '
                   '${_time(cp.createdAt)}'),
               trailing: IconButton(
@@ -751,8 +1051,7 @@ class _CheckpointTimelineState extends State<_CheckpointTimeline> {
             ),
           ),
         const SizedBox(height: 24),
-        Text('环境代  (rootfs)',
-            style: Theme.of(context).textTheme.titleSmall),
+        Text('环境代  (rootfs)', style: Theme.of(context).textTheme.titleSmall),
         const SizedBox(height: 8),
         if (envGens.isEmpty)
           const Padding(
@@ -764,8 +1063,8 @@ class _CheckpointTimelineState extends State<_CheckpointTimeline> {
             child: ListTile(
               dense: true,
               leading: const Icon(Icons.inventory_2_outlined),
-              title: Text(g.reason, maxLines: 2,
-                  overflow: TextOverflow.ellipsis),
+              title:
+                  Text(g.reason, maxLines: 2, overflow: TextOverflow.ellipsis),
               subtitle: Text('${_time(g.createdAt)} · '
                   '独占 ${(g.uniqueBytes / 1024 / 1024).toStringAsFixed(1)}MB'),
               trailing: IconButton(

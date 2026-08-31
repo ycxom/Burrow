@@ -48,8 +48,7 @@ void main() {
 
       final entries = await r.entries();
       expect(entries.length, 2);
-      expect(await r.entryCount, 2,
-          reason: '条目数必须在解压前就能拿到，否则没法显示进度');
+      expect(await r.entryCount, 2, reason: '条目数必须在解压前就能拿到，否则没法显示进度');
 
       final hello = entries.firstWhere((e) => e.name == 'hello.txt');
       expect(utf8.decode(await r.read(hello)), 'hello world');
@@ -74,7 +73,8 @@ void main() {
 
       final r = await ZipReader.open(File('${tmp.path}/t.zip'));
       addTearDown(r.close);
-      final e = (await r.entries()).firstWhere((x) => x.name.endsWith('run.sh'));
+      final e =
+          (await r.entries()).firstWhere((x) => x.name.endsWith('run.sh'));
       expect(e.mode & 0x49, isNot(0),
           reason: '丢了执行位的话解出来的 bin/bash 跑不起来，整个环境是废的');
     });
@@ -128,13 +128,14 @@ void main() {
 
       if (Platform.isLinux || Platform.isMacOS) {
         await Process.run('ln', ['-s', 'plain.txt', '${src.path}/link.txt']);
-        await Process.run('ln', ['${src.path}/plain.txt', '${src.path}/hard.txt']);
+        await Process.run(
+            'ln', ['${src.path}/plain.txt', '${src.path}/hard.txt']);
         await Process.run('chmod', ['755', '${src.path}/plain.txt']);
       }
 
       final out = File('${tmp.path}/t.tar.gz');
-      final r = await Process.run(
-          'tar', ['-czf', out.path, '-C', src.path, '.']);
+      final r =
+          await Process.run('tar', ['-czf', out.path, '-C', src.path, '.']);
       if (r.exitCode != 0) return null;
       return out;
     }
@@ -163,10 +164,9 @@ void main() {
       expect(types['sub'], TarEntryType.directory);
 
       // 长路径：>100 字节，必须走 GNU 'L' 或 PAX 分支才读得对
-      final deep = seen.keys.firstWhere((k) => k.endsWith('deep.txt'),
-          orElse: () => '');
-      expect(deep, isNotEmpty,
-          reason: '超长路径没解出来 —— GNU long name / PAX 分支有问题');
+      final deep =
+          seen.keys.firstWhere((k) => k.endsWith('deep.txt'), orElse: () => '');
+      expect(deep, isNotEmpty, reason: '超长路径没解出来 —— GNU long name / PAX 分支有问题');
       expect(deep.length, greaterThan(100));
       expect(seen[deep], 'deep');
     });
@@ -231,8 +231,8 @@ void main() {
       await Process.run('ln', ['-s', 'usr/bin', '${src.path}/bin']);
 
       final out = File('${tmp.path}/merged.tar.gz');
-      final r = await Process.run(
-          'tar', ['-czf', out.path, '-C', src.path, '.']);
+      final r =
+          await Process.run('tar', ['-czf', out.path, '-C', src.path, '.']);
       if (r.exitCode != 0) {
         markTestSkipped('系统上没有可用的 tar');
         return;
@@ -302,9 +302,7 @@ Uint8List _buildZip(Map<String, List<int>> files) {
     final nameBytes = utf8.encode(name);
     // 小文件用 stored，大文件用 deflate —— 两条解码路径都要被走到
     final useDeflate = content.length > 100;
-    final stored = useDeflate
-        ? ZLibCodec(raw: true).encode(content)
-        : content;
+    final stored = useDeflate ? ZLibCodec(raw: true).encode(content) : content;
     final crc = _crc32(content);
 
     final local = BytesBuilder();

@@ -124,8 +124,9 @@ class OutputDistiller {
       if (runRule == null) return;
       if (runRule!.keepLast && runLast != null) kept.add(runLast!);
       if (runCount > (runRule!.keepLast ? 1 : 0)) {
-        collapsed[runRule!.name] =
-            (collapsed[runRule!.name] ?? 0) + runCount - (runRule!.keepLast ? 1 : 0);
+        collapsed[runRule!.name] = (collapsed[runRule!.name] ?? 0) +
+            runCount -
+            (runRule!.keepLast ? 1 : 0);
       }
       runRule = null;
       runLast = null;
@@ -275,39 +276,45 @@ class OutputDistiller {
   /// 默认折叠规则。按「命中率 × 无信息量」排的：越靠前的越常见越没用。
   static final List<CollapseRule> defaultRules = [
     // pip：Collecting / Downloading / Using cached / Requirement already satisfied
-    CollapseRule('pip 进度',
+    CollapseRule(
+        'pip 进度',
         (l) => RegExp(r'^\s*(Collecting|Downloading|Using cached|'
                 r'Requirement already satisfied|Installing collected|Preparing metadata|'
                 r'Building wheel|Created wheel|Stored in directory|Saved )')
             .hasMatch(l)),
 
     // 进度条：多个连续的 # = - 或百分比
-    CollapseRule('进度条',
+    CollapseRule(
+        '进度条',
         (l) => RegExp(r'(\d+%\|[█▏▎▍▌▋▊▉ ]+\||^\s*[#=\-\.]{10,}\s*$|'
                 r'\d+(\.\d+)?\s*[KMG]B/s|ETA \d)')
             .hasMatch(l)),
 
     // apt/dpkg 的逐包噪声
-    CollapseRule('apt 进度',
+    CollapseRule(
+        'apt 进度',
         (l) => RegExp(r'^\s*(Get:|Hit:|Ign:|Reading |Building dependency|'
                 r'Unpacking |Preparing to unpack|Selecting previously|'
                 r'Setting up |Processing triggers)')
             .hasMatch(l)),
 
     // npm/yarn
-    CollapseRule('npm 进度',
+    CollapseRule(
+        'npm 进度',
         (l) => RegExp(r'^\s*(npm (WARN|notice|http)|added \d+ packages|'
                 r'⸨[\s#▓░]+⸩)')
             .hasMatch(l)),
 
     // 编译器逐文件回显（真正的 error/warning 不匹配这条，会被保留）
-    CollapseRule('编译回显',
+    CollapseRule(
+        '编译回显',
         (l) => RegExp(r'^\s*(\[\s*\d+%\]|CC |CXX |LD |AR |gcc |g\+\+ |clang |'
                 r'make\[\d+\]: (Entering|Leaving) directory)')
             .hasMatch(l)),
 
     // git clone / fetch
-    CollapseRule('git 进度',
+    CollapseRule(
+        'git 进度',
         (l) => RegExp(r'(Receiving objects|Resolving deltas|Counting objects|'
                 r'Compressing objects|remote: (Counting|Compressing|Total))')
             .hasMatch(l)),

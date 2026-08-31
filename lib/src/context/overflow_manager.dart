@@ -108,7 +108,9 @@ class OverflowManager {
     var byTokens = false;
     if (trigger != OverflowTrigger.messageCount) {
       final tokens = TokenCounter.estimateMessages(
-        history.skip(_checkpoint).map((m) => (role: m.role, content: m.content)),
+        history
+            .skip(_checkpoint)
+            .map((m) => (role: m.role, content: m.content)),
       );
       byTokens = tokens >= tokenThreshold * 2;
     }
@@ -164,7 +166,8 @@ class OverflowManager {
 
   int _findCheckpoint(List<ChatMessage> history) {
     if (trigger == OverflowTrigger.messageCount) {
-      return (history.length - messageThreshold).clamp(_checkpoint, history.length);
+      return (history.length - messageThreshold)
+          .clamp(_checkpoint, history.length);
     }
     // 从尾部往前累加 token，累到阈值为止 —— 那个位置就是新 checkpoint。
     var tokens = 0;
