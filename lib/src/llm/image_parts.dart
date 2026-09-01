@@ -58,6 +58,91 @@ class ImageLoadException implements Exception {
   String toString() => message;
 }
 
+/// 这张图是不是 **APNG**（会动的 PNG）。
+///
+/// 判据是 PNG 签名之后、第一个 `IDAT` 之前出现过一个 `acTL` 块 ——
+/// 这是规范定的顺序，写在 IDAT 后面的 acTL 按规范应当被忽略。
+///
+/// 要单独认它，是因为**它和普通 PNG 的文件头一模一样**。当成静态 PNG
+/// 重新编码一遍，动画就没了，而文件还是 `image/png`、还能正常显示，
+/// 谁也看不出丢了东西。
+bool isAnimatedPng(List<int> bytes) {
+  const signature = <int>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+  if (bytes.length < signature.length) return false;
+  for (var i = 0; i < signature.length; i++) {
+    if (bytes[i] != signature[i]) return false;
+  }
+
+  var offset = signature.length;
+  while (offset + 8 <= bytes.length) {
+    // 块头：4 字节长度（大端）+ 4 字节类型。
+    final length = (bytes[offset] << 24) |
+        (bytes[offset + 1] << 16) |
+        (bytes[offset + 2] << 8) |
+        bytes[offset + 3];
+    if (length < 0) return false;
+    final type = String.fromCharCodes(bytes, offset + 4, offset + 8);
+    if (type == 'acTL') return true;
+    // IDAT 之后再出现的 acTL 不算数，直接收工。
+    if (type == 'IDAT' || type == 'IEND') return false;
+    // 块长 + 长度字段 + 类型字段 + CRC。
+    offset += length + 12;
+  }
+  return false;
+}
+
+/// 一张图在发出去之前该被怎么处理。
+enum ImageDisposition {
+  /// 原始字节一个都不动。
+  keep,
+
+  /// 缩放后重新编码成 JPEG。
+  toJpeg,
+
+  /// 缩放后重新编码成 PNG。
+  toPng,
+}
+
+/// 决定怎么处理这张图。**纯函数，三条规则的唯一出处。**
+///
+/// 1. **会动的原样留着**：GIF 和 APNG 一旦被重新编码（转格式也好、缩放也好）
+///    就变成一张静止的图，而结果看起来完全正常 —— 还是一张能显示的图，
+///    谁也看不出丢了东西。这是最该避免的那类静默损失，所以宁可放弃缩放
+///    带来的体积收益。
+/// 2. **JPEG 保持 JPEG**：三家 API 和几乎所有网关都收 JPEG，没有转格式的
+///    理由；而转成 PNG 会让一张照片**变大接近一倍**（实测 1.5MB → 2.6MB），
+///    还要每轮重传。尺寸没超上限时连重编码都省掉 —— 二次压缩是纯损失。
+/// 3. **其余一律转 PNG**：各家网关对格式的容忍度差别很大，PNG 是唯一一个
+///    "填进去基本不会被拒"的；WebP 一半的自建网关不认，HEIC（现在手机默认
+///    存这个）几乎没有云端认。而不认的时候未必报错 —— 实测见过网关把不认识
+///    的字节当损坏图片解出一张花屏，然后模型一本正经地描述那张花屏。
+///    认不出类型的（HEIC 就是这一类）也走这条，交给平台解码器试一次。
+ImageDisposition dispositionFor({
+  required String? mediaType,
+  required List<int> bytes,
+  required int longestSide,
+  required int maxSide,
+}) {
+  if (isAnimated(mediaType, bytes)) return ImageDisposition.keep;
+  if (mediaType == 'image/jpeg') {
+    return longestSide > maxSide
+        ? ImageDisposition.toJpeg
+        : ImageDisposition.keep;
+  }
+  return ImageDisposition.toPng;
+}
+
+/// 会动吗。**和尺寸无关**，所以能在读图头之前就问。
+///
+/// 单独拎出来是因为踩过一次：调用方为了"先把会动的挡掉"而用一个假的
+/// `longestSide: 0` 去问 [dispositionFor]，结果**每一张 JPEG 都因为
+/// `0 > maxSide` 不成立而走了 keep** —— 大图再也不缩了，而且完全没有报错，
+/// 只有去翻磁盘上的文件大小才看得出来。判断依据不同的两件事就不该共用
+/// 同一个入口。
+bool isAnimated(String? mediaType, List<int> bytes) =>
+    mediaType == 'image/gif' ||
+    (mediaType == 'image/png' && isAnimatedPng(bytes));
+
 /// 从文件头认图片类型。认不出来返回 null。
 ///
 /// 只认这四种：三家 API 公认支持的就是这几个。认不出的类型宁可报错，

@@ -42,9 +42,14 @@ dependencies:
   # Debian 官方 rootfs 使用 tar.xz；流式解成临时 tar 后复用安全 tar 解包器。
   archive: ^4.0.9
 
-  # 选图。maxWidth/imageQuality 在平台层就把图缩好，
-  # 不用把一张 12MP 的原图整个读进 Dart 堆再自己缩。
+  # 选图。**不用它的 maxWidth/imageQuality** —— 那会让平台层重新编码，
+  # GIF 进去出来就是一张静态 JPEG。缩放和编码自己来，见 image_transcode.dart。
   image_picker: ^1.1.2
+
+  # 只为了 encodeJpg：`dart:ui` 自带 PNG 编码器但不会编 JPEG，
+  # 而照片必须留在 JPEG（转 PNG 会大接近一倍）。解码仍然走平台解码器 ——
+  # 纯 Dart 的解不开 HEIC。
+  image: ^4.5.4
 
 dev_dependencies:
   flutter_test:

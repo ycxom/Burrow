@@ -99,6 +99,96 @@ void main() {
     });
   });
 
+  group('前置格式转换的取舍', () {
+    /// 拼一个带指定块的 PNG。只要块头对，判定逻辑就够用。
+    List<int> png(List<String> chunks) {
+      final out = <int>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+      for (final type in chunks) {
+        out.addAll(<int>[0, 0, 0, 0]); // 长度 0
+        out.addAll(type.codeUnits); // 类型
+        out.addAll(<int>[0, 0, 0, 0]); // CRC
+      }
+      return out;
+    }
+
+    test('acTL 在 IDAT 之前 = APNG', () {
+      expect(isAnimatedPng(png(<String>['IHDR', 'acTL', 'IDAT'])), isTrue);
+    });
+
+    test('没有 acTL 就是普通 PNG', () {
+      expect(isAnimatedPng(png(<String>['IHDR', 'IDAT', 'IEND'])), isFalse);
+    });
+
+    test('IDAT 之后的 acTL 不算', () {
+      // 规范说了这种要忽略。当成 APNG 的话，一张普通 PNG 会被跳过缩放，
+      // 白白多传几 MB。
+      expect(isAnimatedPng(png(<String>['IHDR', 'IDAT', 'acTL'])), isFalse);
+    });
+
+    test('不是 PNG 的一律 false，且不会越界', () {
+      expect(isAnimatedPng(_jpeg), isFalse);
+      expect(isAnimatedPng(const <int>[]), isFalse);
+      expect(isAnimatedPng(const <int>[0x89, 0x50]), isFalse);
+      // 块头声称的长度远超实际字节，扫描要停得下来。
+      expect(
+        isAnimatedPng(<int>[
+          0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, //
+          0x7F, 0xFF, 0xFF, 0xFF, ...'IHDR'.codeUnits,
+        ]),
+        isFalse,
+      );
+    });
+
+    ImageDisposition disposition(String? type, List<int> bytes, int longest) =>
+        dispositionFor(
+          mediaType: type,
+          bytes: bytes,
+          longestSide: longest,
+          maxSide: 1600,
+        );
+
+    test('会动的两种原样留着，多大都不动', () {
+      // 重新编码就等于把动画拍平，而结果看起来完全正常 ——
+      // 还是一张能显示的图，谁也看不出丢了东西。缩放的体积收益不要了。
+      expect(disposition('image/gif', _gif, 4000), ImageDisposition.keep);
+      expect(
+        disposition('image/png', png(<String>['acTL', 'IDAT']), 4000),
+        ImageDisposition.keep,
+      );
+    });
+
+    test('「会不会动」和尺寸无关，能单独问', () {
+      // 真机上踩过：调用方为了先挡掉动图，拿 longestSide: 0 去问
+      // dispositionFor，于是**每张 JPEG 都因为 0 > maxSide 不成立而走了
+      // keep** —— 大图再也不缩，而且一声不吭，只有翻磁盘才看得出来。
+      expect(isAnimated('image/gif', _gif), isTrue);
+      expect(isAnimated('image/png', png(<String>['acTL', 'IDAT'])), isTrue);
+      expect(isAnimated('image/jpeg', _jpeg), isFalse);
+      expect(isAnimated('image/png', png(<String>['IHDR', 'IDAT'])), isFalse);
+      expect(isAnimated(null, const <int>[1, 2, 3]), isFalse);
+    });
+
+    test('JPEG 保持 JPEG，够小就一个字节都不动', () {
+      // 三家和几乎所有网关都收 JPEG，没有转格式的理由；转 PNG 反而会让
+      // 一张照片大接近一倍，而且每轮重传。够小时连重编码都省 ——
+      // 二次压缩是纯损失。
+      expect(disposition('image/jpeg', _jpeg, 1600), ImageDisposition.keep);
+      expect(disposition('image/jpeg', _jpeg, 1601), ImageDisposition.toJpeg);
+    });
+
+    test('其余一律转 PNG', () {
+      expect(disposition('image/webp', _webp, 800), ImageDisposition.toPng);
+      // 静态 PNG 也过一遍：格式已经对了，但还得缩尺寸。
+      expect(
+        disposition('image/png', png(<String>['IHDR', 'IDAT']), 4000),
+        ImageDisposition.toPng,
+      );
+      // 认不出来的（HEIC 就是这一类）交给平台解码器试，不放过。
+      expect(disposition(null, const <int>[1, 2, 3], 4000),
+          ImageDisposition.toPng);
+    });
+  });
+
   group('读图', () {
     test('文件不在时说清是哪张', () async {
       await expectLater(

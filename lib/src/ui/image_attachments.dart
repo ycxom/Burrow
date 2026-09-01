@@ -6,13 +6,18 @@
 /// 长期存的，界面上那张缩略图得三个月后还能打开。所以选完立刻拷进这个会话
 /// 自己的目录 —— 会话删了，图跟着删，不用另做一套引用计数。
 ///
-/// ## 为什么在选的时候就缩
+/// ## 为什么在选的时候就缩、就转格式
 ///
-/// 手机相机随手一张就是 12MP、4MB。base64 之后 5.3MB，一次请求发出去要
-/// 十几秒，而且**每一轮都要重发一次**（历史里的图会跟着上下文一起再传）。
-/// 缩到 1600px 长边、JPEG 质量 85，截图和照片都还看得清文字，体积落到
-/// 一两百 KB。缩放交给 `image_picker` 的 maxWidth/imageQuality 在平台层做，
-/// 不用把原图整个读进 Dart 堆。
+/// 手机相机随手一张就是 12MP、4MB，而且**每一轮都要重发一次**（历史里的图
+/// 会跟着上下文一起再传）。缩到 1600px 长边之后体积落到能接受的范围，
+/// 而且这件事只做一次。
+///
+/// 格式同理：统一成 PNG（见 image_transcode.dart），后面就不用每次发送前
+/// 再解码编码一遍。
+///
+/// **缩放和编码都自己做，不用 `image_picker` 的 `maxWidth`/`imageQuality`。**
+/// 那两个参数会让平台层重新编码，而重新编码会把 GIF 拍成一张静态 JPEG ——
+/// 动图就这么没了，且看不出来。
 library;
 
 import 'dart:io';
@@ -21,12 +26,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'chat_theme.dart';
-
-/// 长边上限。1600 是"截图上的小字还认得出"和"体积可接受"的折中。
-const _maxPickDimension = 1600.0;
-
-/// JPEG 质量。85 以下截图里的文字边缘开始出现可见的振铃。
-const _pickQuality = 85;
+import 'image_transcode.dart';
 
 /// 一次最多附几张。
 ///
@@ -42,25 +42,17 @@ class ImageAttachmentStore {
 
   final ImagePicker _picker = ImagePicker();
 
-  /// 从相册挑几张。返回**已经拷进会话目录**的绝对路径。
+  /// 从相册挑几张。返回**已经转好格式、拷进会话目录**的绝对路径。
   Future<List<String>> pickFromGallery({int limit = maxAttachments}) async {
-    final picked = await _picker.pickMultiImage(
-      maxWidth: _maxPickDimension,
-      maxHeight: _maxPickDimension,
-      imageQuality: _pickQuality,
-    );
+    // 不传 maxWidth/imageQuality：要的是原图，缩放和编码自己做。
+    final picked = await _picker.pickMultiImage();
     if (picked.isEmpty) return const <String>[];
     return _adopt(picked.take(limit));
   }
 
   /// 现拍一张。
   Future<List<String>> pickFromCamera() async {
-    final shot = await _picker.pickImage(
-      source: ImageSource.camera,
-      maxWidth: _maxPickDimension,
-      maxHeight: _maxPickDimension,
-      imageQuality: _pickQuality,
-    );
+    final shot = await _picker.pickImage(source: ImageSource.camera);
     if (shot == null) return const <String>[];
     return _adopt(<XFile>[shot]);
   }
@@ -69,25 +61,16 @@ class ImageAttachmentStore {
     await dir.create(recursive: true);
     final out = <String>[];
     for (final file in files) {
+      final transcoded = await transcodeForUpload(await file.readAsBytes());
       // 用时间戳+序号命名，不用原文件名：相册里的名字可能重复，也可能带
       // 路径分隔符之外的怪字符。这里只需要唯一。
       final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
-      final ext = _extensionOf(file.name);
-      final target = File('${dir.path}/img_${stamp}_${out.length}$ext');
-      await target.writeAsBytes(await file.readAsBytes());
+      final target =
+          File('${dir.path}/img_${stamp}_${out.length}${transcoded.extension}');
+      await target.writeAsBytes(transcoded.bytes);
       out.add(target.path);
     }
     return out;
-  }
-
-  static String _extensionOf(String name) {
-    final dot = name.lastIndexOf('.');
-    if (dot < 0 || dot == name.length - 1) return '.jpg';
-    final ext = name.substring(dot).toLowerCase();
-    // 只留认识的。缩放之后 image_picker 一律输出 JPEG，
-    // 但 HEIC 之类的原扩展名有时会被原样带过来。
-    const known = <String>{'.jpg', '.jpeg', '.png', '.gif', '.webp'};
-    return known.contains(ext) ? ext : '.jpg';
   }
 }
 
