@@ -25,7 +25,9 @@ import 'src/sandbox/prefix_generations.dart';
 import 'src/sandbox/pty_channel.dart';
 import 'src/sandbox/sandbox_session.dart';
 import 'src/sandbox/snapshot_store.dart';
+import 'src/settings/account_store.dart';
 import 'src/settings/settings_store.dart';
+import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
 
 Future<void> main() async {
@@ -206,6 +208,25 @@ Future<void> _boot({
   final settings = await SettingsStore.load();
   final chats = await ChatStore.open();
   final llm = ConfigurableLlmClient(config: settings.config);
+  final accounts = await AccountStore.load();
+
+  // Skill 装在 rootfs 的 /opt/burrow-skills 里，索引留在 app 私有目录 ——
+  // rootfs 会被「代目录 + 原子 rename」整个换掉，索引跟着丢的话
+  // 用户会看到「我明明装过的 skill 不见了」。见 SkillStore 的注释。
+  final skills = SkillStore(
+    root: activeDistro.value == null
+        ? null
+        : Directory('${activeDistro.value!.rootfs.path}/opt/burrow-skills'),
+    indexFile: File('${files.path}/skills/index.json'),
+    fetch: (url) async {
+      final resp = await http.get(Uri.parse(url));
+      if (resp.statusCode != 200) {
+        throw SkillException('下载失败：HTTP ${resp.statusCode}  $url');
+      }
+      return resp.bodyBytes;
+    },
+  );
+  await skills.open();
 
   runApp(BurrowApp(
     buildRuntime: buildRuntime,
@@ -219,13 +240,16 @@ Future<void> _boot({
       prefixGens: gens,
       overflow: OverflowManager(
         summarize: llm.summarize,
-        trigger: OverflowTrigger.either,
-        messageThreshold: 30,
-        tokenThreshold: 4000,
+        trigger: settings.overflowTrigger,
+        messageThreshold: settings.messageThreshold,
+        tokenThreshold: settings.tokenThreshold,
       ),
       retrieval: MemoryRetrieval(),
       distiller: OutputDistiller(),
       limitGuard: ContextLimitGuard(),
+      skills: skills,
+      mode: settings.approvalMode,
+      sandboxLevel: settings.sandboxLevel,
       outputArchiveDir:
           Directory('${sandboxRoot.path}/tasks/${runtime.id}/outputs'),
     ),
@@ -238,5 +262,7 @@ Future<void> _boot({
     llm: llm,
     settings: settings,
     chats: chats,
+    skills: skills,
+    accounts: accounts,
   ));
 }

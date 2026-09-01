@@ -16,6 +16,7 @@ import '../sandbox/exec_policy.dart';
 import '../sandbox/prefix_generations.dart';
 import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
+import '../skills/skill_store.dart';
 import 'tools.dart';
 
 /// 审批档位。语义对齐 codex。
@@ -79,6 +80,43 @@ class LlmTurn {
   const LlmTurn({required this.text, this.toolCalls = const []});
 }
 
+/// [AgentLoop.rewindTo] 的结果。
+class RewindResult {
+  /// 被截掉的消息，按原顺序。
+  final List<ChatMessage> dropped;
+
+  /// 实际回滚到的检查点；null 表示只截了对话、文件没动
+  /// （那条消息是老版本存的，没有检查点记录）。
+  final int? rolledBackTo;
+
+  /// 旧内容没存下来、回滚不回去的文件。非空时 UI 必须显示。
+  final List<String> unrecoverable;
+
+  const RewindResult({
+    required this.dropped,
+    required this.rolledBackTo,
+    this.unrecoverable = const [],
+  });
+
+  bool get filesRestored => rolledBackTo != null;
+}
+
+/// 服务端返回了 200，但里面既没有文本也没有工具调用。
+///
+/// 单独一个类型而不是 StateError：这个失败有非常具体的排查方向，
+/// 消息里要把方向给出来，而不是让用户去猜。
+class EmptyCompletionException implements Exception {
+  final String endpoint;
+  const EmptyCompletionException(this.endpoint);
+
+  @override
+  String toString() => '模型返回了空响应（$endpoint）。\n'
+      '常见原因是接口地址不对：Base URL 填服务根地址时，'
+      '有些网关的 /chat/completions 会返回前端页面而不是接口，'
+      '状态码仍然是 200，所以看起来像"没反应"。\n'
+      '可以在设置里点「测试连接」确认，或者把 Base URL 写到 /v1 那一层。';
+}
+
 class ContextOverflowException implements Exception {
   final int status;
   final String body;
@@ -97,6 +135,9 @@ class AgentLoop {
   final OutputDistiller distiller;
   final ContextLimitGuard limitGuard;
   final Directory outputArchiveDir;
+
+  /// 已连接的 skill。null 表示这个 app 没启用 skill 功能（单测里就是 null）。
+  final SkillStore? skills;
 
   ApprovalMode mode;
   SandboxLevel sandboxLevel;
@@ -133,6 +174,7 @@ class AgentLoop {
     required this.distiller,
     required this.limitGuard,
     required this.outputArchiveDir,
+    this.skills,
     this.mode = ApprovalMode.onRequest,
     this.sandboxLevel = SandboxLevel.workspaceWrite,
     this.terminalMode = false,
@@ -147,17 +189,22 @@ class AgentLoop {
     //
     // 聊天模式下连扫描都省掉：那一轮里没有任何东西能改文件，
     // 而扫 workspace 是真的要走一遍磁盘的，手机上不该白付这个钱。
+    int? checkpoint;
     if (terminalMode) {
       final cp = await snapshots.checkpoint(reason: _brief(userInput));
       if (cp != null) {
         host.onStatus('检查点 #${cp.generation}（${cp.changes.length} 处变更）');
       }
+      // 记 HEAD 而不是 cp.generation：本轮没改动时 checkpoint() 返回 null，
+      // 但「回到这条消息」要回到的仍然是当前这个状态，不是上一次有变更的状态。
+      checkpoint = snapshots.head;
     }
 
     history.add(ChatMessage(
       role: 'user',
       content: userInput,
       at: DateTime.now(),
+      checkpoint: checkpoint,
     ));
 
     // 用户提问里如果指向了被摘要挤出去的内容，先把它捞回来。
@@ -176,6 +223,18 @@ class AgentLoop {
     for (var round = 0; round < maxToolRounds; round++) {
       final turn = await _completeWithRetry();
       if (epoch != _cancelEpoch) throw const AgentCancelledException();
+
+      // 一次请求既没有文本也没有工具调用 —— 这不是"模型没话说"，
+      // 是这一轮什么都没发生。**必须报出来。**
+      //
+      // 实测踩过一次：baseUrl 填服务根地址时接口路径少了 `/v1`，
+      // 打到了聚合网关的前端页面上，那个路径返回 200 + 一坨 HTML。
+      // 每一层看起来都成功了（状态码 200、解析没抛），最后表现成
+      // 「消息发出去了，没有任何回应，也没有报错」—— 这是最难查的一类失败。
+      // 现在它会变成一条明确的错误消息。
+      if (round == 0 && turn.text.isEmpty && turn.toolCalls.isEmpty) {
+        throw EmptyCompletionException(llm.limitKey);
+      }
 
       if (turn.text.isNotEmpty) {
         history.add(ChatMessage(
@@ -215,6 +274,45 @@ class AgentLoop {
     final input = history[index].content;
     history.removeRange(index, history.length);
     await send(input);
+  }
+
+  /// 回到 history 里第 [index] 条消息之前的状态。
+  ///
+  /// 两件事一起做：截断对话，**并且**把 workspace 回滚到那条消息记下的检查点。
+  /// 只做前者的话，模型会对着一个它以为还没改过、实际已经被改过的 workspace
+  /// 重新推理 —— 那种不一致比不回滚更难查。
+  ///
+  /// 返回被丢弃的消息，调用方可以拿它做「撤销回滚」或者填回输入框。
+  Future<RewindResult> rewindTo(int index) async {
+    if (index < 0 || index >= history.length) {
+      return const RewindResult(dropped: [], rolledBackTo: null);
+    }
+    final target = history[index];
+    final dropped = history.sublist(index).toList(growable: false);
+    history.removeRange(index, history.length);
+
+    // 老会话的消息没有检查点记录（v3 之前的库）。这时只截对话，
+    // 并让调用方知道文件没回滚 —— 假装回滚过才是危险的。
+    final generation = target.checkpoint;
+    if (generation == null) {
+      return RewindResult(dropped: dropped, rolledBackTo: null);
+    }
+    if (generation == snapshots.head) {
+      // 已经在那个状态上，rollback 是空操作，但仍然算「回滚到了」。
+      return RewindResult(dropped: dropped, rolledBackTo: generation);
+    }
+    final report = await snapshots.rollbackTo(generation);
+    // 有存不回来的文件时必须说出来。一次"部分成功"的回滚被报告成成功，
+    // 用户会基于错误的前提继续往下做。
+    host.onStatus(report.unrecoverable.isEmpty
+        ? '已回到检查点 #$generation（恢复 ${report.restored.length} 个文件）'
+        : '已回到检查点 #$generation，但 ${report.unrecoverable.length} 个文件'
+            '的旧内容没存下来，无法恢复');
+    return RewindResult(
+      dropped: dropped,
+      rolledBackTo: generation,
+      unrecoverable: report.unrecoverable,
+    );
   }
 
   /// 撞到上下文超长时：学一次真实窗口，裁剪，重试一次。
@@ -294,6 +392,12 @@ class AgentLoop {
     if (!terminalMode) {
       return const ToolResult.rejected('当前是聊天模式，没有任何工具可用。需要执行命令或读写文件的话，'
           '请让用户在输入框下方勾选「终端模式」。');
+    }
+
+    // read_skill 要拿到 SkillStore，而 runReadOnlyTool 是个纯函数、
+    // 只认 workspace 路径。所以在进那条快路之前先截住它。
+    if (call.name == 'read_skill') {
+      return _readSkill(call);
     }
 
     // 只读工具走快路：不判策略、不打检查点。
@@ -482,6 +586,21 @@ class AgentLoop {
         outputRef: ref);
   }
 
+  Future<ToolResult> _readSkill(ToolCall call) async {
+    final name = (call.args['name'] as String?)?.trim() ?? '';
+    if (name.isEmpty) return const ToolResult.rejected('read_skill 缺少 name');
+
+    final store = skills;
+    final text = store == null ? null : await store.readSkill(name);
+    if (text == null) {
+      // 把可用清单一起回给模型。只说"没找到"的话它会反复猜名字，
+      // 而正确的名字就在系统提示里 —— 直接贴出来一轮就能纠正。
+      final available = store?.enabled.map((s) => s.name).join('、') ?? '（无）';
+      return ToolResult.rejected('没有名为 $name 的 skill。当前可用：$available');
+    }
+    return ToolResult.ok(text);
+  }
+
   // -------------------------------------------------------------------------
 
   /// 系统提示。两个模式给两份，差别不只是措辞。
@@ -521,7 +640,17 @@ class AgentLoop {
         '别反复重试 —— 装包这类需要联网的操作照常发起，外层会自动放行。\n'
         '4. 命令输出会被压缩后给你，需要细节用 grep_output 按 ref 查，'
         '别为了看全量输出重跑一遍命令。\n'
-        '回答用中文，简洁、直接。';
+        '回答用中文，简洁、直接。$skillSection';
+  }
+
+  /// skill 清单，接在系统提示末尾。
+  ///
+  /// 只放名字和一句话描述（见 SkillStore 里关于渐进式披露的说明）。
+  /// 关着的和没装的都不进来 —— 提到一个读不了的 skill，
+  /// 模型会去调 read_skill 然后拿到一个失败，白白烧掉一轮。
+  String get skillSection {
+    final section = skills?.promptSection() ?? '';
+    return section.isEmpty ? '' : '\n\n$section';
   }
 
   List<MemoryDoc> _corpus() => [

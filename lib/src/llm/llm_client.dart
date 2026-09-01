@@ -20,6 +20,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'model_catalog.dart';
+
 import '../agent/agent_loop.dart';
 import '../agent/tools.dart';
 import '../context/overflow_manager.dart';
@@ -78,8 +80,8 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
       throw StateError('请先填写 Base URL 和模型');
     }
     final anthropic = value.apiFormat == 'anthropic';
-    final uri = _endpoint(
-        value.baseUrl, anthropic ? '/v1/messages' : '/chat/completions');
+    final uri =
+        _endpoint(value.baseUrl, anthropic ? '/messages' : '/chat/completions');
     http.Response response;
     try {
       response = await _http
@@ -125,19 +127,10 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     }
   }
 
-  /// 同时接受服务根地址和用户直接粘贴的完整接口地址，避免出现
-  /// `/v1/chat/completions/chat/completions` 这种很难看出的重复路径。
-  static Uri _endpoint(String baseUrl, String suffix) {
-    var base = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
-    if (base.endsWith(suffix)) return Uri.parse(base);
-    if (base.endsWith('/v1') && suffix.startsWith('/v1/')) {
-      return Uri.parse('$base${suffix.substring(3)}');
-    }
-    if (suffix == '/chat/completions' && base.endsWith('/v1')) {
-      return Uri.parse('$base$suffix');
-    }
-    return Uri.parse('$base$suffix');
-  }
+  /// 见 [resolveApiEndpoint]：同时接受服务根地址、带版本段的地址，
+  /// 和用户直接粘贴的完整接口地址。
+  static Uri _endpoint(String baseUrl, String suffix) =>
+      resolveApiEndpoint(baseUrl, suffix);
 
   @override
   String get limitKey => ContextLimitKey.of(config.baseUrl, config.model);
@@ -169,8 +162,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
   }) async {
     final request = http.Request(
       'POST',
-      Uri.parse('${config.baseUrl.replaceAll(RegExp(r'/$'), '')}'
-          '/chat/completions'),
+      _endpoint(config.baseUrl, '/chat/completions'),
     )
       ..headers.addAll({
         'Content-Type': 'application/json',
@@ -235,7 +227,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
         .join('\n\n');
     final request = http.Request(
       'POST',
-      Uri.parse('${config.baseUrl.replaceAll(RegExp(r'/$'), '')}/v1/messages'),
+      _endpoint(config.baseUrl, '/messages'),
     )
       ..headers.addAll(<String, String>{
         'Content-Type': 'application/json',
@@ -430,32 +422,45 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
   ///
   /// 非流式、低温度、不带工具 —— 摘要不该调用工具，带上 tools 只会诱导
   /// 某些模型在摘要任务里发起工具调用，产出一坨没法用的东西。
+  /// 摘要**永远不抛**。
+  ///
+  /// 它是一个尽力而为的优化：成功了上下文更短，失败了无非是窗口更满一点，
+  /// 下一轮 ContextLimitGuard 会接手。而它是在用户的对话回合中间被调用的
+  /// —— 让它抛出去等于「摘要服务抽风 → 用户这句话直接失败」，
+  /// 那是把一个可降级的问题升级成了不可用。
+  ///
+  /// 实测踩过一次：接口地址少了 `/v1`，打到网关前端页面，
+  /// 这里 `jsonDecode('<!doctype html>')` 抛 FormatException，
+  /// 整个回合挂掉，而用户看到的错误信息和真正的原因毫无关系。
   Future<String> summarize(String systemPrompt, String payload) async {
     if (!config.isConfigured) return '';
-    final response = await _http.post(
-      Uri.parse('${config.baseUrl.replaceAll(RegExp(r'/$'), '')}'
-          '/chat/completions'),
-      headers: {
-        'Content-Type': 'application/json',
-        if (config.apiKey.isNotEmpty)
-          'Authorization': 'Bearer ${config.apiKey}',
-      },
-      body: jsonEncode({
-        'model': config.summaryModel ?? config.model,
-        'temperature': 0.1,
-        'messages': [
-          {'role': 'system', 'content': systemPrompt},
-          {'role': 'user', 'content': payload},
-        ],
-      }),
-    );
-    if (response.statusCode >= 400) return '';
-    final body =
-        jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, Object?>;
-    final choices = body['choices'] as List?;
-    if (choices == null || choices.isEmpty) return '';
-    final msg = (choices.first as Map)['message'] as Map<String, Object?>?;
-    return (msg?['content'] as String?)?.trim() ?? '';
+    try {
+      final response = await _http.post(
+        _endpoint(config.baseUrl, '/chat/completions'),
+        headers: {
+          'Content-Type': 'application/json',
+          if (config.apiKey.isNotEmpty)
+            'Authorization': 'Bearer ${config.apiKey}',
+        },
+        body: jsonEncode({
+          'model': config.summaryModel ?? config.model,
+          'temperature': 0.1,
+          'messages': [
+            {'role': 'system', 'content': systemPrompt},
+            {'role': 'user', 'content': payload},
+          ],
+        }),
+      );
+      if (response.statusCode >= 400) return '';
+      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      if (decoded is! Map<String, Object?>) return '';
+      final choices = decoded['choices'] as List?;
+      if (choices == null || choices.isEmpty) return '';
+      final msg = (choices.first as Map)['message'] as Map<String, Object?>?;
+      return (msg?['content'] as String?)?.trim() ?? '';
+    } catch (_) {
+      return '';
+    }
   }
 
   static Map<String, Object?> _toWire(ChatMessage m) => {

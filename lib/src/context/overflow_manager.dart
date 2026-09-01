@@ -29,12 +29,28 @@ class ChatMessage {
   /// 工具调用产生的消息带这个引用，指向落盘的完整输出（见 OutputDistiller）。
   final String? outputRef;
 
+  /// 这条消息发出时 workspace 的检查点代号。
+  ///
+  /// 只有用户消息带它。「回到这条消息」要同时做两件事：把对话截断到这里，
+  /// **以及**把文件回滚到那一刻 —— 只截对话的话，模型会对着一个它以为
+  /// 还没改过、实际已经被改过的 workspace 重新推理，那种不一致比不回滚更糟。
+  final int? checkpoint;
+
   const ChatMessage({
     required this.role,
     required this.content,
     required this.at,
     this.outputRef,
+    this.checkpoint,
   });
+
+  ChatMessage copyWith({String? content, int? checkpoint}) => ChatMessage(
+        role: role,
+        content: content ?? this.content,
+        at: at,
+        outputRef: outputRef,
+        checkpoint: checkpoint ?? this.checkpoint,
+      );
 }
 
 /// 触发摘要的口径。
@@ -46,9 +62,13 @@ typedef Summarizer = Future<String> Function(
 class OverflowManager {
   final Summarizer summarize;
 
-  final OverflowTrigger trigger;
-  final int messageThreshold;
-  final int tokenThreshold;
+  /// 这三项**可变**：设置页改完要当场生效。
+  ///
+  /// 做成 final 的话，用户改完阈值得新建一个会话才看得到效果 ——
+  /// 而"改了没反应"是最容易被当成 bug 的一类体验。
+  OverflowTrigger trigger;
+  int messageThreshold;
+  int tokenThreshold;
 
   OverflowManager({
     required this.summarize,

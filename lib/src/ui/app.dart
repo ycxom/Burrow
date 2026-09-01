@@ -6,11 +6,10 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:xterm/xterm.dart';
 
 import '../agent/agent_loop.dart';
@@ -26,8 +25,14 @@ import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../llm/llm_client.dart';
 import '../settings/settings_store.dart';
+import '../settings/account_store.dart';
+import '../skills/skill_store.dart';
+import 'accounts_page.dart';
+import 'chat_drawer.dart';
+import 'chat_theme.dart';
+import 'chat_view.dart';
 import 'settings_page.dart';
-import 'thread_list_page.dart';
+import 'skills_page.dart';
 
 /// 当前 UI 文案是中文。把 locale 明确交给 Material 本地化后，TextField 的
 /// 原生操作菜单也会使用“剪切 / 复制 / 粘贴 / 全选”，而不是落回英文。
@@ -315,6 +320,30 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
 // 主应用
 // ---------------------------------------------------------------------------
 
+/// 主题。种子色和各处底色见 chat_theme.dart，
+/// 让 Material 组件（弹窗、按钮、进度条）和聊天区是同一套颜色 ——
+/// 只改聊天区的话，一点开设置页就会看出是两个 app 拼起来的。
+ThemeData _buildTheme(Brightness brightness) {
+  final tokens =
+      brightness == Brightness.light ? ChatTokens.light : ChatTokens.dark;
+  return ThemeData(
+    useMaterial3: true,
+    brightness: brightness,
+    colorScheme: ColorScheme.fromSeed(
+      seedColor: tokens.brand,
+      brightness: brightness,
+    ).copyWith(surface: tokens.bgPrimary),
+    scaffoldBackgroundColor: tokens.bgPrimary,
+    appBarTheme: AppBarTheme(
+      backgroundColor: tokens.bgPrimary,
+      foregroundColor: tokens.tintPrimary,
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+    ),
+    extensions: <ThemeExtension<dynamic>>[tokens],
+  );
+}
+
 class BurrowApp extends StatelessWidget {
   final AgentLoop Function(AgentHost host, TaskRuntime runtime) buildAgent;
   final Future<TaskRuntime> Function(String taskId) buildRuntime;
@@ -334,6 +363,8 @@ class BurrowApp extends StatelessWidget {
   final ConfigurableLlmClient llm;
   final SettingsStore settings;
   final ChatStore chats;
+  final SkillStore skills;
+  final AccountStore accounts;
 
   const BurrowApp({
     super.key,
@@ -348,6 +379,8 @@ class BurrowApp extends StatelessWidget {
     required this.llm,
     required this.settings,
     required this.chats,
+    required this.skills,
+    required this.accounts,
   });
 
   @override
@@ -356,45 +389,138 @@ class BurrowApp extends StatelessWidget {
         locale: _appLocale,
         supportedLocales: _supportedLocales,
         localizationsDelegates: _localizationsDelegates,
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF5065A8),
-            brightness: Brightness.light,
-          ),
-          useMaterial3: true,
-        ),
-        darkTheme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF9CABFF),
-            brightness: Brightness.dark,
-          ),
-          useMaterial3: true,
-        ),
-        home: ThreadListPage(
-          store: chats,
-          buildThread: (threadId, title) {
-            final runtimeId = threadId ??
-                'draft_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
-            return HomeShell(
-              buildAgent: buildAgent,
-              runtime: buildRuntime(runtimeId),
-              runtimeId: runtimeId,
-              capabilities: capabilities,
-              prefixGens: prefixGens,
-              spawner: spawner,
-              activeDistro: activeDistro,
-              distros: distros,
-              abi: abi,
-              llm: llm,
-              settings: settings,
-              chats: chats,
-              threadId: threadId,
-              title: title,
-            );
-          },
+        theme: _buildTheme(Brightness.light),
+        darkTheme: _buildTheme(Brightness.dark),
+        home: ChatShell(
+          buildAgent: buildAgent,
+          buildRuntime: buildRuntime,
+          capabilities: capabilities,
+          prefixGens: prefixGens,
+          spawner: spawner,
+          activeDistro: activeDistro,
+          distros: distros,
+          abi: abi,
+          llm: llm,
+          settings: settings,
+          chats: chats,
+          skills: skills,
+          accounts: accounts,
         ),
       );
 }
+
+/// 顶层外壳：管「当前打开的是哪个会话」。
+///
+/// 换会话是**原地替换**而不是 push 一个新页面。理由是导航栈：
+/// 从抽屉里点会话 A 再点会话 B，push 的话栈里会堆两层，
+/// 按返回键回到 A 是没人预期的行为（用户以为是退出）。
+///
+/// 替换的代价是 HomeShell 要连同它的 AgentLoop、TaskRuntime、pty 会话
+/// 一起重建。用 ValueKey(threadId) 让 Flutter 自己做这件事 ——
+/// 手动 dispose 再 init 极容易漏掉一个（尤其是 pty，漏了就泄露一个进程）。
+class ChatShell extends StatefulWidget {
+  final AgentLoop Function(AgentHost host, TaskRuntime runtime) buildAgent;
+  final Future<TaskRuntime> Function(String taskId) buildRuntime;
+  final SandboxCapabilities capabilities;
+  final PrefixGenerations prefixGens;
+  final PtyChannel spawner;
+  final ValueNotifier<InstalledDistro?> activeDistro;
+  final DistroManager distros;
+  final String abi;
+  final ConfigurableLlmClient llm;
+  final SettingsStore settings;
+  final ChatStore chats;
+  final SkillStore skills;
+  final AccountStore accounts;
+
+  const ChatShell({
+    super.key,
+    required this.buildAgent,
+    required this.buildRuntime,
+    required this.capabilities,
+    required this.prefixGens,
+    required this.spawner,
+    required this.activeDistro,
+    required this.distros,
+    required this.abi,
+    required this.llm,
+    required this.settings,
+    required this.chats,
+    required this.skills,
+    required this.accounts,
+  });
+
+  @override
+  State<ChatShell> createState() => _ChatShellState();
+}
+
+class _ChatShellState extends State<ChatShell> {
+  String? _threadId;
+  String _title = '新对话';
+
+  /// 未存盘会话的 runtime id。每开一个新会话换一个 ——
+  /// 复用的话两个草稿会共用同一个 workspace，互相看到对方的文件。
+  late String _draftId = _newDraftId();
+
+  static String _newDraftId() =>
+      'draft_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+
+  Future<void> _select(String? threadId) async {
+    if (threadId == null) {
+      setState(() {
+        _threadId = null;
+        _draftId = _newDraftId();
+        _title = '新对话';
+      });
+      return;
+    }
+    // 标题从库里取。抽屉传过来也行，但那会让「重命名后立刻切过去」
+    // 拿到旧标题 —— 多查一次的代价可以忽略。
+    final threads = await widget.chats.threads();
+    final match = threads.where((t) => t.id == threadId);
+    setState(() {
+      _threadId = threadId;
+      _title = match.isEmpty ? '对话' : match.first.title;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final runtimeId = _threadId ?? _draftId;
+    return HomeShell(
+      // key 变了 Flutter 就重建整棵子树，连同 pty 会话一起收干净。
+      key: ValueKey(runtimeId),
+      buildAgent: widget.buildAgent,
+      runtime: widget.buildRuntime(runtimeId),
+      runtimeId: runtimeId,
+      capabilities: widget.capabilities,
+      prefixGens: widget.prefixGens,
+      spawner: widget.spawner,
+      activeDistro: widget.activeDistro,
+      distros: widget.distros,
+      abi: widget.abi,
+      llm: widget.llm,
+      settings: widget.settings,
+      chats: widget.chats,
+      skills: widget.skills,
+      accounts: widget.accounts,
+      threadId: _threadId,
+      title: _title,
+      onSelectThread: _select,
+      onTitleChanged: (title) => setState(() => _title = title),
+    );
+  }
+}
+
+/// 报错气泡的前缀。
+///
+/// 用前缀识别而不是给 ChatMessage 加一个 isError 字段：这条消息要落进
+/// sqlite 再读回来，加字段要动表结构和迁移；而**不能**简单地"把 system
+/// 角色一律画成报错" —— 检索注入的历史片段也是 system 角色，它们会被
+/// 一起持久化，重开会话时同样出现在列表里。
+///
+/// 前缀对不上的最坏结果是报错画成了普通气泡，不会崩。
+const kErrorPrefix = '出错：';
 
 class HomeShell extends StatefulWidget {
   final AgentLoop Function(AgentHost host, TaskRuntime runtime) buildAgent;
@@ -409,8 +535,16 @@ class HomeShell extends StatefulWidget {
   final ConfigurableLlmClient llm;
   final SettingsStore settings;
   final ChatStore chats;
+  final SkillStore skills;
+  final AccountStore accounts;
   final String? threadId;
   final String title;
+
+  /// 抽屉里选了别的会话。
+  final ValueChanged<String?> onSelectThread;
+
+  /// 第一条消息落库之后，把标题回传给外壳。
+  final ValueChanged<String> onTitleChanged;
 
   const HomeShell({
     super.key,
@@ -426,8 +560,12 @@ class HomeShell extends StatefulWidget {
     required this.llm,
     required this.settings,
     required this.chats,
+    required this.skills,
+    required this.accounts,
     required this.threadId,
     required this.title,
+    required this.onSelectThread,
+    required this.onTitleChanged,
   });
 
   @override
@@ -445,6 +583,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   int _tab = 0;
   String? _status;
+  Timer? _statusTimer;
   bool _busy = false;
   bool _loadingHistory = true;
   bool _cancelRequested = false;
@@ -453,6 +592,19 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   String? _threadId;
 
   InstalledDistro? get _distro => widget.activeDistro.value;
+
+  /// 顶栏副标题上的瞬时状态。
+  ///
+  /// **会自己撤掉。** 状态说的是"刚刚发生了什么"，副标题平时要显示的是
+  /// "现在是什么"（模型 + 沙箱档位）。不撤的话副标题会永远停在最后一条
+  /// 状态上，而那两样恰恰是这个 app 要求一直可见的东西。
+  void _setStatus(String message) {
+    _statusTimer?.cancel();
+    setState(() => _status = message);
+    _statusTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _status = null);
+    });
+  }
 
   /// 助手当前这一轮的流式文本。单独存而不是每个 delta 都往 _visible 里塞，
   /// 否则每个 token 都触发一次列表重建，长回复时会明显掉帧。
@@ -469,7 +621,26 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     super.initState();
     _terminal = Terminal(maxLines: 5000);
     _threadId = widget.threadId;
+    // 设置页改了排版或模型名要立刻反映到这里。不订阅的话，从设置返回后
+    // 界面还是旧的，用户会以为那个开关坏了 —— 而它其实已经存下去了，
+    // 只是要杀进程重开才看得到，这是最难自证的一类"没生效"。
+    widget.settings.addListener(_onSettingsChanged);
     _prepareRuntime();
+  }
+
+  void _onSettingsChanged() {
+    if (!mounted) return;
+    // 设置页改完要**当场**对正在进行的会话生效，而不是等下次新建会话。
+    // `_agent` 是 late final，runtime 没准备好时读它会抛，所以要守一下。
+    if (_runtimeReady) {
+      _agent.sandboxLevel = widget.settings.sandboxLevel;
+      _agent.mode = widget.settings.approvalMode;
+      _agent.overflow
+        ..trigger = widget.settings.overflowTrigger
+        ..messageThreshold = widget.settings.messageThreshold
+        ..tokenThreshold = widget.settings.tokenThreshold;
+    }
+    setState(() {});
   }
 
   Future<void> _prepareRuntime() async {
@@ -559,6 +730,150 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     }
   }
 
+  // ---- 抽屉里的入口 ----
+
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsPage(
+          store: widget.settings,
+          client: widget.llm,
+          accounts: widget.accounts,
+          capabilities: widget.capabilities,
+          // 每个会话一个目录，父目录就是全部会话的容器。
+          tasksRoot: _runtime.root.parent,
+          currentTaskId: _runtime.id,
+          overflow: _agent.overflow,
+          snapshots: _runtime.snapshots,
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openSkills() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => SkillsPage(store: widget.skills)),
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openAccounts() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+          builder: (_) => AccountsPage(store: widget.accounts)),
+    );
+    if (mounted) setState(() {});
+  }
+
+  // ---- 消息操作 ----
+
+  /// 把某条用户消息填回输入框，并丢弃它之后的一切。
+  ///
+  /// 「编辑」在聊天里的语义就是「当没说过，重说一遍」，所以它和
+  /// 「回到这里」是同一个动作，只是多了一步把原文填回输入框。
+  Future<void> _editMessage(int visibleIndex) async {
+    if (_busy) return;
+    final text = _visible[visibleIndex].content;
+    final ok = await _rewind(visibleIndex, confirmTitle: '编辑并重发');
+    if (!ok) return;
+    _input.text = text;
+    _input.selection = TextSelection.collapsed(offset: text.length);
+  }
+
+  /// 回到某条消息之前：截断对话 + 回滚文件。
+  Future<void> _rewindTo(int visibleIndex) async {
+    if (_busy) return;
+    await _rewind(visibleIndex, confirmTitle: '回到这里');
+  }
+
+  /// 只截断对话，不动文件。
+  Future<void> _deleteFrom(int visibleIndex) async {
+    if (_busy) return;
+    final confirmed = await _confirm(
+      '删除这条及之后',
+      '这条消息和它之后的所有消息都会被删除。\n'
+          '文件不会回滚 —— 模型改过的东西还留在 workspace 里。',
+    );
+    if (!confirmed) return;
+
+    final historyIndex = _historyIndexOf(visibleIndex);
+    if (historyIndex >= 0) {
+      _agent.history.removeRange(historyIndex, _agent.history.length);
+    }
+    setState(() => _visible.removeRange(visibleIndex, _visible.length));
+    await _persist();
+  }
+
+  Future<bool> _rewind(int visibleIndex, {required String confirmTitle}) async {
+    final message = _visible[visibleIndex];
+    final hasCheckpoint = message.checkpoint != null;
+    final confirmed = await _confirm(
+      confirmTitle,
+      hasCheckpoint
+          ? '这条消息之后的对话会被丢弃，workspace 里的文件也会一起回到'
+              '发这条消息之前的状态（检查点 #${message.checkpoint}）。'
+          // 老会话没有检查点记录。**必须说出来** —— 用户点「回到这里」
+          // 的预期就是文件也回去，静默地只截对话会让他在一个已经被改过的
+          // workspace 上继续操作而不自知。
+          : '这条消息之后的对话会被丢弃。\n'
+              '这条消息是旧版本存下的，没有检查点记录，'
+              'workspace 里的文件不会回滚。',
+    );
+    if (!confirmed) return false;
+
+    final historyIndex = _historyIndexOf(visibleIndex);
+    if (historyIndex < 0) return false;
+
+    final result = await _agent.rewindTo(historyIndex);
+    if (!mounted) return false;
+    setState(() => _visible.removeRange(visibleIndex, _visible.length));
+    await _persist();
+
+    if (result.unrecoverable.isNotEmpty && mounted) {
+      // 部分成功必须显式说。被报告成成功的话，用户会基于错误的前提继续做。
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('${result.unrecoverable.length} 个文件的旧内容没存下来，'
+            '没能恢复：${result.unrecoverable.take(3).join('、')}'),
+        duration: const Duration(seconds: 6),
+      ));
+    }
+    return true;
+  }
+
+  /// `_visible` 过滤掉了 tool 消息，所以下标和 `history` 对不上。
+  /// 靠身份匹配而不是算偏移 —— 算偏移在「删了一条又加一条」之后就会错位，
+  /// 而错位的表现是回滚到了错误的位置，非常难发现。
+  int _historyIndexOf(int visibleIndex) {
+    if (visibleIndex < 0 || visibleIndex >= _visible.length) return -1;
+    final target = _visible[visibleIndex];
+    return _agent.history.indexWhere((m) => identical(m, target));
+  }
+
+  Future<void> _persist() async {
+    final id = _threadId;
+    if (id != null) await widget.chats.replaceMessages(id, _agent.history);
+  }
+
+  Future<bool> _confirm(String title, String body) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(body),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('确定')),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
   // ---- 终端模式 ----
 
   /// 勾/取消「终端模式」。
@@ -617,9 +932,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       packageManager: installed.distro.packageManager,
     );
     await widget.prefixGens.rebind(installed.rootfs.parent);
+    // skill 装在 rootfs 里，换了基座就要跟着换 —— 不换的话技能页会
+    // 一直显示"已安装"，而模型 read_skill 会读到一个不存在的路径。
+    await widget.skills
+        .rebindRoot(Directory('${installed.rootfs.path}/opt/burrow-skills'));
     await _restartShell();
     if (mounted) {
-      setState(() => _status = '${installed.distro.displayName} 已就绪，命令现在跑在沙箱里');
+      _setStatus('${installed.distro.displayName} 已就绪，命令现在跑在沙箱里');
     }
   }
 
@@ -632,6 +951,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   @override
   void dispose() {
+    widget.settings.removeListener(_onSettingsChanged);
+    _statusTimer?.cancel();
     _shell?.killGroup();
     if (_runtimeReady && _threadId == null) {
       unawaited(_runtime.root.delete(recursive: true));
@@ -714,7 +1035,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   }
 
   @override
-  void onStatus(String message) => setState(() => _status = message);
+  void onStatus(String message) => _setStatus(message);
 
   // ---- 交互 ----
 
@@ -729,6 +1050,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         terminalMode: _agent.terminalMode,
       );
       _threadId = id;
+      // 外壳的标题要跟上，否则顶栏会一直显示「新对话」，
+      // 而抽屉里那一条已经有名字了 —— 两处对不上很像是坏了。
+      widget.onTitleChanged(
+          text.length > 28 ? '${text.substring(0, 28)}…' : text);
     }
     _input.clear();
     setState(() {
@@ -746,7 +1071,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       if (!_cancelRequested) {
         final error = ChatMessage(
           role: 'system',
-          content: '出错：$e',
+          content: '$kErrorPrefix$e',
           at: DateTime.now(),
         );
         _agent.history.add(error);
@@ -771,7 +1096,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   void _stop() {
     _cancelRequested = true;
     _agent.cancel();
-    setState(() => _status = '正在停止当前请求和命令…');
+    _setStatus('正在停止当前请求和命令…');
   }
 
   Future<void> _retry() async {
@@ -818,24 +1143,41 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       );
     }
     return Scaffold(
+      drawer: ChatDrawer(
+        store: widget.chats,
+        currentThreadId: _threadId,
+        onSelect: widget.onSelectThread,
+        onOpenSettings: _openSettings,
+        onOpenSkills: _openSkills,
+        onOpenAccounts: _openAccounts,
+      ),
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Text(widget.title, overflow: TextOverflow.ellipsis),
-            Text(_runtime.sandbox.workspacePath,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 11)),
-          ],
-        ),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(28),
-          child: _SandboxBar(
-            caps: widget.capabilities,
-            mode: _agent.mode,
-            level: _agent.sandboxLevel,
-            terminalMode: _agent.terminalMode,
-            status: _status,
+        backgroundColor: context.chat.headerBg,
+        titleSpacing: 0,
+        // Telegram 的顶栏是「名字 + 一行状态」。点它进设置 ——
+        // 对应 Telegram 里点头部进「聊天信息」。
+        title: InkWell(
+          onTap: _openSettings,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  widget.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 16.5,
+                    fontWeight: FontWeight.w600,
+                    color: context.chat.tintPrimary,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                _buildSubtitle(),
+              ],
+            ),
           ),
         ),
         actions: [
@@ -844,29 +1186,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             onPressed: () => setState(() => _tab = 1),
             icon: const Icon(Icons.terminal_outlined),
           ),
-          IconButton(
-            tooltip: '设置',
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => SettingsPage(
-                  store: widget.settings,
-                  client: widget.llm,
-                ),
-              ),
-            ),
-            icon: const Icon(Icons.settings_outlined),
-          ),
-          PopupMenuButton<ApprovalMode>(
-            icon: const Icon(Icons.shield_outlined),
-            initialValue: _agent.mode,
-            onSelected: (m) => setState(() => _agent.mode = m),
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: ApprovalMode.readOnly, child: Text('只读')),
-              PopupMenuItem(value: ApprovalMode.onRequest, child: Text('按需审批')),
-              PopupMenuItem(value: ApprovalMode.auto, child: Text('自动执行')),
-              PopupMenuItem(value: ApprovalMode.yolo, child: Text('关闭沙箱')),
-            ],
-          ),
+          // 设置 / 技能 / 账号都在抽屉里；终端模式和审批档位在输入框里。
+          // 顶栏只留一个终端 —— 它是要在对话中途反复来回切的那个。
         ],
       ),
       body: IndexedStack(
@@ -877,12 +1198,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             if (_distro == null)
               Container(
                 width: double.infinity,
-                color: Colors.orange.shade900,
+                color: context.chat.tintWarning.withValues(alpha: 0.16),
                 padding: const EdgeInsets.all(8),
-                child: const Text(
+                child: Text(
                   '降级模式：未安装发行版基座，当前是 Android 自带的 '
                   '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
-                  style: TextStyle(fontSize: 11),
+                  style:
+                      TextStyle(fontSize: 11, color: context.chat.tintPrimary),
                 ),
               ),
             Expanded(child: TerminalView(_terminal)),
@@ -890,13 +1212,18 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           _CheckpointTimeline(
             snapshots: _runtime.snapshots,
             prefixGens: widget.prefixGens,
-            onRolledBack: (msg) => setState(() => _status = msg),
+            onRolledBack: _setStatus,
           ),
         ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
         onDestinationSelected: (i) => setState(() => _tab = i),
+        height: 60,
+        backgroundColor: context.chat.bgPrimary,
+        surfaceTintColor: Colors.transparent,
+        indicatorColor: context.chat.bgBrandSecondary,
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(icon: Icon(Icons.chat_outlined), label: '对话'),
           NavigationDestination(
@@ -908,286 +1235,216 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     );
   }
 
-  Widget _buildChat() => Column(
-        children: [
-          Expanded(
+  Widget _buildChat() {
+    // 流式那条单独接在后面，而不是每个 delta 都往 _visible 里塞 ——
+    // 否则每个 token 都要重建整个列表。
+    final streaming = _streaming.toString();
+    final rows = _buildRows(streaming.isEmpty ? null : streaming);
+
+    return Column(
+      children: [
+        Expanded(
+          child: ChatWallpaper(
             child: ListView.builder(
               controller: _scroll,
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 18),
-              itemCount: _visible.length + (_streaming.isEmpty ? 0 : 1),
-              itemBuilder: (_, i) {
-                if (i == _visible.length) {
-                  return _Bubble(
-                      role: 'assistant', text: _streaming.toString());
-                }
-                return _Bubble(
-                  role: _visible[i].role,
-                  text: _visible[i].content,
-                  onRetry: i == _visible.length - 1 &&
-                          _visible[i].role == 'assistant' &&
-                          !_busy
-                      ? _retry
-                      : null,
-                );
-              },
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              itemCount: rows.length,
+              itemBuilder: (_, i) => _buildRow(rows[i]),
             ),
           ),
-          SafeArea(
-            top: false,
-            child: Container(
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                border: Border(
-                  top: BorderSide(
-                    color: Theme.of(context).colorScheme.outlineVariant,
-                  ),
-                ),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _buildTerminalModeRow(),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _input,
-                          enabled: !_busy,
-                          minLines: 1,
-                          maxLines: 5,
-                          decoration: InputDecoration(
-                            hintText: _agent.terminalMode
-                                ? '描述你希望 Agent 完成的任务'
-                                : '随便聊点什么',
-                            filled: true,
-                            fillColor: Theme.of(context)
-                                .colorScheme
-                                .surfaceContainerLow,
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                          ),
-                          onSubmitted: (_) => _send(),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton.filled(
-                        onPressed: _busy ? _stop : _send,
-                        icon: _busy
-                            ? const Icon(Icons.stop_rounded)
-                            : const Icon(Icons.arrow_upward),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      );
+        ),
+        ChatComposer(
+          controller: _input,
+          generating: _busy,
+          enabled: !_busy && !_loadingHistory,
+          hintText: _agent.terminalMode ? '描述你希望 Agent 完成的任务' : '随便聊点什么',
+          onSend: _send,
+          onStop: _stop,
+          leading: [_buildTerminalButton()],
+          // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
+          trailing: [if (_agent.terminalMode) _buildApprovalButton()],
+        ),
+      ],
+    );
+  }
 
-  /// 输入框上方的「终端模式」开关。
+  /// 把 `_visible` 摊成列表要画的那些行：日期分隔 + 消息 + 流式那条。
   ///
-  /// 放在这里而不是设置页：它决定的是**这一句话**会被怎么处理 ——
-  /// 是聊天还是让模型动手。这种开关必须在用户打字的地方，
-  /// 否则每次都要先想起来去别处确认一下自己现在是哪个模式。
-  Widget _buildTerminalModeRow() {
-    final on = _agent.terminalMode;
-    final distro = _distro;
-    final scheme = Theme.of(context).colorScheme;
-    final enabled = !_busy && !_installingDistro;
+  /// 先算成一个扁平的行表再交给 `ListView.builder`，而不是在 itemBuilder 里
+  /// 现算下标 —— 一旦掺进日期分隔，「第 i 行是第几条消息」就不再是同一个数，
+  /// 而 `_editMessage(i)` 这些操作要的是**消息下标**。分开算就不会串。
+  List<_ChatRow> _buildRows(String? streaming) {
+    final rows = <_ChatRow>[];
+    for (var i = 0; i < _visible.length; i++) {
+      final message = _visible[i];
+      if (i == 0 || !_sameDay(_visible[i - 1].at, message.at)) {
+        rows.add(_ChatRow.date(message.at));
+      }
+      // 连续同一方的消息算一组：只有最后一条画尾巴和头像。
+      final next = i + 1 < _visible.length ? _visible[i + 1] : null;
+      final lastInGroup = next == null
+          ? streaming == null || message.role != 'assistant'
+          : next.role != message.role || !_sameDay(message.at, next.at);
+      rows.add(_ChatRow.message(i, lastInGroup));
+    }
+    if (streaming != null) rows.add(_ChatRow.streaming(streaming));
+    return rows;
+  }
 
-    final hint = on
-        ? '模型可以在 ${distro?.distro.displayName ?? '沙箱'} 里执行命令、读写文件'
-        : distro == null
-            ? '勾选后会先装一个 Linux 基座（约 3–30MB）'
-            : '普通聊天，模型没有任何工具';
+  Widget _buildRow(_ChatRow row) {
+    final streaming = row.streaming;
+    if (streaming != null) {
+      return ChatBubble(role: 'assistant', text: streaming, generating: true);
+    }
 
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Row(
-        children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(8),
-            onTap: enabled ? () => _setTerminalMode(!on) : null,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // IgnorePointer：点击统一交给外层 InkWell 处理，
-                  // 否则复选框那 20 像素和它旁边的文字会走两条不同的路径。
-                  SizedBox(
-                    width: 24,
-                    height: 24,
-                    child: IgnorePointer(
-                      child: Checkbox(
-                        value: on,
-                        visualDensity: VisualDensity.compact,
-                        onChanged: enabled ? (_) {} : null,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  Icon(Icons.terminal_outlined,
-                      size: 15,
-                      color: on ? scheme.primary : scheme.onSurfaceVariant),
-                  const SizedBox(width: 4),
-                  Text(
-                    '终端模式',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: on ? FontWeight.w600 : FontWeight.normal,
-                      color: on ? scheme.primary : scheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              hint,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
-            ),
-          ),
-        ],
-      ),
+    final day = row.day;
+    if (day != null) return ServicePill(text: _dayLabel(day));
+
+    final i = row.index;
+    final message = _visible[i];
+    final isError =
+        message.role == 'system' && message.content.startsWith(kErrorPrefix);
+
+    // 系统提示不是"谁说的话"，做成居中胶囊和左右两侧的气泡分开 ——
+    // 长得像助手发言的话，用户会以为模型在自言自语。
+    // 报错除外：它可能很长，压进胶囊会读不了，仍然走气泡。
+    if (message.role == 'system' && !isError) {
+      return ServicePill(text: message.content);
+    }
+
+    final isLastAssistant =
+        i == _visible.length - 1 && message.role == 'assistant' && !_busy;
+    final isUser = message.role == 'user';
+    return ChatBubble(
+      role: message.role,
+      text: message.content,
+      time: message.at,
+      meta: message.role == 'assistant' ? widget.settings.config.model : null,
+      isError: isError,
+      lastInGroup: row.lastInGroup,
+      onRetry: isLastAssistant ? _retry : null,
+      // 编辑和回退只给用户消息：它们的语义都是「从这句重来」，
+      // 挂在助手消息上没有对应的动作。
+      onEdit: isUser && !_busy ? () => _editMessage(i) : null,
+      onRewind: isUser && !_busy ? () => _rewindTo(i) : null,
+      onDelete: !_busy ? () => _deleteFrom(i) : null,
     );
   }
-}
 
-/// 常驻的沙箱状态条。
-///
-/// 这条不能折叠也不能隐藏：`yolo` 模式下用户必须一眼看到自己关了沙箱。
-class _SandboxBar extends StatelessWidget {
-  final SandboxCapabilities caps;
-  final ApprovalMode mode;
-  final SandboxLevel level;
-  final bool terminalMode;
-  final String? status;
+  static bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
 
-  const _SandboxBar({
-    required this.caps,
-    required this.mode,
-    required this.level,
-    required this.terminalMode,
-    this.status,
-  });
+  static String _dayLabel(DateTime t) {
+    final now = DateTime.now();
+    if (_sameDay(t, now)) return '今天';
+    if (_sameDay(t, now.subtract(const Duration(days: 1)))) return '昨天';
+    if (t.year == now.year) return '${t.month} 月 ${t.day} 日';
+    return '${t.year} 年 ${t.month} 月 ${t.day} 日';
+  }
 
-  @override
-  Widget build(BuildContext context) {
+  /// 顶栏第二行。Telegram 在这里放「在线 / 正在输入」，我们放的是
+  /// 「模型 + 这一轮会怎么执行」—— 同样是"随时在变、必须一直看得见"的东西。
+  ///
+  /// `yolo` 尤其不能折叠：用户必须一眼看到自己关了沙箱。
+  Widget _buildSubtitle() {
+    final t = context.chat;
     // yolo 只在终端模式下才真的危险 —— 聊天模式下没有工具可关。
-    final danger = terminalMode && mode == ApprovalMode.yolo;
+    final danger = _agent.terminalMode && _agent.mode == ApprovalMode.yolo;
 
-    // 聊天模式下报「路径隔离 + 断网」是误导：没有任何东西在跑，
-    // 那几层保护现在保护的是零。说清楚模型手里有没有工具更有用。
-    final idle = terminalMode
-        ? (danger ? '⚠ 沙箱已关闭，命令直接在环境里执行' : caps.describe())
-        : '聊天模式 · 模型没有工具，不会执行任何命令';
+    final String text;
+    if (_status != null) {
+      text = _status!;
+    } else if (danger) {
+      text = '⚠ 沙箱已关闭，命令直接在环境里执行';
+    } else {
+      final model = widget.settings.config.model;
+      // 聊天模式下报「路径隔离 + 断网」是误导：没有任何东西在跑，
+      // 那几层保护现在保护的是零。说清楚模型手里有没有工具更有用。
+      final sandbox =
+          _agent.terminalMode ? widget.capabilities.describe() : '聊天模式，模型没有工具';
+      text = model.isEmpty ? '未配置模型 · $sandbox' : '$model · $sandbox';
+    }
 
-    return Container(
-      width: double.infinity,
-      color: danger
-          ? Colors.red.shade900
-          : Theme.of(context).colorScheme.surfaceContainerHighest,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Text(
-        status ?? idle,
-        style: const TextStyle(fontSize: 11),
-        overflow: TextOverflow.ellipsis,
+    return Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: 12.5,
+        height: 1.2,
+        color: danger ? t.tintError : t.tintTertiary,
+      ),
+    );
+  }
+
+  Widget _buildTerminalButton() {
+    final on = _agent.terminalMode;
+    return ComposerIconButton(
+      icon: on ? Icons.terminal : Icons.terminal_outlined,
+      tooltip: on
+          ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
+          : _distro == null
+              ? '开启后会先装一个 Linux 基座（约 3–30MB）'
+              : '普通聊天，模型没有任何工具',
+      active: on,
+      enabled: !_busy && !_installingDistro,
+      onTap: () => _setTerminalMode(!on),
+    );
+  }
+
+  Widget _buildApprovalButton() {
+    const labels = {
+      ApprovalMode.readOnly: '只读',
+      ApprovalMode.onRequest: '按需审批',
+      ApprovalMode.auto: '自动执行',
+      ApprovalMode.yolo: '关闭沙箱',
+    };
+    final danger = _agent.mode == ApprovalMode.yolo;
+    return PopupMenuButton<ApprovalMode>(
+      initialValue: _agent.mode,
+      tooltip: '审批档位：${labels[_agent.mode]}',
+      // 写回设置而不是只改 _agent —— 这个按钮和设置页里的「审批档位」
+      // 是同一件事，两份状态迟早会不一致。写回之后 _onSettingsChanged
+      // 会把它同步到 _agent 上。
+      onSelected: (m) => widget.settings.setApprovalMode(m),
+      itemBuilder: (_) => [
+        for (final entry in labels.entries)
+          PopupMenuItem(value: entry.key, child: Text(entry.value)),
+      ],
+      // 关掉沙箱是唯一需要抢眼的档位，用红色而不是品牌色 ——
+      // 品牌色在输入框这一排已经表示「开着」了。
+      child: ComposerIconButton(
+        icon: danger ? Icons.gpp_maybe : Icons.shield_outlined,
+        active: !danger && _agent.mode != ApprovalMode.onRequest,
+        color: danger ? context.chat.tintError : null,
       ),
     );
   }
 }
 
-class _Bubble extends StatelessWidget {
-  final String role;
-  final String text;
-  final VoidCallback? onRetry;
-  const _Bubble({required this.role, required this.text, this.onRetry});
+/// 消息列表里的一行。
+///
+/// 三种：日期分隔（[day] 非空）、一条消息（[index] >= 0）、
+/// 流式输出那条（[streaming] 非空）。
+class _ChatRow {
+  final DateTime? day;
+  final int index;
+  final String? streaming;
+  final bool lastInGroup;
 
-  @override
-  Widget build(BuildContext context) {
-    final isUser = role == 'user';
-    final scheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 8),
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
-        constraints:
-            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.85),
-        decoration: BoxDecoration(
-          color:
-              isUser ? scheme.primaryContainer : scheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(22),
-          border: Border.all(color: scheme.outlineVariant),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(isUser ? Icons.person_outline : Icons.auto_awesome,
-                    size: 18),
-                const SizedBox(width: 8),
-                Text(isUser ? '你' : 'Burrow',
-                    style: const TextStyle(fontWeight: FontWeight.w600)),
-                const SizedBox(width: 8),
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: const BoxDecoration(
-                    color: Color(0xFF66BB6A),
-                    shape: BoxShape.circle,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            MarkdownBody(
-              data: text,
-              selectable: true,
-              styleSheet: role == 'tool'
-                  ? MarkdownStyleSheet(
-                      p: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                    )
-                  : null,
-            ),
-            if (!isUser && text.isNotEmpty) ...<Widget>[
-              const SizedBox(height: 4),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: '复制',
-                    onPressed: () =>
-                        Clipboard.setData(ClipboardData(text: text)),
-                    icon: const Icon(Icons.copy_outlined, size: 17),
-                  ),
-                  if (onRetry != null)
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      tooltip: '重新生成',
-                      onPressed: onRetry,
-                      icon: const Icon(Icons.refresh, size: 18),
-                    ),
-                ],
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
+  const _ChatRow.date(this.day)
+      : index = -1,
+        streaming = null,
+        lastInGroup = true;
+
+  const _ChatRow.message(this.index, this.lastInGroup)
+      : day = null,
+        streaming = null;
+
+  const _ChatRow.streaming(this.streaming)
+      : day = null,
+        index = -1,
+        lastInGroup = true;
 }
 
 /// 检查点时间线。回滚入口。

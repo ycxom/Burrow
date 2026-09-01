@@ -50,7 +50,9 @@ const readOnlyTools = {
   'list_dir',
   'grep',
   'grep_output',
-  'recall_memory'
+  'recall_memory',
+  // 读一份说明书不会改任何东西，走只读快路：不判策略、不打检查点。
+  'read_skill',
 };
 
 // ---------------------------------------------------------------------------
@@ -137,6 +139,12 @@ final allToolSpecs = <ToolSpec>[
           ['ref', 'pattern'])),
   ToolSpec('recall_memory', '检索被摘要挤出上下文的早期对话记录',
       _obj({'query': _str('检索关键词')}, ['query'])),
+  ToolSpec(
+    'read_skill',
+    '读一个 skill 的完整说明。系统提示里只给了每个 skill 的一句话描述，'
+        '判断某个和当前任务相关时用这个读全文，再照着做。',
+    _obj({'name': _str('skill 的名字，取自系统提示里的清单')}, ['name']),
+  ),
 ];
 
 // ---------------------------------------------------------------------------

@@ -1,17 +1,44 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
+import '../agent/agent_loop.dart';
+import '../context/overflow_manager.dart';
 import '../llm/llm_client.dart';
+import '../llm/model_catalog.dart';
+import '../sandbox/sandbox_session.dart';
+import '../sandbox/snapshot_store.dart';
+import '../settings/account_store.dart';
 import '../settings/settings_store.dart';
+import 'agent_settings_page.dart';
+import 'chat_theme.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
     required this.store,
     required this.client,
+    required this.accounts,
+    required this.capabilities,
+    required this.tasksRoot,
+    required this.currentTaskId,
+    required this.overflow,
+    required this.snapshots,
     super.key,
   });
 
   final SettingsStore store;
   final ConfigurableLlmClient client;
+
+  /// 已登录的 OAuth 账号。设置页要能把 baseUrl / key 一键切成订阅账号。
+  final AccountStore accounts;
+
+  // 下面这几个是「Agent 与终端」那三个子页要用的运行时对象。
+  // 设置页自己不碰它们，只负责往下传。
+  final SandboxCapabilities capabilities;
+  final Directory tasksRoot;
+  final String currentTaskId;
+  final OverflowManager overflow;
+  final SnapshotStore snapshots;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -22,6 +49,11 @@ class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _url;
   late final TextEditingController _key;
   late final TextEditingController _model;
+
+  /// 从服务端拉回来的模型列表。null = 还没拉过（这时只显示预设里的几个）。
+  List<FetchedModel>? _fetchedModels;
+  bool _fetchingModels = false;
+  String? _modelFetchError;
   late final TextEditingController _summaryModel;
   late double _temperature;
   late bool _streamOutput;
@@ -53,6 +85,28 @@ class _SettingsPageState extends State<SettingsPage> {
     _summaryModel.dispose();
     super.dispose();
   }
+
+  /// 子页改的是同一个 SettingsStore，回来时要重建 —— 否则上面那几行
+  /// 副标题还停在旧值上，看起来像"改了没生效"。
+  Future<void> _push(Widget page) async {
+    await Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => page));
+    if (mounted) setState(() {});
+  }
+
+  static String _levelName(SandboxLevel level) => switch (level) {
+        SandboxLevel.readOnly => '只读',
+        SandboxLevel.workspaceWrite => '工作区可写',
+        SandboxLevel.workspaceWriteNetwork => '工作区可写 + 联网',
+        SandboxLevel.dangerFullAccess => '已关闭沙箱',
+      };
+
+  static String _approvalName(ApprovalMode mode) => switch (mode) {
+        ApprovalMode.readOnly => '只读',
+        ApprovalMode.onRequest => '按需审批',
+        ApprovalMode.auto => '自动执行',
+        ApprovalMode.yolo => '不审批',
+      };
 
   void _select(ProviderPreset value) {
     setState(() {
@@ -110,6 +164,39 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() => _testing = false);
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _fetchModels() async {
+    setState(() {
+      _fetchingModels = true;
+      _modelFetchError = null;
+    });
+    try {
+      final models = await fetchModels(
+        baseUrl: _url.text.trim(),
+        apiKey: _key.text.trim(),
+      );
+      if (mounted) setState(() => _fetchedModels = models);
+    } catch (e) {
+      // 把失败原因原样显示。这里的错误信息是精心拼过的（哪个候选端点
+      // 返回了什么），截断或者换成"获取失败"会把唯一有用的线索丢掉。
+      if (mounted) setState(() => _modelFetchError = '$e');
+    } finally {
+      if (mounted) setState(() => _fetchingModels = false);
+    }
+  }
+
+  /// 用一个已登录的订阅账号填上 baseUrl 和协议。
+  ///
+  /// key 留空 —— 订阅账号走 Bearer access_token，那个 token 会过期，
+  /// 抄进输入框就等于抄了一份马上失效的副本。运行时从 AccountStore 现取。
+  void _useAccount(String providerId) {
+    final provider = widget.accounts.providerById(providerId);
+    if (provider == null) return;
+    setState(() {
+      _url.text = provider.apiBaseUrl;
+      _key.text = '';
+    });
   }
 
   @override
@@ -222,7 +309,64 @@ class _SettingsPageState extends State<SettingsPage> {
                       border: OutlineInputBorder(),
                     ),
                   ),
-                  if (_provider.models.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 8),
+                  Row(
+                    children: <Widget>[
+                      OutlinedButton.icon(
+                        onPressed: _fetchingModels ? null : _fetchModels,
+                        icon: _fetchingModels
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.cloud_download_outlined,
+                                size: 18),
+                        label: Text(_fetchingModels ? '获取中…' : '从服务端获取模型'),
+                      ),
+                    ],
+                  ),
+                  if (_modelFetchError != null) ...<Widget>[
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: context.chat.bgErrorSecondary,
+                        borderRadius: BorderRadius.circular(ChatShape.radiusLg),
+                        border: Border.all(color: context.chat.tintError),
+                      ),
+                      child: SelectableText(
+                        _modelFetchError!,
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                    ),
+                  ],
+                  // 拉回来的排在前面，预设的作为兜底 ——
+                  // 真实列表永远比我们硬编码的那几个准。
+                  if ((_fetchedModels ?? const []).isNotEmpty) ...<Widget>[
+                    const SizedBox(height: 8),
+                    Text('服务端返回 ${_fetchedModels!.length} 个模型',
+                        style: const TextStyle(fontSize: 11)),
+                    const SizedBox(height: 4),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 180),
+                      child: SingleChildScrollView(
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 4,
+                          children: _fetchedModels!
+                              .map((m) => ActionChip(
+                                    label: Text(m.id,
+                                        style: const TextStyle(fontSize: 12)),
+                                    onPressed: () =>
+                                        setState(() => _model.text = m.id),
+                                  ))
+                              .toList(),
+                        ),
+                      ),
+                    ),
+                  ] else if (_provider.models.isNotEmpty) ...<Widget>[
                     const SizedBox(height: 8),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -233,6 +377,24 @@ class _SettingsPageState extends State<SettingsPage> {
                                   label: Text(model),
                                   onPressed: () =>
                                       setState(() => _model.text = model),
+                                ))
+                            .toList(),
+                      ),
+                    ),
+                  ],
+                  if (widget.accounts.signedIn.isNotEmpty) ...<Widget>[
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Wrap(
+                        spacing: 8,
+                        children: widget.accounts.signedIn
+                            .map((p) => ActionChip(
+                                  avatar: const Icon(Icons.account_circle,
+                                      size: 16),
+                                  label: Text('用 ${p.displayName}',
+                                      style: const TextStyle(fontSize: 12)),
+                                  onPressed: () => _useAccount(p.id),
                                 ))
                             .toList(),
                       ),
@@ -305,29 +467,50 @@ class _SettingsPageState extends State<SettingsPage> {
             title: 'Agent 与终端',
             subtitle: '控制本地命令的执行边界',
           ),
-          const Card(
+          Card(
             clipBehavior: Clip.antiAlias,
             child: Column(
-              children: [
+              children: <Widget>[
                 ListTile(
-                  leading: Icon(Icons.shield_outlined),
-                  title: Text('沙箱模式'),
-                  subtitle: Text('命令限制在当前任务工作区，高风险操作需要确认'),
-                  trailing: Icon(Icons.chevron_right),
+                  leading: const Icon(Icons.shield_outlined),
+                  title: const Text('沙箱模式'),
+                  // 副标题显示当前档位而不是一句固定的介绍 ——
+                  // 设置项的当前值应该在列表里就看得见，不用点进去猜。
+                  subtitle: Text(
+                    '${_levelName(widget.store.sandboxLevel)}'
+                    ' · ${_approvalName(widget.store.approvalMode)}',
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => _push(SandboxSettingsPage(
+                    store: widget.store,
+                    capabilities: widget.capabilities,
+                  )),
                 ),
-                Divider(height: 1),
+                const Divider(height: 1),
                 ListTile(
-                  leading: Icon(Icons.folder_outlined),
-                  title: Text('默认工作目录'),
-                  subtitle: Text('每个任务使用独立 workspace'),
-                  trailing: Icon(Icons.chevron_right),
+                  leading: const Icon(Icons.folder_outlined),
+                  title: const Text('默认工作目录'),
+                  subtitle: const Text('每个会话使用独立 workspace，可查看占用并清理'),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => _push(WorkspaceSettingsPage(
+                    tasksRoot: widget.tasksRoot,
+                    currentTaskId: widget.currentTaskId,
+                  )),
                 ),
-                Divider(height: 1),
+                const Divider(height: 1),
                 ListTile(
-                  leading: Icon(Icons.history),
-                  title: Text('上下文与检查点'),
-                  subtitle: Text('长对话自动摘要，文件修改可回滚'),
-                  trailing: Icon(Icons.chevron_right),
+                  leading: const Icon(Icons.history),
+                  title: const Text('上下文与检查点'),
+                  subtitle: Text(
+                    '超过 ${widget.store.messageThreshold} 条或 '
+                    '${widget.store.tokenThreshold} token 自动摘要',
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => _push(ContextSettingsPage(
+                    store: widget.store,
+                    overflow: widget.overflow,
+                    snapshots: widget.snapshots,
+                  )),
                 ),
               ],
             ),

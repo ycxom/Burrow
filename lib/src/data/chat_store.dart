@@ -32,13 +32,18 @@ class ChatStore {
     final path = p.join(await getDatabasesPath(), 'burrow.db');
     final db = await openDatabase(
       path,
-      version: 2,
+      version: 3,
       onUpgrade: (db, from, to) async {
-        // v1 的库里没有 terminal_mode。加列而不是重建表 ——
-        // 用户的历史对话不该因为加了个开关就被清掉。
+        // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
           await db.execute('ALTER TABLE threads '
               'ADD COLUMN terminal_mode INTEGER NOT NULL DEFAULT 0');
+        }
+        if (from < 3) {
+          // 老消息没有检查点记录。它们的「回到这里」只截对话不回滚文件，
+          // 并且 UI 会说明这一点 —— 假装能回滚才是危险的。
+          await db
+              .execute('ALTER TABLE messages ADD COLUMN checkpoint INTEGER');
         }
       },
       onCreate: (db, _) async {
@@ -58,7 +63,8 @@ class ChatStore {
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            output_ref TEXT
+            output_ref TEXT,
+            checkpoint INTEGER
           )
         ''');
         await db.execute(
@@ -125,6 +131,28 @@ class ChatStore {
     return id;
   }
 
+  Future<void> renameThread(String threadId, String title) async {
+    await _db.update(
+      'threads',
+      <String, Object?>{'title': title},
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+    );
+  }
+
+  /// 删除会话连同它的消息。
+  ///
+  /// 消息表没有外键级联（sqflite 默认不开 foreign_keys），所以要手动删 ——
+  /// 漏掉的话消息会永久留在库里，谁也看不到，只是慢慢把手机存储吃掉。
+  Future<void> deleteThread(String threadId) async {
+    await _db.transaction((txn) async {
+      await txn.delete('messages',
+          where: 'thread_id = ?', whereArgs: <Object?>[threadId]);
+      await txn
+          .delete('threads', where: 'id = ?', whereArgs: <Object?>[threadId]);
+    });
+  }
+
   Future<List<ChatMessage>> messages(String threadId) async {
     final rows = await _db.query(
       'messages',
@@ -140,6 +168,7 @@ class ChatStore {
                 row['created_at']! as int,
               ),
               outputRef: row['output_ref'] as String?,
+              checkpoint: row['checkpoint'] as int?,
             ))
         .toList();
   }
@@ -151,6 +180,7 @@ class ChatStore {
       'content': message.content,
       'created_at': message.at.millisecondsSinceEpoch,
       'output_ref': message.outputRef,
+      'checkpoint': message.checkpoint,
     });
     await _db.update(
       'threads',
@@ -180,6 +210,7 @@ class ChatStore {
           'content': message.content,
           'created_at': message.at.millisecondsSinceEpoch,
           'output_ref': message.outputRef,
+          'checkpoint': message.checkpoint,
         });
       }
     });
