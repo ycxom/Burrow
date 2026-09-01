@@ -29,7 +29,7 @@ class ChatDrawer extends StatefulWidget {
   /// 抽屉底部的入口。
   final VoidCallback onOpenSettings;
   final VoidCallback onOpenSkills;
-  final VoidCallback onOpenAccounts;
+  final VoidCallback onOpenChannels;
 
   const ChatDrawer({
     super.key,
@@ -38,7 +38,7 @@ class ChatDrawer extends StatefulWidget {
     required this.onSelect,
     required this.onOpenSettings,
     required this.onOpenSkills,
-    required this.onOpenAccounts,
+    required this.onOpenChannels,
   });
 
   @override
@@ -306,7 +306,7 @@ class _ChatDrawerState extends State<ChatDrawer> {
     return Column(
       children: [
         entry(Icons.extension_outlined, '技能', widget.onOpenSkills),
-        entry(Icons.account_circle_outlined, '模型账号', widget.onOpenAccounts),
+        entry(Icons.hub_outlined, '渠道管理', widget.onOpenChannels),
         entry(Icons.settings_outlined, '设置', widget.onOpenSettings),
         const SizedBox(height: 4),
       ],

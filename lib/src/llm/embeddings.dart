@@ -14,6 +14,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../net/proxy_client.dart';
 import 'model_catalog.dart';
 
 /// 一批的**起始**条数。真正用多少是运行时学出来的，见 [OpenAiEmbedder._batch]。
@@ -42,16 +43,38 @@ class OpenAiEmbedder {
   /// 嵌入模型 id。空 = 没启用。
   final String Function() model;
 
-  final http.Client _http;
+  /// 代理。和 baseUrl 一样跟着当前渠道现读 —— 代理是在 HttpClient 上设的，
+  /// 换渠道要重建客户端，不能只换 URL。
+  final String Function()? proxy;
+
+  http.Client _http;
+  String? _proxyInUse;
+  final bool _ownsClient;
   final Duration timeout;
 
   OpenAiEmbedder({
     required this.baseUrl,
     required this.apiKey,
     required this.model,
+    this.proxy,
     http.Client? client,
     this.timeout = const Duration(seconds: 30),
-  }) : _http = client ?? http.Client();
+  })  : _http = client ?? buildHttpClient(proxy: proxy?.call()),
+        _proxyInUse = proxy?.call(),
+        _ownsClient = client == null;
+
+  /// 代理变了就重建底层客户端。不重建的话「换了渠道但嵌入还走老代理」，
+  /// 而表现只是超时，看不出和代理有关。
+  http.Client get _client {
+    if (!_ownsClient) return _http;
+    final want = proxy?.call();
+    if (want != _proxyInUse) {
+      _http.close();
+      _http = buildHttpClient(proxy: want);
+      _proxyInUse = want;
+    }
+    return _http;
+  }
 
   /// 最近一次失败的原因。null = 没失败过。
   ///
@@ -116,7 +139,7 @@ class OpenAiEmbedder {
     List<String> chunk,
   ) async {
     final key = apiKey().trim();
-    final response = await _http
+    final response = await _client
         .post(
           resolveApiEndpoint(base, '/embeddings'),
           headers: {

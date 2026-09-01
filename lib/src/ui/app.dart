@@ -25,10 +25,12 @@ import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../llm/llm_client.dart';
 import '../llm/model_catalog.dart';
+import '../net/proxy_client.dart';
 import '../settings/settings_store.dart';
 import '../settings/account_store.dart';
+import '../settings/channel_store.dart';
 import '../skills/skill_store.dart';
-import 'accounts_page.dart';
+import 'channels_page.dart';
 import 'chat_drawer.dart';
 import 'chat_theme.dart';
 import 'chat_view.dart';
@@ -367,6 +369,7 @@ class BurrowApp extends StatelessWidget {
   final ChatStore chats;
   final SkillStore skills;
   final AccountStore accounts;
+  final ChannelStore channels;
 
   const BurrowApp({
     super.key,
@@ -383,6 +386,7 @@ class BurrowApp extends StatelessWidget {
     required this.chats,
     required this.skills,
     required this.accounts,
+    required this.channels,
   });
 
   @override
@@ -407,6 +411,7 @@ class BurrowApp extends StatelessWidget {
           chats: chats,
           skills: skills,
           accounts: accounts,
+          channels: channels,
         ),
       );
 }
@@ -434,6 +439,7 @@ class ChatShell extends StatefulWidget {
   final ChatStore chats;
   final SkillStore skills;
   final AccountStore accounts;
+  final ChannelStore channels;
 
   const ChatShell({
     super.key,
@@ -450,6 +456,7 @@ class ChatShell extends StatefulWidget {
     required this.chats,
     required this.skills,
     required this.accounts,
+    required this.channels,
   });
 
   @override
@@ -506,6 +513,7 @@ class _ChatShellState extends State<ChatShell> {
       chats: widget.chats,
       skills: widget.skills,
       accounts: widget.accounts,
+      channels: widget.channels,
       threadId: _threadId,
       title: _title,
       onSelectThread: _select,
@@ -539,6 +547,7 @@ class HomeShell extends StatefulWidget {
   final ChatStore chats;
   final SkillStore skills;
   final AccountStore accounts;
+  final ChannelStore channels;
   final String? threadId;
   final String title;
 
@@ -564,6 +573,7 @@ class HomeShell extends StatefulWidget {
     required this.chats,
     required this.skills,
     required this.accounts,
+    required this.channels,
     required this.threadId,
     required this.title,
     required this.onSelectThread,
@@ -739,8 +749,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       MaterialPageRoute<void>(
         builder: (_) => SettingsPage(
           store: widget.settings,
-          client: widget.llm,
           accounts: widget.accounts,
+          channels: widget.channels,
           capabilities: widget.capabilities,
           // 每个会话一个目录，父目录就是全部会话的容器。
           tasksRoot: _runtime.root.parent,
@@ -760,10 +770,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     if (mounted) setState(() {});
   }
 
-  Future<void> _openAccounts() async {
+  Future<void> _openChannels() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
-          builder: (_) => AccountsPage(store: widget.accounts)),
+          builder: (_) => ChannelsPage(
+                channels: widget.channels,
+                accounts: widget.accounts,
+              )),
     );
     if (mounted) setState(() {});
   }
@@ -1158,7 +1171,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           onSelect: widget.onSelectThread,
           onOpenSettings: _openSettings,
           onOpenSkills: _openSkills,
-          onOpenAccounts: _openAccounts,
+          onOpenChannels: _openChannels,
         ),
         appBar: AppBar(
           backgroundColor: context.chat.headerBg,
@@ -1390,10 +1403,19 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   /// 从服务端拉模型列表并缓存。选择器和设置页共用同一份缓存。
   Future<List<String>> _refreshModels() async {
-    final models = await fetchModels(
-      baseUrl: widget.settings.config.baseUrl,
-      apiKey: widget.settings.config.apiKey,
-    );
+    // 走当前渠道的代理。用默认客户端的话，配了代理的渠道在这里会超时，
+    // 而聊天本身是通的 —— 那种不一致最难查。
+    final client = buildHttpClient(proxy: widget.channels.active?.proxy);
+    final List<FetchedModel> models;
+    try {
+      models = await fetchModels(
+        baseUrl: widget.settings.config.baseUrl,
+        apiKey: widget.settings.config.apiKey,
+        client: client,
+      );
+    } finally {
+      client.close();
+    }
     final ids = models.map((m) => m.id).toList();
     await widget.settings.setCachedModels(ids);
     return ids;

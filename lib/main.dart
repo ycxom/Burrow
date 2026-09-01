@@ -8,7 +8,9 @@ library;
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'src/agent/agent_loop.dart';
@@ -27,6 +29,7 @@ import 'src/sandbox/pty_channel.dart';
 import 'src/sandbox/sandbox_session.dart';
 import 'src/sandbox/snapshot_store.dart';
 import 'src/settings/account_store.dart';
+import 'src/settings/channel_store.dart';
 import 'src/settings/settings_store.dart';
 import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
@@ -207,6 +210,12 @@ Future<void> _boot({
   // LLM 客户端等设置页配置完成后才可用。没配也要能进主界面 ——
   // 手动开终端、看检查点这些都不依赖模型。
   final settings = await SettingsStore.load();
+
+  // 渠道是接入点的唯一来源；SettingsStore 只是把「当前那个」加上生成参数
+  // 投影成下游要的 LlmConfig（见 SettingsStore.config）。
+  final legacyPrefs = await SharedPreferences.getInstance();
+  final channels = await ChannelStore.load(prefs: legacyPrefs);
+  settings.bindChannels(channels);
   final chats = await ChatStore.open();
   final llm = ConfigurableLlmClient(config: settings.config);
 
@@ -219,8 +228,37 @@ Future<void> _boot({
     baseUrl: () => settings.config.baseUrl,
     apiKey: () => settings.config.apiKey,
     model: () => settings.embeddingModel,
+    proxy: () => channels.active?.proxy ?? '',
   );
   final accounts = await AccountStore.load();
+
+  // 老版本把 baseUrl/key/model 存在 prefs 的单份配置里。不迁的话，
+  // 升级后用户看到的是一个空的渠道列表 —— 那看起来就是"我的配置丢了"。
+  await channels.migrateFrom(
+    config: LlmConfig(
+      apiFormat: legacyPrefs.getString('burrow.llm.format') ?? 'openAI',
+      baseUrl: legacyPrefs.getString('burrow.llm.baseUrl') ?? '',
+      apiKey:
+          await const FlutterSecureStorage().read(key: 'burrow.llm.apiKey') ??
+              '',
+      model: legacyPrefs.getString('burrow.llm.model') ?? '',
+      summaryModel: legacyPrefs.getString('burrow.llm.summaryModel'),
+    ),
+    providerName: legacyPrefs.getString('burrow.llm.provider') ?? '',
+  );
+
+  // OAuth 渠道的 access_token 每次请求前现取 —— 存进配置就等于存了一份
+  // 马上失效的副本。
+  llm.bearerProvider = () async {
+    final channel = channels.active;
+    if (channel == null || !channel.usesOAuth) {
+      return channel == null ? '' : channels.apiKeyOf(channel);
+    }
+    final account =
+        accounts.account(channel.oauthProviderId!, channel.oauthAccountId!);
+    if (account == null) return '';
+    return accounts.validToken(account);
+  };
 
   // Skill 装在 rootfs 的 /opt/burrow-skills 里，索引留在 app 私有目录 ——
   // rootfs 会被「代目录 + 原子 rename」整个换掉，索引跟着丢的话
@@ -277,5 +315,6 @@ Future<void> _boot({
     chats: chats,
     skills: skills,
     accounts: accounts,
+    channels: channels,
   ));
 }

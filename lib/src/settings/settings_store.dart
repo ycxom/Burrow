@@ -1,10 +1,10 @@
 import 'package:flutter/foundation.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
 import '../llm/llm_client.dart';
+import 'channel_store.dart';
 import '../sandbox/sandbox_session.dart';
 
 class ProviderPreset {
@@ -62,8 +62,8 @@ const providerPresets = <ProviderPreset>[
 
 class SettingsStore extends ChangeNotifier {
   SettingsStore._(
-    this._config,
-    this._provider,
+    this._temperature,
+    this._streamOutput,
     this._terminalModeDefault,
     this._embeddingModel,
     this._cachedModels,
@@ -73,10 +73,8 @@ class SettingsStore extends ChangeNotifier {
     this._messageThreshold,
     this._tokenThreshold,
     this._prefs,
-    this._secure,
   );
 
-  static const _keyName = 'burrow.llm.apiKey';
   static const _prefix = 'burrow.llm.';
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
   static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
@@ -92,9 +90,16 @@ class SettingsStore extends ChangeNotifier {
   static const minMessageThreshold = 6;
   static const minTokenThreshold = 1000;
 
-  LlmConfig _config;
-  String _provider;
+  double _temperature;
+  bool _streamOutput;
   bool _terminalModeDefault;
+
+  /// 渠道列表。由 main 注入 —— [config] 是它的投影。
+  ///
+  /// 为什么不让 SettingsStore 自己存一份 baseUrl/key/model：那样就有两份
+  /// 真相了。渠道是唯一的来源，这里只负责把「当前那个」加上生成参数
+  /// 摊成下游要的 [LlmConfig]。
+  ChannelStore? _channels;
   String _embeddingModel;
   List<String> _cachedModels;
   SandboxLevel _sandboxLevel;
@@ -103,10 +108,30 @@ class SettingsStore extends ChangeNotifier {
   int _messageThreshold;
   int _tokenThreshold;
   final SharedPreferences? _prefs;
-  final FlutterSecureStorage? _secure;
 
-  LlmConfig get config => _config;
-  String get provider => _provider;
+  /// 当前渠道 + 生成参数。没有任何渠道时是 [LlmConfig.empty]。
+  LlmConfig get config {
+    final channels = _channels;
+    if (channels == null) return LlmConfig.empty;
+    return channels.configFor(
+      channels.active,
+      temperature: _temperature,
+      streamOutput: _streamOutput,
+    );
+  }
+
+  ChannelStore? get channels => _channels;
+
+  double get temperature => _temperature;
+  bool get streamOutput => _streamOutput;
+
+  /// 接上渠道列表。渠道一变就跟着通知 —— 下游只订阅了 SettingsStore，
+  /// 不接这一条的话换渠道不会触发任何刷新。
+  void bindChannels(ChannelStore channels) {
+    _channels = channels;
+    channels.addListener(notifyListeners);
+    notifyListeners();
+  }
 
   /// 记忆检索用的嵌入模型。空 = 不启用，检索退回两路词法。
   ///
@@ -141,21 +166,9 @@ class SettingsStore extends ChangeNotifier {
 
   static Future<SettingsStore> load() async {
     final prefs = await SharedPreferences.getInstance();
-    const secure = FlutterSecureStorage();
-    final key = await secure.read(key: _keyName) ?? '';
     return SettingsStore._(
-      LlmConfig(
-        apiFormat: prefs.getString('${_prefix}format') ?? 'openAI',
-        baseUrl: prefs.getString('${_prefix}baseUrl') ?? '',
-        apiKey: key,
-        model: prefs.getString('${_prefix}model') ?? '',
-        // 空串归一成 null：设置页留空存下来的是 ''，而"留空"的语义是
-        // 「跟对话模型一样」，不是「模型名叫空字符串」。
-        summaryModel: _emptyToNull(prefs.getString('${_prefix}summaryModel')),
-        temperature: prefs.getDouble('${_prefix}temperature') ?? 0.3,
-        streamOutput: prefs.getBool('${_prefix}streamOutput') ?? true,
-      ),
-      prefs.getString('${_prefix}provider') ?? 'OpenAI',
+      prefs.getDouble('${_prefix}temperature') ?? 0.3,
+      prefs.getBool('${_prefix}streamOutput') ?? true,
       prefs.getBool(_keyTerminalDefault) ?? false,
       prefs.getString(_keyEmbeddingModel) ?? '',
       prefs.getStringList(_keyCachedModels) ?? const <String>[],
@@ -168,12 +181,8 @@ class SettingsStore extends ChangeNotifier {
       prefs.getInt(_keyMessageThreshold) ?? 30,
       prefs.getInt(_keyTokenThreshold) ?? 4000,
       prefs,
-      secure,
     );
   }
-
-  static String? _emptyToNull(String? v) =>
-      (v == null || v.trim().isEmpty) ? null : v;
 
   /// 按 name 反查枚举，认不出来就用默认值。
   ///
@@ -186,12 +195,29 @@ class SettingsStore extends ChangeNotifier {
     return fallback;
   }
 
-  /// 换对话模型。只动 model 那一项，其余配置原样留着。
+  /// 换对话模型 —— 改的是**当前渠道**的模型。
+  ///
+  /// 底部快切改一次就落到渠道上，而不是另存一份「临时模型」：
+  /// 那样渠道管理里显示的和实际在用的就对不上了。
   Future<void> setModel(String model) async {
-    if (_config.model == model) return;
-    _config = _config.copyWith(model: model);
+    final channels = _channels;
+    final active = channels?.active;
+    if (channels == null || active == null || active.model == model) return;
+    await channels.upsert(active.copyWith(model: model));
+  }
+
+  Future<void> setTemperature(double value) async {
+    if (_temperature == value) return;
+    _temperature = value;
     notifyListeners();
-    await _prefs?.setString('${_prefix}model', model);
+    await _prefs?.setDouble('${_prefix}temperature', value);
+  }
+
+  Future<void> setStreamOutput(bool value) async {
+    if (_streamOutput == value) return;
+    _streamOutput = value;
+    notifyListeners();
+    await _prefs?.setBool('${_prefix}streamOutput', value);
   }
 
   Future<void> setEmbeddingModel(String model) async {
@@ -254,24 +280,5 @@ class SettingsStore extends ChangeNotifier {
     _terminalModeDefault = on;
     notifyListeners();
     await _prefs?.setBool(_keyTerminalDefault, on);
-  }
-
-  Future<void> save(
-      {required String provider, required LlmConfig config}) async {
-    _provider = provider;
-    _config = config;
-    notifyListeners();
-    final prefs = _prefs;
-    if (prefs == null) return;
-    await Future.wait(<Future<bool>>[
-      prefs.setString('${_prefix}provider', provider),
-      prefs.setString('${_prefix}format', config.apiFormat),
-      prefs.setString('${_prefix}baseUrl', config.baseUrl),
-      prefs.setString('${_prefix}model', config.model),
-      prefs.setString('${_prefix}summaryModel', config.summaryModel ?? ''),
-      prefs.setDouble('${_prefix}temperature', config.temperature),
-      prefs.setBool('${_prefix}streamOutput', config.streamOutput),
-    ]);
-    await _secure?.write(key: _keyName, value: config.apiKey);
   }
 }

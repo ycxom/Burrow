@@ -20,6 +20,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../net/proxy_client.dart';
 import 'model_catalog.dart';
 
 import '../agent/agent_loop.dart';
@@ -51,6 +52,11 @@ class LlmConfig {
     return s.isEmpty ? model : s;
   }
 
+  /// HTTP 代理，`host:port`。空 = 直连。
+  ///
+  /// 跟着渠道走而不是全局：一个渠道走内网直连、另一个走梯子是很常见的组合。
+  final String? proxy;
+
   final double temperature;
   final bool streamOutput;
 
@@ -60,6 +66,7 @@ class LlmConfig {
     required this.apiKey,
     required this.model,
     this.summaryModel,
+    this.proxy,
     this.temperature = 0.3,
     this.streamOutput = true,
   });
@@ -74,6 +81,7 @@ class LlmConfig {
     String? apiKey,
     String? model,
     String? summaryModel,
+    String? proxy,
     double? temperature,
     bool? streamOutput,
   }) =>
@@ -83,29 +91,59 @@ class LlmConfig {
         apiKey: apiKey ?? this.apiKey,
         model: model ?? this.model,
         summaryModel: summaryModel ?? this.summaryModel,
+        proxy: proxy ?? this.proxy,
         temperature: temperature ?? this.temperature,
         streamOutput: streamOutput ?? this.streamOutput,
       );
 }
 
 class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
-  LlmConfig config;
+  LlmConfig _config;
   http.Client _http;
   final bool _ownsClient;
   final Duration connectionTimeout;
+
+  /// OAuth 渠道的 access_token 提供者。null 表示用 [LlmConfig.apiKey]。
+  ///
+  /// 不把 token 塞进 config：它会过期，而 config 是被到处传的快照，
+  /// 存进去就等于存了一份马上失效的副本。每次请求前现取才是对的。
+  Future<String> Function()? bearerProvider;
 
   ConfigurableLlmClient({
     LlmConfig? config,
     http.Client? httpClient,
     this.connectionTimeout = const Duration(seconds: 45),
-  })  : config = config ?? LlmConfig.empty,
-        _http = httpClient ?? http.Client(),
+  })  : _config = config ?? LlmConfig.empty,
+        _http = httpClient ?? buildHttpClient(proxy: config?.proxy),
         _ownsClient = httpClient == null;
+
+  LlmConfig get config => _config;
+
+  /// 换配置。**代理变了要重建底层客户端** —— 代理是在 HttpClient 上设的，
+  /// 不是每个请求的参数，光换 config 不会有任何效果，而表现是
+  /// 「改了代理没反应」这种最难查的一类。
+  set config(LlmConfig value) {
+    final proxyChanged = value.proxy != _config.proxy;
+    _config = value;
+    if (proxyChanged && _ownsClient) {
+      _http.close();
+      _http = buildHttpClient(proxy: value.proxy);
+    }
+  }
+
+  /// 这次请求该用的密钥。OAuth 渠道现取 token，普通渠道用配置里的 key。
+  Future<String> _authValue() async {
+    final provider = bearerProvider;
+    if (provider == null) return _config.apiKey;
+    return provider();
+  }
 
   @override
   void cancel() {
     _http.close();
-    if (_ownsClient) _http = http.Client();
+    // 重建时必须**带上代理**：cancel 之后代理静默消失是一个很隐蔽的
+    // "只在取消过一次之后才出现"的 bug。
+    if (_ownsClient) _http = buildHttpClient(proxy: _config.proxy);
   }
 
   Future<void> testConnection([LlmConfig? draft]) async {
@@ -194,14 +232,14 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
   }) async {
+    final auth = await _authValue();
     final request = http.Request(
       'POST',
       _endpoint(config.baseUrl, '/chat/completions'),
     )
       ..headers.addAll({
         'Content-Type': 'application/json',
-        if (config.apiKey.isNotEmpty)
-          'Authorization': 'Bearer ${config.apiKey}',
+        if (auth.isNotEmpty) 'Authorization': 'Bearer $auth',
       })
       ..body = jsonEncode({
         'model': config.model,
@@ -259,6 +297,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
         .where((message) => message.role == 'system')
         .map((message) => message.content)
         .join('\n\n');
+    final auth = await _authValue();
     final request = http.Request(
       'POST',
       _endpoint(config.baseUrl, '/messages'),
@@ -266,7 +305,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
       ..headers.addAll(<String, String>{
         'Content-Type': 'application/json',
         'anthropic-version': '2023-06-01',
-        if (config.apiKey.isNotEmpty) 'x-api-key': config.apiKey,
+        if (auth.isNotEmpty) 'x-api-key': auth,
       })
       ..body = jsonEncode(<String, Object?>{
         'model': config.model,
@@ -469,12 +508,12 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
   Future<String> summarize(String systemPrompt, String payload) async {
     if (!config.isConfigured) return '';
     try {
+      final auth = await _authValue();
       final response = await _http.post(
         _endpoint(config.baseUrl, '/chat/completions'),
         headers: {
           'Content-Type': 'application/json',
-          if (config.apiKey.isNotEmpty)
-            'Authorization': 'Bearer ${config.apiKey}',
+          if (auth.isNotEmpty) 'Authorization': 'Bearer $auth',
         },
         body: jsonEncode({
           'model': config.summaryModelOrDefault,
