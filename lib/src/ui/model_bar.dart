@@ -79,6 +79,7 @@ class ModelSwitchBar extends StatelessWidget {
 
   final VoidCallback onPickModel;
   final VoidCallback onPickEmbedding;
+  final bool floating;
 
   const ModelSwitchBar({
     super.key,
@@ -88,13 +89,14 @@ class ModelSwitchBar extends StatelessWidget {
     required this.onPickEmbedding,
     this.sourceName,
     this.embeddingError,
+    this.floating = false,
   });
 
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
     return Container(
-      color: t.composerBg,
+      color: floating ? Colors.transparent : t.composerBg,
       padding: const EdgeInsets.fromLTRB(8, 6, 8, 0),
       child: Row(
         children: <Widget>[
