@@ -184,19 +184,39 @@ class OverflowManager {
     }
   }
 
+  /// 新 checkpoint 的位置：窗口里最多留 [messageThreshold] 条、
+  /// 且最多留 [tokenThreshold] 个 token。
+  ///
+  /// **两条都要算，取更靠后的那个。** 原来这里在非 `messageCount` 模式下
+  /// 只走 token 那条路，于是 `either` 模式有个静默空转的 bug：
+  /// `_shouldSummarize` 按**条数**判定该摘要了，这里却按 **token** 找位置，
+  /// 短消息攒再多也累不到 token 阈值，返回的还是老 checkpoint，
+  /// `_summarizeUpTo` 直接 early return —— 摘要一次都不会真的发生，
+  /// 而且此后每加一条消息都要重新白算一遍。
+  ///
+  /// 实测就是这样：聊天模式下连聊十几轮，`checkpoint` 一直是 0。
   int _findCheckpoint(List<ChatMessage> history) {
-    if (trigger == OverflowTrigger.messageCount) {
-      return (history.length - messageThreshold)
+    var byCount = _checkpoint;
+    if (trigger != OverflowTrigger.tokenCount) {
+      byCount = (history.length - messageThreshold)
           .clamp(_checkpoint, history.length);
     }
-    // 从尾部往前累加 token，累到阈值为止 —— 那个位置就是新 checkpoint。
-    var tokens = 0;
-    for (var i = history.length - 1; i > _checkpoint; i--) {
-      tokens += TokenCounter.estimate(history[i].content) +
-          TokenCounter.perMessageOverhead;
-      if (tokens >= tokenThreshold) return i;
+
+    var byTokens = _checkpoint;
+    if (trigger != OverflowTrigger.messageCount) {
+      // 从尾部往前累加 token，累到阈值为止 —— 那个位置就是候选。
+      var tokens = 0;
+      for (var i = history.length - 1; i > _checkpoint; i--) {
+        tokens += TokenCounter.estimate(history[i].content) +
+            TokenCounter.perMessageOverhead;
+        if (tokens >= tokenThreshold) {
+          byTokens = i;
+          break;
+        }
+      }
     }
-    return _checkpoint;
+
+    return byCount > byTokens ? byCount : byTokens;
   }
 
   static String _firstLine(String s) {

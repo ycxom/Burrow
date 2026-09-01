@@ -97,8 +97,9 @@ void main() {
   });
 
   Future<(AgentLoop, _ScriptedLlm, _RecordingHost)> buildLoop(
-    List<LlmTurn> turns,
-  ) async {
+    List<LlmTurn> turns, {
+    OverflowManager? overflow,
+  }) async {
     final workspace = Directory('${tmp.path}/workspace');
     await workspace.create(recursive: true);
     final snapshots = SnapshotStore(
@@ -126,7 +127,7 @@ void main() {
         ),
         snapshots: snapshots,
         prefixGens: gens,
-        overflow: OverflowManager(summarize: (a, b) async => ''),
+        overflow: overflow ?? OverflowManager(summarize: (a, b) async => ''),
         retrieval: MemoryRetrieval(),
         distiller: OutputDistiller(),
         limitGuard: ContextLimitGuard(),
@@ -136,6 +137,38 @@ void main() {
       host,
     );
   }
+
+  group('滚动摘要的触发时机', () {
+    test('纯聊天的回合也会触发摘要', () async {
+      // 这条钉的是一个实测踩到的 bug：摘要检查原先写在工具轮循环的**末尾**，
+      // 而没有工具调用时 `if (turn.toolCalls.isEmpty) break;` 会先跳出去，
+      // 检查一次都执行不到。于是聊天模式下上下文只增不减 ——
+      // 而那恰恰是最需要摘要的场景，它没有工具输出可蒸馏，全是原文。
+      var summarizeCalls = 0;
+      final overflow = OverflowManager(
+        summarize: (a, b) async {
+          summarizeCalls++;
+          return '之前聊了一些东西';
+        },
+        messageThreshold: 2, // 攒够 2×2 = 4 条就摘要
+        tokenThreshold: 1 << 30, // token 那条路让开，只测条数
+      );
+      final (agent, _, host) = await buildLoop(
+        [for (var i = 0; i < 6; i++) const LlmTurn(text: '好的')],
+        overflow: overflow,
+      );
+      agent.terminalMode = false;
+
+      for (var i = 0; i < 3; i++) {
+        await agent.send('第 $i 句');
+      }
+
+      expect(summarizeCalls, greaterThan(0), reason: '一次工具都没调用，但摘要必须照常触发');
+      expect(overflow.checkpoint, greaterThan(0));
+      expect(host.statuses.any((s) => s.contains('已整理长期记忆')), isTrue,
+          reason: '触发了就要让用户知道');
+    });
+  });
 
   group('终端模式开关', () {
     test('关着时一个工具都不发给模型', () async {

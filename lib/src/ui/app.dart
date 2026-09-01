@@ -24,6 +24,7 @@ import '../sandbox/pty_channel.dart';
 import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../llm/llm_client.dart';
+import '../llm/model_catalog.dart';
 import '../settings/settings_store.dart';
 import '../settings/account_store.dart';
 import '../skills/skill_store.dart';
@@ -31,6 +32,7 @@ import 'accounts_page.dart';
 import 'chat_drawer.dart';
 import 'chat_theme.dart';
 import 'chat_view.dart';
+import 'model_bar.dart';
 import 'settings_page.dart';
 import 'skills_page.dart';
 
@@ -1142,95 +1144,85 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         body: const Center(child: CircularProgressIndicator()),
       );
     }
-    return Scaffold(
-      drawer: ChatDrawer(
-        store: widget.chats,
-        currentThreadId: _threadId,
-        onSelect: widget.onSelectThread,
-        onOpenSettings: _openSettings,
-        onOpenSkills: _openSkills,
-        onOpenAccounts: _openAccounts,
-      ),
-      appBar: AppBar(
-        backgroundColor: context.chat.headerBg,
-        titleSpacing: 0,
-        // Telegram 的顶栏是「名字 + 一行状态」。点它进设置 ——
-        // 对应 Telegram 里点头部进「聊天信息」。
-        title: InkWell(
-          onTap: _openSettings,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 4),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                Text(
-                  widget.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 16.5,
-                    fontWeight: FontWeight.w600,
-                    color: context.chat.tintPrimary,
+    // 底栏没了之后，「怎么从终端回到对话」只剩顶栏那个图标。
+    // 返回键也得能回来 —— 否则用户按返回会直接退出 app。
+    return PopScope(
+      canPop: _tab == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) setState(() => _tab = 0);
+      },
+      child: Scaffold(
+        drawer: ChatDrawer(
+          store: widget.chats,
+          currentThreadId: _threadId,
+          onSelect: widget.onSelectThread,
+          onOpenSettings: _openSettings,
+          onOpenSkills: _openSkills,
+          onOpenAccounts: _openAccounts,
+        ),
+        appBar: AppBar(
+          backgroundColor: context.chat.headerBg,
+          titleSpacing: 0,
+          // Telegram 的顶栏是「名字 + 一行状态」。点它进设置 ——
+          // 对应 Telegram 里点头部进「聊天信息」。
+          title: InkWell(
+            onTap: _openSettings,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text(
+                    widget.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 16.5,
+                      fontWeight: FontWeight.w600,
+                      color: context.chat.tintPrimary,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 1),
-                _buildSubtitle(),
-              ],
+                  const SizedBox(height: 1),
+                  _buildSubtitle(),
+                ],
+              ),
             ),
           ),
+          // 终端和检查点都从顶栏进。终端本来就是给模型用的，用户偶尔进去看一眼，
+          // 不值得在底部占一整格；底部那条留给真正会反复用的东西 —— 换模型。
+          actions: [
+            _tabAction(2, Icons.history_outlined, '检查点'),
+            _tabAction(1, Icons.terminal_outlined, '终端'),
+            // 设置 / 技能 / 账号都在抽屉里；终端模式和审批档位在输入框里。
+          ],
         ),
-        actions: [
-          IconButton(
-            tooltip: '打开终端',
-            onPressed: () => setState(() => _tab = 1),
-            icon: const Icon(Icons.terminal_outlined),
-          ),
-          // 设置 / 技能 / 账号都在抽屉里；终端模式和审批档位在输入框里。
-          // 顶栏只留一个终端 —— 它是要在对话中途反复来回切的那个。
-        ],
-      ),
-      body: IndexedStack(
-        index: _tab,
-        children: [
-          _buildChat(),
-          Column(children: [
-            if (_distro == null)
-              Container(
-                width: double.infinity,
-                color: context.chat.tintWarning.withValues(alpha: 0.16),
-                padding: const EdgeInsets.all(8),
-                child: Text(
-                  '降级模式：未安装发行版基座，当前是 Android 自带的 '
-                  '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
-                  style:
-                      TextStyle(fontSize: 11, color: context.chat.tintPrimary),
+        body: IndexedStack(
+          index: _tab,
+          children: [
+            _buildChat(),
+            Column(children: [
+              if (_distro == null)
+                Container(
+                  width: double.infinity,
+                  color: context.chat.tintWarning.withValues(alpha: 0.16),
+                  padding: const EdgeInsets.all(8),
+                  child: Text(
+                    '降级模式：未安装发行版基座，当前是 Android 自带的 '
+                    '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
+                    style: TextStyle(
+                        fontSize: 11, color: context.chat.tintPrimary),
+                  ),
                 ),
-              ),
-            Expanded(child: TerminalView(_terminal)),
-          ]),
-          _CheckpointTimeline(
-            snapshots: _runtime.snapshots,
-            prefixGens: widget.prefixGens,
-            onRolledBack: _setStatus,
-          ),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
-        height: 60,
-        backgroundColor: context.chat.bgPrimary,
-        surfaceTintColor: Colors.transparent,
-        indicatorColor: context.chat.bgBrandSecondary,
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.chat_outlined), label: '对话'),
-          NavigationDestination(
-              icon: Icon(Icons.terminal_outlined), label: '终端'),
-          NavigationDestination(
-              icon: Icon(Icons.history_outlined), label: '检查点'),
-        ],
+              Expanded(child: TerminalView(_terminal)),
+            ]),
+            _CheckpointTimeline(
+              snapshots: _runtime.snapshots,
+              prefixGens: widget.prefixGens,
+              onRolledBack: _setStatus,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1252,6 +1244,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
               itemBuilder: (_, i) => _buildRow(rows[i]),
             ),
           ),
+        ),
+        ModelSwitchBar(
+          model: widget.settings.config.model,
+          embeddingModel: widget.settings.embeddingModel,
+          embeddingError: _agent.retrieval.lastEmbeddingError,
+          onPickModel: _pickModel,
+          onPickEmbedding: _pickEmbeddingModel,
         ),
         ChatComposer(
           controller: _input,
@@ -1375,6 +1374,60 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         color: danger ? t.tintError : t.tintTertiary,
       ),
     );
+  }
+
+  /// 顶栏那两个页签入口。已经在那一页时再点一次回到对话 ——
+  /// 图标既是"去"也是"回"，省掉一个返回键。
+  Widget _tabAction(int tab, IconData icon, String tooltip) {
+    final active = _tab == tab;
+    return IconButton(
+      tooltip: active ? '返回对话' : tooltip,
+      onPressed: () => setState(() => _tab = active ? 0 : tab),
+      icon: Icon(icon),
+      color: active ? context.chat.brand : null,
+    );
+  }
+
+  /// 从服务端拉模型列表并缓存。选择器和设置页共用同一份缓存。
+  Future<List<String>> _refreshModels() async {
+    final models = await fetchModels(
+      baseUrl: widget.settings.config.baseUrl,
+      apiKey: widget.settings.config.apiKey,
+    );
+    final ids = models.map((m) => m.id).toList();
+    await widget.settings.setCachedModels(ids);
+    return ids;
+  }
+
+  Future<void> _pickModel() async {
+    final picked = await showModelPicker(
+      context,
+      title: '对话模型',
+      current: widget.settings.config.model,
+      models: widget.settings.cachedModels,
+      onRefresh: _refreshModels,
+    );
+    if (picked == null || picked.isEmpty) return;
+    await widget.settings.setModel(picked);
+  }
+
+  Future<void> _pickEmbeddingModel() async {
+    final picked = await showModelPicker(
+      context,
+      title: '嵌入模型（记忆检索）',
+      current: widget.settings.embeddingModel,
+      models: widget.settings.cachedModels,
+      onRefresh: _refreshModels,
+      allowNone: true,
+      noneLabel: '不启用',
+      error: _agent.retrieval.lastEmbeddingError,
+    );
+    if (picked == null) return;
+    await widget.settings.setEmbeddingModel(picked);
+    // 换了嵌入模型，旧向量作废：不同模型的向量不在同一个空间里，
+    // 混着算余弦得到的是无意义的数。
+    _agent.retrieval.vectorIndex.clear();
+    _agent.retrieval.lastEmbeddingError = null;
   }
 
   Widget _buildTerminalButton() {

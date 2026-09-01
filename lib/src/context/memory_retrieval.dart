@@ -143,7 +143,12 @@ class RetrievalHit {
   const RetrievalHit(this.doc, this.score);
 }
 
-typedef Embedder = Future<List<double>> Function(String text);
+/// 向量后端。**批量**接口而不是单条：给 20 条记忆建索引会变成 20 次网络往返，
+/// 而嵌入接口本来就接受数组。
+///
+/// 契约：没配置时返回空列表（调用方静默跳过向量路），
+/// 配置了但失败时抛异常（调用方降级，但要能把原因显示出来）。
+typedef Embedder = Future<List<List<double>>> Function(List<String> texts);
 
 class MemoryRetrieval {
   static const _alphaRelevance = 0.5;
@@ -172,8 +177,40 @@ class MemoryRetrieval {
   /// 已建好索引的文档向量。键是 [MemoryDoc.source]。
   final Map<String, List<double>> vectorIndex;
 
+  /// 最近一次建索引失败的原因。null = 正常或没配。
+  ///
+  /// 向量路降级得很安静，安静到用户不会发现自己配的嵌入模型根本没生效。
+  /// 上层拿这个把原因报到界面上 —— 静默失败已经坑过一次了（见 README 的 /v1）。
+  String? lastEmbeddingError;
+
   MemoryRetrieval({this.embedder, Map<String, List<double>>? vectorIndex})
       : vectorIndex = vectorIndex ?? {};
+
+  /// 给还没有向量的文档补上索引。**只嵌入新的** —— 语料是只增的
+  /// （`history[0..checkpoint)`），每轮全量重嵌等于每轮多付一次全量的钱。
+  ///
+  /// 失败就算了。向量路本来就是可选的第三路，为了它让用户这句话失败
+  /// 是本末倒置。真正的失败原因由 [Embedder] 的实现记下来给界面显示。
+  Future<void> index(List<MemoryDoc> corpus) async {
+    final embed = embedder;
+    if (embed == null) return;
+    final missing =
+        corpus.where((d) => !vectorIndex.containsKey(d.source)).toList();
+    if (missing.isEmpty) return;
+    try {
+      final vectors = await embed(missing.map((d) => d.text).toList());
+      // 数量对不上说明这批的对应关系已经不可信 —— 宁可一条都不存。
+      // 存错的向量比没有向量糟得多：检索不会报错，只会一直给错答案。
+      if (vectors.length != missing.length) return;
+      for (var i = 0; i < missing.length; i++) {
+        vectorIndex[missing[i].source] = vectors[i];
+      }
+      lastEmbeddingError = null;
+    } catch (e) {
+      // 降级成两路词法检索，但把原因留下。
+      lastEmbeddingError = '$e';
+    }
+  }
 
   Future<List<RetrievalHit>> search(
     String query,
@@ -209,14 +246,18 @@ class MemoryRetrieval {
     // 路 3：向量（可选）
     if (embedder != null && vectorIndex.isNotEmpty) {
       try {
-        final qv = await embedder!(query);
-        final cos = List<double>.generate(corpus.length, (i) {
-          final dv = vectorIndex[corpus[i].source];
-          if (dv == null) return 0;
-          final c = _cosine(qv, dv);
-          return c >= _minCosine ? c : 0;
-        });
-        rankings.add(_rankByScore(cos, _vectorTopK));
+        // 空 = 后端没配置。这时不加第三路，两路照常走。
+        final queryVectors = await embedder!([query]);
+        if (queryVectors.isNotEmpty) {
+          final qv = queryVectors.first;
+          final cos = List<double>.generate(corpus.length, (i) {
+            final dv = vectorIndex[corpus[i].source];
+            if (dv == null) return 0;
+            final c = _cosine(qv, dv);
+            return c >= _minCosine ? c : 0;
+          });
+          rankings.add(_rankByScore(cos, _vectorTopK));
+        }
       } catch (_) {
         // 向量后端挂了就退成两路。检索降级永远好过检索失败 ——
         // 用户问「之前那个包叫什么」，给个次优答案远好过报错。

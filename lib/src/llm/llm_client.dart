@@ -34,7 +34,22 @@ class LlmConfig {
 
   /// 摘要用的模型。可以指定一个更小更便宜的 —— 摘要任务不需要旗舰模型，
   /// 而它的调用频率随对话长度线性增长。
+  ///
+  /// null **和空字符串都表示「用对话模型」**。设置页的输入框留空时存下来的是
+  /// `''` 而不是 null，只判 null 的话会把空串当成一个真实的模型名发出去
+  /// —— 见 [summaryModelOrDefault]。
   final String? summaryModel;
+
+  /// 实际用于摘要的模型 id。
+  ///
+  /// 存在的理由是一个实测踩到的 bug：`summaryModel ?? model` 对空字符串不成立，
+  /// 于是摘要请求带着 `"model": ""` 发出去，服务端 400。而 [summarize] 是
+  /// **永不抛**的（它不该让用户这句话失败），所以它静默返回空 ——
+  /// 表现为「滚动摘要一次都不会生效」，上下文只增不减，而且毫无迹象。
+  String get summaryModelOrDefault {
+    final s = summaryModel?.trim() ?? '';
+    return s.isEmpty ? model : s;
+  }
 
   final double temperature;
   final bool streamOutput;
@@ -52,6 +67,25 @@ class LlmConfig {
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
 
   bool get isConfigured => baseUrl.isNotEmpty && model.isNotEmpty;
+
+  LlmConfig copyWith({
+    String? apiFormat,
+    String? baseUrl,
+    String? apiKey,
+    String? model,
+    String? summaryModel,
+    double? temperature,
+    bool? streamOutput,
+  }) =>
+      LlmConfig(
+        apiFormat: apiFormat ?? this.apiFormat,
+        baseUrl: baseUrl ?? this.baseUrl,
+        apiKey: apiKey ?? this.apiKey,
+        model: model ?? this.model,
+        summaryModel: summaryModel ?? this.summaryModel,
+        temperature: temperature ?? this.temperature,
+        streamOutput: streamOutput ?? this.streamOutput,
+      );
 }
 
 class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
@@ -443,7 +477,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
             'Authorization': 'Bearer ${config.apiKey}',
         },
         body: jsonEncode({
-          'model': config.summaryModel ?? config.model,
+          'model': config.summaryModelOrDefault,
           'temperature': 0.1,
           'messages': [
             {'role': 'system', 'content': systemPrompt},

@@ -65,6 +65,8 @@ class SettingsStore extends ChangeNotifier {
     this._config,
     this._provider,
     this._terminalModeDefault,
+    this._embeddingModel,
+    this._cachedModels,
     this._sandboxLevel,
     this._approvalMode,
     this._overflowTrigger,
@@ -77,6 +79,8 @@ class SettingsStore extends ChangeNotifier {
   static const _keyName = 'burrow.llm.apiKey';
   static const _prefix = 'burrow.llm.';
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
+  static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
+  static const _keyCachedModels = 'burrow.llm.cachedModels';
   static const _keySandboxLevel = 'burrow.sandbox.level';
   static const _keyApprovalMode = 'burrow.sandbox.approval';
   static const _keyOverflowTrigger = 'burrow.context.trigger';
@@ -91,6 +95,8 @@ class SettingsStore extends ChangeNotifier {
   LlmConfig _config;
   String _provider;
   bool _terminalModeDefault;
+  String _embeddingModel;
+  List<String> _cachedModels;
   SandboxLevel _sandboxLevel;
   ApprovalMode _approvalMode;
   OverflowTrigger _overflowTrigger;
@@ -101,6 +107,18 @@ class SettingsStore extends ChangeNotifier {
 
   LlmConfig get config => _config;
   String get provider => _provider;
+
+  /// 记忆检索用的嵌入模型。空 = 不启用，检索退回两路词法。
+  ///
+  /// 和对话模型分开存：它们通常**不是同一个模型**，而且嵌入模型一旦选定就
+  /// 不该乱换 —— 换了之后旧向量和新向量不在同一个空间里，余弦没有意义。
+  String get embeddingModel => _embeddingModel;
+
+  /// 上一次从服务端拉回来的模型 id 列表。
+  ///
+  /// 缓存下来是为了让底部那条快速切换器**一打开就有东西**。每次都现拉的话，
+  /// 切个模型要先等一次网络往返，那就不叫快速切换了。
+  List<String> get cachedModels => List.unmodifiable(_cachedModels);
 
   /// 命令的执行边界。真的会进 argv/env（见 SandboxSession.buildArgv），
   /// 不是一个只给人看的标签。
@@ -131,12 +149,16 @@ class SettingsStore extends ChangeNotifier {
         baseUrl: prefs.getString('${_prefix}baseUrl') ?? '',
         apiKey: key,
         model: prefs.getString('${_prefix}model') ?? '',
-        summaryModel: prefs.getString('${_prefix}summaryModel'),
+        // 空串归一成 null：设置页留空存下来的是 ''，而"留空"的语义是
+        // 「跟对话模型一样」，不是「模型名叫空字符串」。
+        summaryModel: _emptyToNull(prefs.getString('${_prefix}summaryModel')),
         temperature: prefs.getDouble('${_prefix}temperature') ?? 0.3,
         streamOutput: prefs.getBool('${_prefix}streamOutput') ?? true,
       ),
       prefs.getString('${_prefix}provider') ?? 'OpenAI',
       prefs.getBool(_keyTerminalDefault) ?? false,
+      prefs.getString(_keyEmbeddingModel) ?? '',
+      prefs.getStringList(_keyCachedModels) ?? const <String>[],
       _byName(SandboxLevel.values, prefs.getString(_keySandboxLevel),
           SandboxLevel.workspaceWrite),
       _byName(ApprovalMode.values, prefs.getString(_keyApprovalMode),
@@ -150,6 +172,9 @@ class SettingsStore extends ChangeNotifier {
     );
   }
 
+  static String? _emptyToNull(String? v) =>
+      (v == null || v.trim().isEmpty) ? null : v;
+
   /// 按 name 反查枚举，认不出来就用默认值。
   ///
   /// 用 name 而不是 index 存：index 会被「往枚举中间插一个值」这种
@@ -159,6 +184,27 @@ class SettingsStore extends ChangeNotifier {
       if (v.name == name) return v;
     }
     return fallback;
+  }
+
+  /// 换对话模型。只动 model 那一项，其余配置原样留着。
+  Future<void> setModel(String model) async {
+    if (_config.model == model) return;
+    _config = _config.copyWith(model: model);
+    notifyListeners();
+    await _prefs?.setString('${_prefix}model', model);
+  }
+
+  Future<void> setEmbeddingModel(String model) async {
+    if (_embeddingModel == model) return;
+    _embeddingModel = model;
+    notifyListeners();
+    await _prefs?.setString(_keyEmbeddingModel, model);
+  }
+
+  Future<void> setCachedModels(List<String> models) async {
+    _cachedModels = List<String>.from(models);
+    notifyListeners();
+    await _prefs?.setStringList(_keyCachedModels, _cachedModels);
   }
 
   Future<void> setSandboxLevel(SandboxLevel level) async {

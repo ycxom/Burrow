@@ -19,6 +19,7 @@ import 'src/context/output_distiller.dart';
 import 'src/context/overflow_manager.dart';
 import 'src/data/chat_store.dart';
 import 'src/data/task_runtime.dart';
+import 'src/llm/embeddings.dart';
 import 'src/llm/llm_client.dart';
 import 'src/sandbox/exec_policy.dart';
 import 'src/sandbox/prefix_generations.dart';
@@ -208,6 +209,17 @@ Future<void> _boot({
   final settings = await SettingsStore.load();
   final chats = await ChatStore.open();
   final llm = ConfigurableLlmClient(config: settings.config);
+
+  // 设置一变就把配置推给客户端。底部那条快速切换器改的是 SettingsStore，
+  // 不接这一条的话「切了模型但还在用旧的」—— 而且切换本身看起来是成功的。
+  settings.addListener(() => llm.config = settings.config);
+
+  // 嵌入后端。全部用闭包现读设置：换了嵌入模型下一次检索就生效。
+  final embedder = OpenAiEmbedder(
+    baseUrl: () => settings.config.baseUrl,
+    apiKey: () => settings.config.apiKey,
+    model: () => settings.embeddingModel,
+  );
   final accounts = await AccountStore.load();
 
   // Skill 装在 rootfs 的 /opt/burrow-skills 里，索引留在 app 私有目录 ——
@@ -244,7 +256,8 @@ Future<void> _boot({
         messageThreshold: settings.messageThreshold,
         tokenThreshold: settings.tokenThreshold,
       ),
-      retrieval: MemoryRetrieval(),
+      // 每个会话一份向量索引：语料是这个会话的历史，跨会话共用没有意义。
+      retrieval: MemoryRetrieval(embedder: embedder.call),
       distiller: OutputDistiller(),
       limitGuard: ContextLimitGuard(),
       skills: skills,

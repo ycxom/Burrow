@@ -210,7 +210,14 @@ class AgentLoop {
     // 用户提问里如果指向了被摘要挤出去的内容，先把它捞回来。
     // 主动检索而不是等模型调 recall_memory：模型经常不知道自己忘了什么。
     if (overflow.hasSummary) {
-      final hits = await retrieval.search(userInput, _corpus(), topK: 6);
+      final corpus = _corpus();
+      // 先给新进入语料的消息补上向量。没配嵌入模型时这是个空操作。
+      await retrieval.index(corpus);
+      // 失败了不影响这一轮（检索会降级成两路词法），但必须说出来 ——
+      // 用户配了嵌入模型却一直没生效的话，界面上得看得见。
+      final embedError = retrieval.lastEmbeddingError;
+      if (embedError != null) host.onStatus('嵌入检索不可用：$embedError');
+      final hits = await retrieval.search(userInput, corpus, topK: 6);
       if (hits.isNotEmpty) {
         final injected = retrieval.format(hits, tokenBudget: 600);
         if (injected.isNotEmpty) {
@@ -256,6 +263,18 @@ class AgentLoop {
       if (await overflow.onMessageAdded(history)) {
         host.onStatus('已整理长期记忆（摘要覆盖到第 ${overflow.checkpoint} 条）');
       }
+    }
+
+    // 循环里那次**只有调用了工具的回合才走得到** —— 没有工具调用时
+    // `if (turn.toolCalls.isEmpty) break;` 会先跳出去，检查根本不执行。
+    //
+    // 结果是：纯聊天的会话一次摘要都不会触发，上下文只增不减，直到撞上
+    // 模型的窗口上限由 ContextLimitGuard 兜底。而聊天模式恰恰是最需要摘要的
+    // 场景 —— 它没有工具输出可蒸馏，全是原文。
+    //
+    // 实测发现的：终端模式关掉后连聊十几轮，`overflow.checkpoint` 一直是 0。
+    if (await overflow.onMessageAdded(history)) {
+      host.onStatus('已整理长期记忆（摘要覆盖到第 ${overflow.checkpoint} 条）');
     }
   }
 
