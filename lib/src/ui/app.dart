@@ -648,11 +648,19 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     _prepareRuntime();
   }
 
-  /// 当前渠道名，用来给模型标来源。只有一个渠道时是 null ——
-  /// 没有第二个来源要区分，那个前缀就只是噪音。
+  /// 当前提供商名，用来给底部模型标来源。
   String? get _sourceName {
-    if (widget.channels.channels.length < 2) return null;
-    return widget.channels.active?.name;
+    return widget.channels.active?.providerLabel;
+  }
+
+  String? _displayMessageSource(String? source) {
+    if (source == null || source.isEmpty) return source;
+    final separator = source.indexOf(' · ');
+    final prefix = separator < 0 ? source : source.substring(0, separator);
+    if (Uri.tryParse(prefix)?.hasScheme != true) return source;
+    final provider = Channel.providerLabelForBaseUrl(prefix);
+    final suffix = separator < 0 ? '' : source.substring(separator);
+    return '$provider$suffix';
   }
 
   void _onSettingsChanged() {
@@ -1393,7 +1401,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       // 用消息**自己记下的**来源，而不是当前配置。换个渠道就把满屏历史
       // 全部改署成新渠道的话，恰好会在用户回头查"刚才那次是谁花的额度"时
       // 给出错误答案。老消息没有这个记录，那就不署名。
-      meta: message.source,
+      meta: _displayMessageSource(message.source),
       isError: isError,
       lastInGroup: row.lastInGroup,
       avatarPath: isUser
@@ -1437,14 +1445,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     } else if (danger) {
       text = '⚠ 沙箱已关闭，命令直接在环境里执行';
     } else {
-      // 带渠道名的署名（多渠道时才有）。顶栏这行是全程可见的那一行，
-      // 「现在发给谁」属于必须一直看得见的东西 —— 和沙箱档位同一类。
       final model = widget.settings.sourceLabel;
-      // 聊天模式下报「路径隔离 + 断网」是误导：没有任何东西在跑，
-      // 那几层保护现在保护的是零。说清楚模型手里有没有工具更有用。
-      final sandbox =
-          _agent.terminalMode ? widget.capabilities.describe() : '聊天模式，模型没有工具';
-      text = model.isEmpty ? '未配置模型 · $sandbox' : '$model · $sandbox';
+      text = model.isEmpty ? '未配置模型' : model;
     }
 
     return Text(
