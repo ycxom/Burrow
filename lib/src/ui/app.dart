@@ -1202,22 +1202,34 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             onTap: _openSettings,
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 4),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
+              child: Row(
                 children: <Widget>[
-                  Text(
-                    widget.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 16.5,
-                      fontWeight: FontWeight.w600,
-                      color: context.chat.tintPrimary,
+                  ChatAvatar(
+                    role: 'assistant',
+                    imagePath: widget.settings.assistantAvatarPath,
+                    diameter: 38,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Text(
+                          widget.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 16.5,
+                            fontWeight: FontWeight.w600,
+                            color: context.chat.tintPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 1),
+                        _buildSubtitle(),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 1),
-                  _buildSubtitle(),
                 ],
               ),
             ),
@@ -1266,36 +1278,56 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     final streaming = _streaming.toString();
     final rows = _buildRows(streaming.isEmpty ? null : streaming);
 
-    return Column(
-      children: [
-        Expanded(
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    return Stack(
+      children: <Widget>[
+        Positioned.fill(
           child: ChatWallpaper(
+            preset: widget.settings.chatWallpaperPreset,
+            imagePath: widget.settings.chatWallpaperPath,
+            dim: widget.settings.chatWallpaperDim,
             child: ListView.builder(
               controller: _scroll,
-              padding: const EdgeInsets.symmetric(vertical: 8),
+              // 模型条和输入区悬浮在列表上面；给最后一条消息留下同等空间，
+              // 否则它会停在玻璃下面，看得见却点不到。
+              padding: EdgeInsets.fromLTRB(0, 8, 0, 136 + bottomInset),
               itemCount: rows.length,
               itemBuilder: (_, i) => _buildRow(rows[i]),
             ),
           ),
         ),
-        ModelSwitchBar(
-          model: widget.settings.config.model,
-          embeddingModel: widget.settings.embeddingModel,
-          sourceName: _sourceName,
-          embeddingError: _agent.retrieval.lastEmbeddingError,
-          onPickModel: _pickModel,
-          onPickEmbedding: _pickEmbeddingModel,
-        ),
-        ChatComposer(
-          controller: _input,
-          generating: _busy,
-          enabled: !_busy && !_loadingHistory,
-          hintText: _agent.terminalMode ? '描述你希望 Agent 完成的任务' : '随便聊点什么',
-          onSend: _send,
-          onStop: _stop,
-          leading: [_buildTerminalButton()],
-          // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
-          trailing: [if (_agent.terminalMode) _buildApprovalButton()],
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              ModelSwitchBar(
+                model: widget.settings.config.model,
+                embeddingModel: widget.settings.embeddingModel,
+                sourceName: _sourceName,
+                embeddingError: _agent.retrieval.lastEmbeddingError,
+                onPickModel: _pickModel,
+                onPickEmbedding: _pickEmbeddingModel,
+                floating: true,
+              ),
+              ChatComposer(
+                controller: _input,
+                generating: _busy,
+                enabled: !_busy && !_loadingHistory,
+                hintText: _agent.terminalMode ? '描述你希望 Agent 完成的任务' : '随便聊点什么',
+                onSend: _send,
+                onStop: _stop,
+                effect: widget.settings.chatComposerEffect,
+                blur: widget.settings.chatComposerBlur,
+                opacity: widget.settings.chatComposerOpacity,
+                leading: [_buildTerminalButton()],
+                // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
+                trailing: [if (_agent.terminalMode) _buildApprovalButton()],
+              ),
+            ],
+          ),
         ),
       ],
     );
@@ -1327,7 +1359,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   Widget _buildRow(_ChatRow row) {
     final streaming = row.streaming;
     if (streaming != null) {
-      return ChatBubble(role: 'assistant', text: streaming, generating: true);
+      return ChatBubble(
+        role: 'assistant',
+        text: streaming,
+        generating: true,
+        avatarPath: widget.settings.assistantAvatarPath,
+        showAvatar: widget.settings.showMessageAvatars,
+      );
     }
 
     final day = row.day;
@@ -1358,6 +1396,12 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       meta: _displayMessageSource(message.source),
       isError: isError,
       lastInGroup: row.lastInGroup,
+      avatarPath: isUser
+          ? widget.settings.userAvatarPath
+          : message.role == 'assistant'
+              ? widget.settings.assistantAvatarPath
+              : '',
+      showAvatar: widget.settings.showMessageAvatars,
       onRetry: isLastAssistant ? _retry : null,
       // 编辑和回退只给用户消息：它们的语义都是「从这句重来」，
       // 挂在助手消息上没有对应的动作。

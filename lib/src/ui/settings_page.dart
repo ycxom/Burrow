@@ -10,6 +10,7 @@ import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
 import '../settings/settings_store.dart';
 import 'agent_settings_page.dart';
+import 'chat_appearance_page.dart';
 import 'channels_page.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -98,6 +99,26 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: <Widget>[
+          const _Header(
+            icon: Icons.palette_outlined,
+            title: '聊天外观',
+            subtitle: '壁纸、背景暗度与消息头像',
+          ),
+          Card(
+            clipBehavior: Clip.antiAlias,
+            child: ListTile(
+              leading: const Icon(Icons.wallpaper_rounded),
+              title: const Text('现代聊天界面'),
+              subtitle: Text(
+                widget.store.chatWallpaperPath.isNotEmpty
+                    ? '自定义背景 · 头像与气泡预览'
+                    : '内置背景 · 头像与气泡预览',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => _push(ChatAppearancePage(store: widget.store)),
+            ),
+          ),
+          const SizedBox(height: 18),
           const _Header(
             icon: Icons.hub_outlined,
             title: '渠道',

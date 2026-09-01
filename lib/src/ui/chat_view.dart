@@ -18,10 +18,14 @@
 ///     少了这一层就变成"卡片列表"，不是聊天。
 library;
 
+import 'dart:io';
+import 'dart:ui' show ImageFilter;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
+import '../settings/settings_store.dart';
 import 'chat_theme.dart';
 
 // ---------------------------------------------------------------------------
@@ -31,22 +35,147 @@ import 'chat_theme.dart';
 /// 聊天区的壁纸。消息列表铺在它上面。
 class ChatWallpaper extends StatelessWidget {
   final Widget child;
-  const ChatWallpaper({super.key, required this.child});
+  final ChatWallpaperPreset preset;
+  final String imagePath;
+  final double dim;
+
+  const ChatWallpaper({
+    super.key,
+    required this.child,
+    this.preset = ChatWallpaperPreset.classic,
+    this.imagePath = '',
+    this.dim = 0,
+  });
+
+  static List<Color> colors(
+    ChatWallpaperPreset preset,
+    ChatTokens tokens,
+    Brightness brightness,
+  ) {
+    final dark = brightness == Brightness.dark;
+    return switch (preset) {
+      ChatWallpaperPreset.classic => <Color>[
+          tokens.wallpaperTop,
+          tokens.wallpaperBottom
+        ],
+      ChatWallpaperPreset.aurora => dark
+          ? const <Color>[
+              Color(0xFF102B32),
+              Color(0xFF193246),
+              Color(0xFF292743),
+            ]
+          : const <Color>[
+              Color(0xFFDDF6ED),
+              Color(0xFFDDEEFF),
+              Color(0xFFEDE4FA),
+            ],
+      ChatWallpaperPreset.sunset => dark
+          ? const <Color>[
+              Color(0xFF35242A),
+              Color(0xFF342D3D),
+              Color(0xFF1E3042),
+            ]
+          : const <Color>[
+              Color(0xFFFFE4D4),
+              Color(0xFFF8E2ED),
+              Color(0xFFE3EAFB),
+            ],
+      ChatWallpaperPreset.midnight => dark
+          ? const <Color>[
+              Color(0xFF08131F),
+              Color(0xFF102437),
+              Color(0xFF122D35),
+            ]
+          : const <Color>[
+              Color(0xFFD8E5EF),
+              Color(0xFFC9D9E5),
+              Color(0xFFBFD4D5),
+            ],
+    };
+  }
 
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [t.wallpaperTop, t.wallpaperBottom],
+    final brightness = Theme.of(context).brightness;
+    final palette = colors(preset, t, brightness);
+    final customFile = imagePath.isEmpty ? null : File(imagePath);
+    final hasCustomImage = customFile?.existsSync() ?? false;
+    final overlay = dim.clamp(0.0, 0.6).toDouble();
+
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: palette,
+            ),
+          ),
         ),
-      ),
-      child: child,
+        IgnorePointer(
+          child: CustomPaint(
+            painter: _WallpaperPatternPainter(
+              color: (brightness == Brightness.dark
+                      ? Colors.white
+                      : const Color(0xFF436579))
+                  .withValues(alpha: 0.055),
+            ),
+          ),
+        ),
+        if (hasCustomImage)
+          Image.file(
+            customFile!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.medium,
+            // 文件损坏或 Android 解码器不支持时保留下面的内置壁纸，设置页
+            // 仍然能打开并让用户换一张，而不是整块区域抛红屏。
+            errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+          ),
+        if (overlay > 0)
+          ColoredBox(color: Colors.black.withValues(alpha: overlay)),
+        child,
+      ],
     );
   }
+}
+
+/// 很淡的几何纹理。Nekogram/Telegram 的壁纸之所以不像一块普通渐变色，
+/// 靠的就是这层几乎注意不到、但能让大块空白有质感的图案。
+class _WallpaperPatternPainter extends CustomPainter {
+  const _WallpaperPatternPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    const step = 76.0;
+    for (double y = -20; y < size.height + step; y += step) {
+      final shifted = ((y / step).round().isEven) ? 0.0 : step / 2;
+      for (double x = -20 + shifted; x < size.width + step; x += step) {
+        canvas.drawCircle(Offset(x, y), 13, paint);
+        canvas.drawArc(
+          Rect.fromCircle(center: Offset(x + 25, y + 23), radius: 10),
+          0.2,
+          2.2,
+          false,
+          paint,
+        );
+        canvas.drawLine(Offset(x + 8, y + 27), Offset(x + 20, y + 34), paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(_WallpaperPatternPainter oldDelegate) =>
+      oldDelegate.color != color;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,23 +294,77 @@ class BubbleShape extends ShapeBorder {
 /// 32px 圆形头像。只有收到的消息带 —— 自己发的不需要头像提醒是谁说的。
 class ChatAvatar extends StatelessWidget {
   final String role;
-  const ChatAvatar({super.key, required this.role});
+  final String imagePath;
+  final double diameter;
+
+  const ChatAvatar({
+    super.key,
+    required this.role,
+    this.imagePath = '',
+    this.diameter = size,
+  });
 
   static const double size = 32;
 
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
-    final (IconData icon, Color bg) = switch (role) {
-      'assistant' => (Icons.smart_toy_outlined, t.brand),
-      'tool' => (Icons.terminal, t.tintSecondary),
-      _ => (Icons.info_outline, t.tintTertiary),
+    final (IconData icon, List<Color> colors) = switch (role) {
+      'assistant' => (
+          Icons.auto_awesome_rounded,
+          <Color>[t.brand, Color.lerp(t.brand, Colors.purple, 0.35)!]
+        ),
+      'user' => (
+          Icons.person_rounded,
+          <Color>[const Color(0xFF26A69A), const Color(0xFF4DB6AC)]
+        ),
+      'tool' => (
+          Icons.terminal_rounded,
+          <Color>[t.tintSecondary, t.tintTertiary]
+        ),
+      _ => (
+          Icons.info_outline_rounded,
+          <Color>[t.tintTertiary, t.tintSecondary]
+        ),
     };
+
+    final fallback = DecoratedBox(
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: colors,
+        ),
+      ),
+      child: Center(
+        child: Icon(icon, size: diameter * 0.53, color: Colors.white),
+      ),
+    );
+    final file = imagePath.isEmpty ? null : File(imagePath);
+    final Widget content = file?.existsSync() == true
+        ? Image.file(
+            file!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.medium,
+            errorBuilder: (_, __, ___) => fallback,
+          )
+        : fallback;
+
     return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(color: bg, shape: BoxShape.circle),
-      child: Icon(icon, size: 18, color: Colors.white),
+      width: diameter,
+      height: diameter,
+      padding: const EdgeInsets.all(1.5),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: t.headerBg,
+        boxShadow: const <BoxShadow>[
+          BoxShadow(
+              color: Color(0x22000000), blurRadius: 3, offset: Offset(0, 1)),
+        ],
+      ),
+      child: ClipOval(child: content),
     );
   }
 }
@@ -253,6 +436,12 @@ class ChatBubble extends StatelessWidget {
   /// 这条是一组连续消息里的最后一条：画尾巴、显示头像。
   final bool lastInGroup;
 
+  /// 当前说话者的自定义头像。空字符串使用角色默认图标。
+  final String avatarPath;
+
+  /// 关闭时连占位都不保留，气泡会自然贴回屏幕两侧。
+  final bool showAvatar;
+
   final VoidCallback? onRetry;
   final VoidCallback? onEdit;
   final VoidCallback? onRewind;
@@ -267,6 +456,8 @@ class ChatBubble extends StatelessWidget {
     this.isError = false,
     this.generating = false,
     this.lastInGroup = true,
+    this.avatarPath = '',
+    this.showAvatar = true,
     this.onRetry,
     this.onEdit,
     this.onRewind,
@@ -290,7 +481,8 @@ class ChatBubble extends StatelessWidget {
             : t.tintOnIn;
     final timeColor = _outgoing ? t.timeOut : t.timeIn;
 
-    final maxWidth = MediaQuery.of(context).size.width * 0.8;
+    final maxWidth =
+        MediaQuery.of(context).size.width * (showAvatar ? 0.76 : 0.84);
 
     final footer = time == null
         ? null
@@ -336,11 +528,13 @@ class ChatBubble extends StatelessWidget {
         mainAxisAlignment:
             _outgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
         children: <Widget>[
-          if (!_outgoing) ...<Widget>[
+          if (!_outgoing && showAvatar) ...<Widget>[
             // 组内非末条也要占住头像的位置，否则气泡会左右跳。
             SizedBox(
               width: ChatAvatar.size,
-              child: lastInGroup ? ChatAvatar(role: role) : null,
+              child: lastInGroup
+                  ? ChatAvatar(role: role, imagePath: avatarPath)
+                  : null,
             ),
             const SizedBox(width: 6),
           ],
@@ -352,6 +546,15 @@ class ChatBubble extends StatelessWidget {
               child: bubble,
             ),
           ),
+          if (_outgoing && showAvatar) ...<Widget>[
+            const SizedBox(width: 6),
+            SizedBox(
+              width: ChatAvatar.size,
+              child: lastInGroup
+                  ? ChatAvatar(role: role, imagePath: avatarPath)
+                  : null,
+            ),
+          ],
         ],
       ),
     );
@@ -645,6 +848,10 @@ class ChatComposer extends StatelessWidget {
   final String hintText;
   final VoidCallback onSend;
   final VoidCallback onStop;
+  final ChatComposerEffect effect;
+  final double blur;
+  final double opacity;
+  final bool safeAreaBottom;
 
   /// 药丸里左边的图标。
   final List<Widget> leading;
@@ -660,6 +867,10 @@ class ChatComposer extends StatelessWidget {
     required this.hintText,
     required this.onSend,
     required this.onStop,
+    this.effect = ChatComposerEffect.liquid,
+    this.blur = 20,
+    this.opacity = 0.68,
+    this.safeAreaBottom = true,
     this.leading = const [],
     this.trailing = const [],
   });
@@ -667,65 +878,215 @@ class ChatComposer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
-    return Container(
-      color: t.composerBg,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: <Widget>[
-              Expanded(
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: t.composerField,
-                    borderRadius:
-                        BorderRadius.circular(ChatShape.composerRadius),
-                  ),
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: <Widget>[
-                      ...leading,
-                      Expanded(
-                        child: TextField(
-                          controller: controller,
-                          enabled: enabled,
-                          minLines: 1,
-                          maxLines: 6,
-                          style: TextStyle(fontSize: 16, color: t.tintPrimary),
-                          cursorColor: t.brand,
-                          decoration: InputDecoration(
-                            hintText: hintText,
-                            hintStyle:
-                                TextStyle(fontSize: 16, color: t.tintTertiary),
-                            // 药丸本身就是输入框的边界。
-                            border: InputBorder.none,
-                            enabledBorder: InputBorder.none,
-                            focusedBorder: InputBorder.none,
-                            disabledBorder: InputBorder.none,
-                            isDense: true,
-                            contentPadding: const EdgeInsets.symmetric(
-                                horizontal: 6, vertical: 12),
+    final content = Padding(
+      padding: const EdgeInsets.fromLTRB(10, 5, 10, 9),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: <Widget>[
+          Expanded(
+            child: _ComposerSurface(
+              effect: effect,
+              blur: blur,
+              opacity: opacity,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: <Widget>[
+                    ...leading,
+                    Expanded(
+                      child: TextField(
+                        controller: controller,
+                        enabled: enabled,
+                        minLines: 1,
+                        maxLines: 6,
+                        style: TextStyle(fontSize: 16, color: t.tintPrimary),
+                        cursorColor: t.brand,
+                        decoration: InputDecoration(
+                          hintText: hintText,
+                          hintStyle:
+                              TextStyle(fontSize: 16, color: t.tintTertiary),
+                          // 药丸本身就是输入框的边界。
+                          border: InputBorder.none,
+                          enabledBorder: InputBorder.none,
+                          focusedBorder: InputBorder.none,
+                          disabledBorder: InputBorder.none,
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 12,
                           ),
-                          textInputAction: TextInputAction.newline,
-                          keyboardType: TextInputType.multiline,
                         ),
+                        textInputAction: TextInputAction.newline,
+                        keyboardType: TextInputType.multiline,
                       ),
-                      ...trailing,
-                    ],
-                  ),
+                    ),
+                    ...trailing,
+                  ],
                 ),
               ),
-              const SizedBox(width: 6),
-              _SendButton(
-                generating: generating,
-                enabled: enabled,
-                onSend: onSend,
-                onStop: onStop,
-              ),
-            ],
+            ),
+          ),
+          const SizedBox(width: 7),
+          _SendButton(
+            generating: generating,
+            enabled: enabled,
+            onSend: onSend,
+            onStop: onStop,
+          ),
+        ],
+      ),
+    );
+    return safeAreaBottom ? SafeArea(top: false, child: content) : content;
+  }
+}
+
+/// 输入药丸的材质层。模糊只裁在药丸内部，阴影留在裁剪外；否则玻璃会把整块
+/// 底栏都糊掉，看起来像半透明面板而不是悬浮在壁纸上的一滴液体。
+class _ComposerSurface extends StatelessWidget {
+  const _ComposerSurface({
+    required this.effect,
+    required this.blur,
+    required this.opacity,
+    required this.child,
+  });
+
+  final ChatComposerEffect effect;
+  final double blur;
+  final double opacity;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.chat;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final alpha = opacity.clamp(0.25, 1.0).toDouble();
+    final requestedBlur = blur.clamp(0.0, 30.0).toDouble();
+    final radius = BorderRadius.circular(ChatShape.composerRadius + 2);
+
+    final Color? color;
+    final Gradient? gradient;
+    final Border border;
+    final double sigma;
+    final List<BoxShadow> shadows;
+
+    switch (effect) {
+      case ChatComposerEffect.solid:
+        color = t.composerField.withValues(alpha: alpha);
+        gradient = null;
+        border = Border.all(
+          color: t.borderPrimary.withValues(alpha: 0.8),
+          width: 0.8,
+        );
+        sigma = 0;
+        shadows = const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x18000000),
+            blurRadius: 10,
+            offset: Offset(0, 4),
+          ),
+        ];
+      case ChatComposerEffect.frosted:
+        color = t.composerBg.withValues(alpha: alpha);
+        gradient = null;
+        border = Border.all(
+          color: (dark ? Colors.white : Colors.white)
+              .withValues(alpha: dark ? 0.18 : 0.72),
+        );
+        sigma = requestedBlur;
+        shadows = const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x26000000),
+            blurRadius: 18,
+            offset: Offset(0, 7),
+          ),
+        ];
+      case ChatComposerEffect.liquid:
+        color = null;
+        gradient = LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: dark
+              ? <Color>[
+                  Colors.white.withValues(alpha: alpha * 0.22),
+                  t.bgSecondary.withValues(alpha: alpha * 0.86),
+                  t.brand.withValues(alpha: alpha * 0.16),
+                ]
+              : <Color>[
+                  Colors.white.withValues(alpha: alpha * 0.96),
+                  t.bgBrandSecondary.withValues(alpha: alpha * 0.76),
+                  Colors.white.withValues(alpha: alpha * 0.62),
+                ],
+        );
+        border = Border.all(
+          color: Colors.white.withValues(alpha: dark ? 0.24 : 0.82),
+          width: 1.1,
+        );
+        sigma = requestedBlur * 1.1;
+        shadows = <BoxShadow>[
+          const BoxShadow(
+            color: Color(0x26000000),
+            blurRadius: 24,
+            offset: Offset(0, 9),
+          ),
+          BoxShadow(
+            color: t.brand.withValues(alpha: dark ? 0.09 : 0.12),
+            blurRadius: 20,
+            spreadRadius: -4,
+          ),
+        ];
+      case ChatComposerEffect.outline:
+        color = t.composerBg.withValues(alpha: alpha * 0.34);
+        gradient = null;
+        border = Border.all(
+          color: t.brand.withValues(alpha: 0.52),
+          width: 1.2,
+        );
+        sigma = requestedBlur * 0.25;
+        shadows = const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x12000000),
+            blurRadius: 8,
+            offset: Offset(0, 3),
+          ),
+        ];
+    }
+
+    return DecoratedBox(
+      decoration: BoxDecoration(borderRadius: radius, boxShadow: shadows),
+      child: ClipRRect(
+        borderRadius: radius,
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: color,
+              gradient: gradient,
+              border: border,
+              borderRadius: radius,
+            ),
+            child: Stack(
+              children: <Widget>[
+                child,
+                if (effect == ChatComposerEffect.liquid)
+                  Positioned(
+                    left: 22,
+                    right: 22,
+                    top: 1,
+                    child: IgnorePointer(
+                      child: Container(
+                        height: 1,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(
+                            alpha: dark ? 0.22 : 0.76,
+                          ),
+                          borderRadius: BorderRadius.circular(1),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
         ),
       ),
