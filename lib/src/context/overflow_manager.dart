@@ -36,12 +36,23 @@ class ChatMessage {
   /// 还没改过、实际已经被改过的 workspace 重新推理，那种不一致比不回滚更糟。
   final int? checkpoint;
 
+  /// 这条助手消息是**哪个来源**生成的，形如 `渠道名 · 模型名`。
+  ///
+  /// 存下来而不是显示时现取当前配置：换一次渠道，历史里每一条助手消息的
+  /// 署名都会跟着变成新渠道 —— 那不只是不准，它恰好在用户想查
+  /// 「刚才那次是谁花的额度」时给出错误答案。
+  ///
+  /// 存的是**标签而不是渠道 id**：渠道删掉之后 id 就成了悬空引用，
+  /// 而这份记录的全部价值就在于渠道被删/改之后还读得懂。
+  final String? source;
+
   const ChatMessage({
     required this.role,
     required this.content,
     required this.at,
     this.outputRef,
     this.checkpoint,
+    this.source,
   });
 
   ChatMessage copyWith({String? content, int? checkpoint}) => ChatMessage(
@@ -50,6 +61,7 @@ class ChatMessage {
         at: at,
         outputRef: outputRef,
         checkpoint: checkpoint ?? this.checkpoint,
+        source: source,
       );
 }
 

@@ -53,6 +53,17 @@ class Channel {
     this.oauthAccountId,
   });
 
+  /// 地址里的 `host[:port]`，认不出来时退回原串。
+  ///
+  /// 界面上光有渠道名是不够的：名字是用户自己起的，「测试」「新渠道2」
+  /// 之类重名或含糊的叫法很常见，而**花的是谁的额度由地址决定**。
+  /// 所以凡是要让用户确认"发给谁"的地方，都把 host 一起摆出来。
+  String get host {
+    final uri = Uri.tryParse(baseUrl);
+    if (uri == null || uri.host.isEmpty) return baseUrl;
+    return uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
+  }
+
   bool get usesOAuth =>
       (oauthProviderId?.isNotEmpty ?? false) &&
       (oauthAccountId?.isNotEmpty ?? false);

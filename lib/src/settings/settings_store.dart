@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -66,7 +69,8 @@ class SettingsStore extends ChangeNotifier {
     this._streamOutput,
     this._terminalModeDefault,
     this._embeddingModel,
-    this._cachedModels,
+    this._modelsByChannel,
+    this._legacyModels,
     this._sandboxLevel,
     this._approvalMode,
     this._overflowTrigger,
@@ -79,6 +83,7 @@ class SettingsStore extends ChangeNotifier {
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
   static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
   static const _keyCachedModels = 'burrow.llm.cachedModels';
+  static const _keyModelsByChannel = 'burrow.llm.modelsByChannel';
   static const _keySandboxLevel = 'burrow.sandbox.level';
   static const _keyApprovalMode = 'burrow.sandbox.approval';
   static const _keyOverflowTrigger = 'burrow.context.trigger';
@@ -101,7 +106,17 @@ class SettingsStore extends ChangeNotifier {
   /// 摊成下游要的 [LlmConfig]。
   ChannelStore? _channels;
   String _embeddingModel;
-  List<String> _cachedModels;
+
+  /// 渠道 id → 上一次从**那个渠道**拉回来的模型列表。
+  ///
+  /// 曾经是一份全局列表，那是个会让人花错钱的设计：在 A 渠道拉一次，
+  /// 切到 B 渠道，选择器里列的还是 A 的模型 —— 挑一个发出去，
+  /// 要么 404，要么更糟，B 那边刚好有个同名模型于是照常计费。
+  /// 模型列表属于渠道，就得跟着渠道存。
+  final Map<String, List<String>> _modelsByChannel;
+
+  /// 迁移用：旧版那份全局列表。[bindChannels] 里认领给当前渠道后清掉。
+  List<String>? _legacyModels;
   SandboxLevel _sandboxLevel;
   ApprovalMode _approvalMode;
   OverflowTrigger _overflowTrigger;
@@ -129,9 +144,72 @@ class SettingsStore extends ChangeNotifier {
   /// 不接这一条的话换渠道不会触发任何刷新。
   void bindChannels(ChannelStore channels) {
     _channels = channels;
-    channels.addListener(notifyListeners);
+    channels.addListener(_onChannelsChanged);
+    unawaited(_claimLegacyModels());
     notifyListeners();
   }
+
+  void _onChannelsChanged() {
+    unawaited(_claimLegacyModels());
+    unawaited(_pruneModels());
+    notifyListeners();
+  }
+
+  /// 把旧版那份全局模型列表认领给当前渠道。
+  ///
+  /// 迁移过来的时候只有一个渠道，那份列表当初就是从它拉的 —— 认领是对的。
+  /// 但只认领一次：之后再有第二个渠道，它得自己拉。
+  Future<void> _claimLegacyModels() async {
+    final legacy = _legacyModels;
+    if (legacy == null) return;
+    // 渠道迁移比 bindChannels 晚一步（main 里先 bind、再 migrateFrom），
+    // 所以这一刻很可能一个渠道都还没有。留着下次渠道变动再认领，
+    // 在这里直接丢掉的话，升级后第一次打开选择器会是空的。
+    final id = _channels?.activeId;
+    if (id == null) return;
+    _legacyModels = null;
+    if (legacy.isNotEmpty && !_modelsByChannel.containsKey(id)) {
+      _modelsByChannel[id] = List<String>.from(legacy);
+      await _persistModels();
+    }
+    await _prefs?.remove(_keyCachedModels);
+  }
+
+  /// 丢掉已删渠道留下的模型列表。
+  ///
+  /// 不清的话它们会一直躺在 prefs 里；更要紧的是 [ChannelStore.newId] 万一
+  /// 撞了 id，新渠道一打开就会显示上一个渠道的模型 —— 又回到那个花错钱的坑。
+  Future<void> _pruneModels() async {
+    final channels = _channels;
+    if (channels == null || _modelsByChannel.isEmpty) return;
+    final alive = {for (final c in channels.channels) c.id};
+    final dead = _modelsByChannel.keys.where((id) => !alive.contains(id));
+    if (dead.isEmpty) return;
+    for (final id in dead.toList()) {
+      _modelsByChannel.remove(id);
+    }
+    await _persistModels();
+  }
+
+  static Map<String, List<String>> _decodeModels(String? raw) {
+    if (raw == null || raw.isEmpty) return <String, List<String>>{};
+    try {
+      final decoded = jsonDecode(raw) as Map<String, Object?>;
+      return <String, List<String>>{
+        for (final entry in decoded.entries)
+          entry.key: <String>[
+            for (final m in entry.value! as List) m! as String,
+          ],
+      };
+    } catch (_) {
+      // 缓存坏了重新拉一次就有了，不值得让 app 起不来。
+      return <String, List<String>>{};
+    }
+  }
+
+  Future<void> _persistModels() =>
+      _prefs?.setString(_keyModelsByChannel, jsonEncode(_modelsByChannel)) ??
+      Future<void>.value();
 
   /// 记忆检索用的嵌入模型。空 = 不启用，检索退回两路词法。
   ///
@@ -139,11 +217,30 @@ class SettingsStore extends ChangeNotifier {
   /// 不该乱换 —— 换了之后旧向量和新向量不在同一个空间里，余弦没有意义。
   String get embeddingModel => _embeddingModel;
 
-  /// 上一次从服务端拉回来的模型 id 列表。
+  /// 当前渠道上一次拉回来的模型 id 列表。
   ///
   /// 缓存下来是为了让底部那条快速切换器**一打开就有东西**。每次都现拉的话，
   /// 切个模型要先等一次网络往返，那就不叫快速切换了。
-  List<String> get cachedModels => List.unmodifiable(_cachedModels);
+  List<String> get cachedModels => modelsOf(_channels?.activeId);
+
+  /// 某个渠道缓存下来的模型列表。没拉过是空的 —— 选择器据此自动拉一次。
+  List<String> modelsOf(String? channelId) => List.unmodifiable(
+      (channelId == null ? null : _modelsByChannel[channelId]) ??
+          const <String>[]);
+
+  /// 当前来源的署名，形如 `渠道名 · 模型名`。
+  ///
+  /// 只有一个渠道时省掉渠道名 —— 没有第二个来源要区分，那个前缀就只是噪音。
+  /// 反过来，有多个渠道时它必须出现在每一处显示模型的地方：同名模型挂在
+  /// 两个渠道上是常态（一个免费网关、一个计费官方），光看模型名分不出来。
+  String get sourceLabel {
+    final model = config.model;
+    final channels = _channels;
+    final active = channels?.active;
+    if (active == null) return model;
+    if ((channels?.channels.length ?? 0) < 2) return model;
+    return model.isEmpty ? active.name : '${active.name} · $model';
+  }
 
   /// 命令的执行边界。真的会进 argv/env（见 SandboxSession.buildArgv），
   /// 不是一个只给人看的标签。
@@ -171,7 +268,8 @@ class SettingsStore extends ChangeNotifier {
       prefs.getBool('${_prefix}streamOutput') ?? true,
       prefs.getBool(_keyTerminalDefault) ?? false,
       prefs.getString(_keyEmbeddingModel) ?? '',
-      prefs.getStringList(_keyCachedModels) ?? const <String>[],
+      _decodeModels(prefs.getString(_keyModelsByChannel)),
+      prefs.getStringList(_keyCachedModels),
       _byName(SandboxLevel.values, prefs.getString(_keySandboxLevel),
           SandboxLevel.workspaceWrite),
       _byName(ApprovalMode.values, prefs.getString(_keyApprovalMode),
@@ -227,10 +325,14 @@ class SettingsStore extends ChangeNotifier {
     await _prefs?.setString(_keyEmbeddingModel, model);
   }
 
-  Future<void> setCachedModels(List<String> models) async {
-    _cachedModels = List<String>.from(models);
+  /// 记下**某个渠道**拉回来的模型列表。
+  ///
+  /// 必须带 channelId：拉取是异步的，拉的过程中用户完全可能已经切走了，
+  /// 记到"当前渠道"上就会把 A 的列表安到 B 头上。
+  Future<void> setModelsFor(String channelId, List<String> models) async {
+    _modelsByChannel[channelId] = List<String>.from(models);
     notifyListeners();
-    await _prefs?.setStringList(_keyCachedModels, _cachedModels);
+    await _persistModels();
   }
 
   Future<void> setSandboxLevel(SandboxLevel level) async {

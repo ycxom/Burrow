@@ -23,6 +23,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../llm/oauth.dart';
+import 'channel_store.dart';
 
 /// 一个已登录的账号。
 class OAuthAccount {
@@ -218,6 +219,18 @@ class AccountStore extends ChangeNotifier {
     notifyListeners();
     await _secure.delete(key: account.storageKey);
     await _writeIndex();
+  }
+
+  /// 一个渠道这次请求该带的 Authorization 值。
+  ///
+  /// 走 API key 的渠道原样返回传进来的 key；走 OAuth 的**每次现取** ——
+  /// 把 access_token 抄进渠道配置的话，它一过期那份副本就成了必然 401
+  /// 的死值，而界面上还显示着"已登录"。
+  Future<String> authFor(Channel channel, {required String apiKey}) async {
+    if (!channel.usesOAuth) return apiKey;
+    final bound = account(channel.oauthProviderId!, channel.oauthAccountId!);
+    if (bound == null) throw const OAuthException('绑定的账号已经不存在了');
+    return validToken(bound);
   }
 
   /// 拿一个当前可用的 access_token，过期就先刷新。

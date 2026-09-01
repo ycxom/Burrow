@@ -154,6 +154,13 @@ class AgentLoop {
   /// 模型会对着一堆「command not found」原地打转。UI 负责挡这一步。
   bool terminalMode;
 
+  /// 当前来源的署名，形如 `渠道名 · 模型名`。写进每条助手消息里。
+  ///
+  /// 由 UI 推过来（和 [mode]、[sandboxLevel] 一样），而不是从 `llm.config`
+  /// 现取：渠道名只有 UI 那层知道，而**只有模型名是不够的** —— 两个渠道
+  /// 常常挂着同名的模型，一个免费一个计费，那正是要分清的情形。
+  String? sourceLabel;
+
   /// 全量历史。**永不删除** —— overflow 只控制哪些进 prompt。
   final List<ChatMessage> history = [];
 
@@ -178,6 +185,7 @@ class AgentLoop {
     this.mode = ApprovalMode.onRequest,
     this.sandboxLevel = SandboxLevel.workspaceWrite,
     this.terminalMode = false,
+    this.sourceLabel,
     this.maxToolRounds = 24,
   });
 
@@ -245,7 +253,11 @@ class AgentLoop {
 
       if (turn.text.isNotEmpty) {
         history.add(ChatMessage(
-            role: 'assistant', content: turn.text, at: DateTime.now()));
+          role: 'assistant',
+          content: turn.text,
+          at: DateTime.now(),
+          source: sourceLabel,
+        ));
       }
       if (turn.toolCalls.isEmpty) break;
 

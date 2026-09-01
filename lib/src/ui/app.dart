@@ -640,6 +640,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     _prepareRuntime();
   }
 
+  /// 当前渠道名，用来给模型标来源。只有一个渠道时是 null ——
+  /// 没有第二个来源要区分，那个前缀就只是噪音。
+  String? get _sourceName {
+    if (widget.channels.channels.length < 2) return null;
+    return widget.channels.active?.name;
+  }
+
   void _onSettingsChanged() {
     if (!mounted) return;
     // 设置页改完要**当场**对正在进行的会话生效，而不是等下次新建会话。
@@ -647,6 +654,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     if (_runtimeReady) {
       _agent.sandboxLevel = widget.settings.sandboxLevel;
       _agent.mode = widget.settings.approvalMode;
+      // 换渠道/换模型之后，接下来生成的助手消息要署新的来源。
+      _agent.sourceLabel = widget.settings.sourceLabel;
       _agent.overflow
         ..trigger = widget.settings.overflowTrigger
         ..messageThreshold = widget.settings.messageThreshold
@@ -658,6 +667,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   Future<void> _prepareRuntime() async {
     _runtime = await widget.runtime;
     _agent = widget.buildAgent(this, _runtime);
+    _agent.sourceLabel = widget.settings.sourceLabel;
     await _restoreTerminalMode();
     await _loadHistory();
     await _startShell();
@@ -1096,9 +1106,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       setState(() {
         if (_streaming.isNotEmpty) {
           _visible.add(ChatMessage(
-              role: 'assistant',
-              content: _streaming.toString(),
-              at: DateTime.now()));
+            role: 'assistant',
+            content: _streaming.toString(),
+            at: DateTime.now(),
+            source: widget.settings.sourceLabel,
+          ));
           _streaming.clear();
         }
         _busy = false;
@@ -1261,6 +1273,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         ModelSwitchBar(
           model: widget.settings.config.model,
           embeddingModel: widget.settings.embeddingModel,
+          sourceName: _sourceName,
           embeddingError: _agent.retrieval.lastEmbeddingError,
           onPickModel: _pickModel,
           onPickEmbedding: _pickEmbeddingModel,
@@ -1331,7 +1344,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       role: message.role,
       text: message.content,
       time: message.at,
-      meta: message.role == 'assistant' ? widget.settings.config.model : null,
+      // 用消息**自己记下的**来源，而不是当前配置。换个渠道就把满屏历史
+      // 全部改署成新渠道的话，恰好会在用户回头查"刚才那次是谁花的额度"时
+      // 给出错误答案。老消息没有这个记录，那就不署名。
+      meta: message.source,
       isError: isError,
       lastInGroup: row.lastInGroup,
       onRetry: isLastAssistant ? _retry : null,
@@ -1369,7 +1385,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     } else if (danger) {
       text = '⚠ 沙箱已关闭，命令直接在环境里执行';
     } else {
-      final model = widget.settings.config.model;
+      // 带渠道名的署名（多渠道时才有）。顶栏这行是全程可见的那一行，
+      // 「现在发给谁」属于必须一直看得见的东西 —— 和沙箱档位同一类。
+      final model = widget.settings.sourceLabel;
       // 聊天模式下报「路径隔离 + 断网」是误导：没有任何东西在跑，
       // 那几层保护现在保护的是零。说清楚模型手里有没有工具更有用。
       final sandbox =
@@ -1401,24 +1419,54 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     );
   }
 
-  /// 从服务端拉模型列表并缓存。选择器和设置页共用同一份缓存。
-  Future<List<String>> _refreshModels() async {
-    // 走当前渠道的代理。用默认客户端的话，配了代理的渠道在这里会超时，
-    // 而聊天本身是通的 —— 那种不一致最难查。
-    final client = buildHttpClient(proxy: widget.channels.active?.proxy);
+  /// 拉**指定渠道**的模型列表并缓存到那个渠道名下。
+  ///
+  /// 带渠道参数而不是用"当前渠道"：选择器里可以翻别的来源，翻的时候
+  /// 当前渠道并没有变；按当前渠道拉的话，用户看到的会是 A 的地址配 B 的列表。
+  Future<List<String>> _refreshModels(String channelId) async {
+    final channel = widget.channels.byId(channelId);
+    if (channel == null) throw StateError('这个渠道已经不存在了');
+    // 走**这个渠道自己**的代理和认证。用默认客户端的话，配了代理的渠道
+    // 在这里会超时，而聊天本身是通的 —— 那种不一致最难查。
+    final auth = await widget.accounts
+        .authFor(channel, apiKey: widget.channels.apiKeyOf(channel));
+    final client = buildHttpClient(proxy: channel.proxy);
     final List<FetchedModel> models;
     try {
       models = await fetchModels(
-        baseUrl: widget.settings.config.baseUrl,
-        apiKey: widget.settings.config.apiKey,
+        baseUrl: channel.baseUrl,
+        apiKey: auth,
         client: client,
       );
     } finally {
       client.close();
     }
     final ids = models.map((m) => m.id).toList();
-    await widget.settings.setCachedModels(ids);
+    await widget.settings.setModelsFor(channelId, ids);
     return ids;
+  }
+
+  /// 选择器里那一排来源 = 渠道列表，各自带着自己缓存的模型。
+  List<ModelSource> _modelSources() => <ModelSource>[
+        for (final c in widget.channels.channels)
+          ModelSource(
+            id: c.id,
+            name: c.name,
+            host: c.host,
+            models: widget.settings.modelsOf(c.id),
+            configuredModel: c.model,
+          ),
+      ];
+
+  /// 选中的来源不是当前渠道时，把渠道一起切过去。
+  ///
+  /// 顺序不能反：[SettingsStore.setModel] 改的是**当前**渠道的模型，
+  /// 先设模型的话，那个模型会被写到用户正想离开的那个渠道上。
+  Future<void> _adoptSource(String sourceId) async {
+    if (sourceId == widget.channels.activeId) return;
+    await widget.channels.setActive(sourceId);
+    final name = widget.channels.byId(sourceId)?.name ?? sourceId;
+    if (mounted) _setStatus('已切换到渠道「$name」');
   }
 
   Future<void> _pickModel() async {
@@ -1426,11 +1474,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       context,
       title: '对话模型',
       current: widget.settings.config.model,
-      models: widget.settings.cachedModels,
+      sources: _modelSources(),
+      activeSourceId: widget.channels.activeId,
       onRefresh: _refreshModels,
     );
-    if (picked == null || picked.isEmpty) return;
-    await widget.settings.setModel(picked);
+    if (picked == null || picked.model.isEmpty) return;
+    await _adoptSource(picked.sourceId);
+    await widget.settings.setModel(picked.model);
   }
 
   Future<void> _pickEmbeddingModel() async {
@@ -1438,16 +1488,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       context,
       title: '嵌入模型（记忆检索）',
       current: widget.settings.embeddingModel,
-      models: widget.settings.cachedModels,
+      sources: _modelSources(),
+      activeSourceId: widget.channels.activeId,
       onRefresh: _refreshModels,
       allowNone: true,
       noneLabel: '不启用',
       error: _agent.retrieval.lastEmbeddingError,
     );
     if (picked == null) return;
-    await widget.settings.setEmbeddingModel(picked);
+    // 嵌入也发往当前渠道，所以在别的来源上挑嵌入模型同样要把渠道带过去 ——
+    // 不带的话就是拿 A 的模型名去 B 那里请求，一路 404 或者更糟：
+    // B 上刚好有个同名模型，于是照常计费。
+    await _adoptSource(picked.sourceId);
+    await widget.settings.setEmbeddingModel(picked.model);
     // 换了嵌入模型，旧向量作废：不同模型的向量不在同一个空间里，
-    // 混着算余弦得到的是无意义的数。
+    // 混着算余弦得到的是无意义的数。换渠道同理 —— 同名模型在两家服务商
+    // 那里也是两个空间。
     _agent.retrieval.vectorIndex.clear();
     _agent.retrieval.lastEmbeddingError = null;
   }

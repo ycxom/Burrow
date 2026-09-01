@@ -341,13 +341,8 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
       );
 
   /// 这次要用的密钥。OAuth 渠道现取 token。
-  Future<String> _authFor(Channel draft) async {
-    if (!draft.usesOAuth) return _key.text.trim();
-    final account =
-        widget.accounts.account(draft.oauthProviderId!, draft.oauthAccountId!);
-    if (account == null) throw const OAuthException('绑定的账号已经不存在了');
-    return widget.accounts.validToken(account);
-  }
+  Future<String> _authFor(Channel draft) =>
+      widget.accounts.authFor(draft, apiKey: _key.text.trim());
 
   void _say(String message, {bool error = false}) {
     if (!mounted) return;

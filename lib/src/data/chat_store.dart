@@ -32,7 +32,7 @@ class ChatStore {
     final path = p.join(await getDatabasesPath(), 'burrow.db');
     final db = await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -44,6 +44,12 @@ class ChatStore {
           // 并且 UI 会说明这一点 —— 假装能回滚才是危险的。
           await db
               .execute('ALTER TABLE messages ADD COLUMN checkpoint INTEGER');
+        }
+        if (from < 4) {
+          // 老消息不知道自己是谁生成的。留空而不是补上"当前渠道"——
+          // 那等于给历史消息盖一个多半是错的章，而这个字段存在的意义
+          // 就是让「这条是谁答的」可信。UI 对空值不显示署名。
+          await db.execute('ALTER TABLE messages ADD COLUMN source TEXT');
         }
       },
       onCreate: (db, _) async {
@@ -64,7 +70,8 @@ class ChatStore {
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             output_ref TEXT,
-            checkpoint INTEGER
+            checkpoint INTEGER,
+            source TEXT
           )
         ''');
         await db.execute(
@@ -169,6 +176,7 @@ class ChatStore {
               ),
               outputRef: row['output_ref'] as String?,
               checkpoint: row['checkpoint'] as int?,
+              source: row['source'] as String?,
             ))
         .toList();
   }
@@ -181,6 +189,7 @@ class ChatStore {
       'created_at': message.at.millisecondsSinceEpoch,
       'output_ref': message.outputRef,
       'checkpoint': message.checkpoint,
+      'source': message.source,
     });
     await _db.update(
       'threads',
@@ -211,6 +220,7 @@ class ChatStore {
           'created_at': message.at.millisecondsSinceEpoch,
           'output_ref': message.outputRef,
           'checkpoint': message.checkpoint,
+          'source': message.source,
         });
       }
     });

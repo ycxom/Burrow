@@ -138,6 +138,40 @@ void main() {
     );
   }
 
+  group('助手消息记下自己的来源', () {
+    test('署名写进消息，不是显示时现取', () async {
+      // 换个渠道就把满屏历史全部改署成新渠道的话，恰好会在用户回头查
+      // 「刚才那次是谁花的额度」时给出错误答案。
+      final (agent, _, _) = await buildLoop(<LlmTurn>[
+        const LlmTurn(text: '第一次'),
+      ]);
+      agent.sourceLabel = '本地网关 · glm-5';
+      await agent.send('你好');
+
+      final first = agent.history.lastWhere((m) => m.role == 'assistant');
+      expect(first.source, '本地网关 · glm-5');
+
+      // 换渠道之后再发一条：旧的那条**不动**。
+      agent.sourceLabel = 'OpenAI · gpt-5';
+      await agent.send('再来');
+      final all = agent.history.where((m) => m.role == 'assistant').toList();
+      expect(all.first.source, '本地网关 · glm-5');
+      expect(all.last.source, 'OpenAI · gpt-5');
+    });
+
+    test('没设来源时留空，而不是编一个', () async {
+      // 空值的意思是"不知道"，UI 据此不署名。补一个当前渠道上去，
+      // 就是给历史消息盖一个多半是错的章。
+      final (agent, _, _) =
+          await buildLoop(<LlmTurn>[const LlmTurn(text: '嗨')]);
+      await agent.send('你好');
+      expect(
+        agent.history.lastWhere((m) => m.role == 'assistant').source,
+        isNull,
+      );
+    });
+  });
+
   group('滚动摘要的触发时机', () {
     test('纯聊天的回合也会触发摘要', () async {
       // 这条钉的是一个实测踩到的 bug：摘要检查原先写在工具轮循环的**末尾**，

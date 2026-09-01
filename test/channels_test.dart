@@ -8,9 +8,31 @@ library;
 import 'package:burrow/src/llm/llm_client.dart';
 import 'package:burrow/src/net/proxy_client.dart';
 import 'package:burrow/src/settings/channel_store.dart';
+import 'package:burrow/src/settings/settings_store.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  group('渠道地址', () {
+    Channel at(String baseUrl) =>
+        Channel(id: 'c', name: 'n', baseUrl: baseUrl, model: 'm');
+
+    test('host 带端口', () {
+      expect(at('http://192.168.31.228:3000/v1').host, '192.168.31.228:3000');
+    });
+
+    test('默认端口不显示', () {
+      expect(at('https://api.openai.com/v1').host, 'api.openai.com');
+    });
+
+    test('认不出来就原样给出去', () {
+      // 宁可显示一串怪东西，也不能显示空白 —— 这一行的作用就是让用户
+      // 在点下去之前认出"这次发给谁"，空着等于没有这一行。
+      expect(at('不是个地址').host, '不是个地址');
+      expect(at('').host, '');
+    });
+  });
+
   group('代理地址解析', () {
     test('裸 host:port', () {
       expect(normalizeProxy('127.0.0.1:7890'), '127.0.0.1:7890');
@@ -168,6 +190,8 @@ void main() {
     });
   });
 
+  _modelCacheTests();
+
   group('客户端换代理', () {
     test('换配置时代理变了会重建底层客户端', () {
       // 代理是设在 HttpClient 上的，不是每个请求的参数。只换 config
@@ -179,6 +203,141 @@ void main() {
       expect(client.config.proxy, isNull);
       client.config = client.config.copyWith(proxy: '127.0.0.1:7890');
       expect(client.config.proxy, '127.0.0.1:7890');
+    });
+  });
+}
+
+/// 模型列表**跟着渠道走**。
+///
+/// 这一组钉的是一个会让人花错钱的 bug：模型列表曾经是一份全局缓存，
+/// 在 A 渠道拉一次、切到 B，选择器里列的还是 A 的模型。挑一个发出去，
+/// 要么 404，要么更糟 —— B 那边刚好有个同名模型，于是照常计费。
+void _modelCacheTests() {
+  const a = Channel(
+      id: 'c1', name: '本地网关', baseUrl: 'http://gw:3000', model: 'glm-5');
+  const b = Channel(
+      id: 'c2',
+      name: 'OpenAI',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-5');
+
+  /// bindChannels 里的认领和清理是 unawaited 的（它们不该拖慢启动），
+  /// 所以断言前要让出一次事件循环。
+  Future<void> settle() => Future<void>.delayed(Duration.zero);
+
+  group('模型缓存按渠道分开', () {
+    setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+
+    test('切渠道不会串列表', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      final settings = await SettingsStore.load();
+      settings.bindChannels(channels);
+
+      await settings.setModelsFor('c1', <String>['glm-5', 'glm-4.6']);
+      expect(settings.cachedModels, <String>['glm-5', 'glm-4.6']);
+
+      await channels.setActive('c2');
+      // 空的，不是 c1 那份。选择器据此自动拉一次 —— 那正是想要的：
+      // 宁可等一次网络往返，也不能列一份别人家的菜单。
+      expect(settings.cachedModels, isEmpty);
+
+      await channels.setActive('c1');
+      expect(settings.cachedModels, <String>['glm-5', 'glm-4.6']);
+    });
+
+    test('拉取期间切走了，列表仍然记在拉的那个渠道上', () async {
+      // 拉模型是异步的，回来时用户完全可能已经切走了。
+      // 记到"当前渠道"上就会把 A 的列表安到 B 头上。
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      final settings = await SettingsStore.load();
+      settings.bindChannels(channels);
+
+      await channels.setActive('c2');
+      await settings.setModelsFor('c1', <String>['glm-5']);
+
+      expect(settings.cachedModels, isEmpty);
+      expect(settings.modelsOf('c1'), <String>['glm-5']);
+    });
+
+    test('删掉渠道会连它的模型列表一起清掉', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      final settings = await SettingsStore.load();
+      settings.bindChannels(channels);
+      await settings.setModelsFor('c1', <String>['glm-5']);
+
+      await channels.remove('c1');
+      await settle();
+      expect(settings.modelsOf('c1'), isEmpty);
+    });
+
+    test('落盘的是按渠道分的表，重开还在', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      final settings = await SettingsStore.load();
+      settings.bindChannels(channels);
+      await settings.setModelsFor('c1', <String>['glm-5']);
+
+      final reopened = await SettingsStore.load();
+      reopened
+          .bindChannels(ChannelStore.forTest(channels: [a, b], activeId: 'c1'));
+      expect(reopened.cachedModels, <String>['glm-5']);
+    });
+  });
+
+  group('旧版全局列表的迁移', () {
+    test('认领给当前渠道，别的渠道仍然是空的', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'burrow.llm.cachedModels': <String>['glm-5', 'glm-4.6'],
+      });
+      final settings = await SettingsStore.load();
+      settings
+          .bindChannels(ChannelStore.forTest(channels: [a, b], activeId: 'c1'));
+      await settle();
+
+      expect(settings.modelsOf('c1'), <String>['glm-5', 'glm-4.6']);
+      expect(settings.modelsOf('c2'), isEmpty);
+    });
+
+    test('bind 时还没有渠道，等迁移建出来再认领', () async {
+      // main 里是先 bindChannels 再 migrateFrom，所以 bind 的那一刻
+      // 一个渠道都没有。在那里直接丢掉的话，升级后第一次打开选择器是空的。
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'burrow.llm.cachedModels': <String>['glm-5'],
+      });
+      final channels = ChannelStore.forTest();
+      final settings = await SettingsStore.load();
+      settings.bindChannels(channels);
+      await settle();
+      expect(settings.cachedModels, isEmpty);
+
+      await channels.upsert(a);
+      await settle();
+      expect(settings.modelsOf('c1'), <String>['glm-5']);
+    });
+  });
+
+  group('来源署名', () {
+    setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+
+    test('只有一个渠道时不标来源', () async {
+      final settings = await SettingsStore.load();
+      settings
+          .bindChannels(ChannelStore.forTest(channels: [a], activeId: 'c1'));
+      expect(settings.sourceLabel, 'glm-5');
+    });
+
+    test('多渠道时带上渠道名', () async {
+      // 同名模型挂在两个渠道上是常态（一个免费网关、一个计费官方），
+      // 光看模型名分不出花的是谁的钱。
+      final settings = await SettingsStore.load();
+      settings
+          .bindChannels(ChannelStore.forTest(channels: [a, b], activeId: 'c2'));
+      expect(settings.sourceLabel, 'OpenAI · gpt-5');
+    });
+
+    test('没有渠道时是空的', () async {
+      final settings = await SettingsStore.load();
+      settings.bindChannels(ChannelStore.forTest());
+      expect(settings.sourceLabel, isEmpty);
     });
   });
 }
