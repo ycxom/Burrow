@@ -34,6 +34,20 @@ class Channel {
   final String model;
   final String? summaryModel;
 
+  /// 这个渠道的**对话模型本身能不能看图**。
+  ///
+  /// 手动勾，不自动探测：聚合网关返回的模型 id 五花八门，靠名字猜"是不是
+  /// 视觉模型"猜错的代价是一次 400 或者更糟 —— 模型收到图却当没看见，
+  /// 照常答一段，而用户以为它看过了。
+  final bool visionCapable;
+
+  /// 前置多模态用的视觉模型（可选）。
+  ///
+  /// 对话模型不认图时，先让它把图描述成文字，再把文字交给对话模型。
+  /// 和 [summaryModel] 是同一个套路：同一个接入点上换一个更便宜、
+  /// 更专门的模型干一件配角的活。空 = 这个渠道不提供视觉。
+  final String? visionModel;
+
   /// `host:port`。空 = 直连。
   final String? proxy;
 
@@ -48,6 +62,8 @@ class Channel {
     required this.model,
     this.apiFormat = 'openAI',
     this.summaryModel,
+    this.visionCapable = false,
+    this.visionModel,
     this.proxy,
     this.oauthProviderId,
     this.oauthAccountId,
@@ -63,6 +79,9 @@ class Channel {
     if (uri == null || uri.host.isEmpty) return baseUrl;
     return uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
   }
+
+  /// 能不能拿来做前置多模态。
+  bool get canDescribeImages => (visionModel?.trim().isNotEmpty ?? false);
 
   bool get usesOAuth =>
       (oauthProviderId?.isNotEmpty ?? false) &&
@@ -109,6 +128,9 @@ class Channel {
     String? baseUrl,
     String? model,
     String? summaryModel,
+    bool? visionCapable,
+    String? visionModel,
+    bool clearVisionModel = false,
     String? proxy,
     String? oauthProviderId,
     String? oauthAccountId,
@@ -121,6 +143,9 @@ class Channel {
         baseUrl: baseUrl ?? this.baseUrl,
         model: model ?? this.model,
         summaryModel: summaryModel ?? this.summaryModel,
+        visionCapable: visionCapable ?? this.visionCapable,
+        visionModel:
+            clearVisionModel ? null : (visionModel ?? this.visionModel),
         proxy: proxy ?? this.proxy,
         oauthProviderId:
             clearOAuth ? null : (oauthProviderId ?? this.oauthProviderId),
@@ -135,6 +160,8 @@ class Channel {
         'base_url': baseUrl,
         'model': model,
         'summary_model': summaryModel,
+        'vision_capable': visionCapable,
+        'vision_model': visionModel,
         'proxy': proxy,
         'oauth_provider': oauthProviderId,
         'oauth_account': oauthAccountId,
@@ -147,6 +174,8 @@ class Channel {
         baseUrl: (j['base_url'] as String?) ?? '',
         model: (j['model'] as String?) ?? '',
         summaryModel: j['summary_model'] as String?,
+        visionCapable: j['vision_capable'] as bool? ?? false,
+        visionModel: j['vision_model'] as String?,
         proxy: j['proxy'] as String?,
         oauthProviderId: j['oauth_provider'] as String?,
         oauthAccountId: j['oauth_account'] as String?,
@@ -340,7 +369,9 @@ class ChannelStore extends ChangeNotifier {
   /// 一份马上失效的副本。真正的 token 由 [ConfigurableLlmClient.bearerProvider]
   /// 在每次请求前现取。
   LlmConfig configFor(Channel? channel,
-      {double temperature = 0.3, bool streamOutput = true}) {
+      {double temperature = 0.3,
+      bool streamOutput = true,
+      bool sendImagesInline = false}) {
     if (channel == null) return LlmConfig.empty;
     return LlmConfig(
       apiFormat: channel.oauthProviderId == 'openai_oauth'
@@ -353,6 +384,7 @@ class ChannelStore extends ChangeNotifier {
       proxy: channel.proxy,
       temperature: temperature,
       streamOutput: streamOutput,
+      sendImagesInline: sendImagesInline,
     );
   }
 }

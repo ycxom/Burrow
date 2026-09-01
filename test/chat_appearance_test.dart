@@ -74,7 +74,7 @@ void main() {
     );
 
     expect(find.text('Burrow 助手'), findsOneWidget);
-    expect(find.text('夜间'), findsOneWidget);
+    expect(find.text('Nekogram 夜间'), findsOneWidget);
     expect(find.text('聊天背景'), findsOneWidget);
     await tester.tap(find.text('极光'));
     await tester.pump();

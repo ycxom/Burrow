@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:burrow/src/agent/tools.dart';
 import 'package:burrow/src/context/overflow_manager.dart';
@@ -8,7 +9,140 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
+/// 最小的合法 PNG 头。只用来让 sniffMediaType 认出类型。
+final _png = <int>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00];
+
 void main() {
+  group('图片进请求体', () {
+    late Directory tmp;
+    late String image;
+
+    setUp(() async {
+      tmp = await Directory.systemTemp.createTemp('burrow_llm_img');
+      final file = File('${tmp.path}/a.png');
+      await file.writeAsBytes(_png);
+      image = file.path;
+    });
+
+    tearDown(() async {
+      if (await tmp.exists()) await tmp.delete(recursive: true);
+    });
+
+    Future<Map<String, Object?>> sendWith(LlmConfig config) async {
+      late http.Request captured;
+      final client = ConfigurableLlmClient(
+        config: config,
+        httpClient: MockClient((request) async {
+          captured = request;
+          return http.Response.bytes(
+            utf8.encode(jsonEncode(<String, Object?>{
+              'choices': <Object?>[
+                <String, Object?>{
+                  'message': <String, Object?>{'content': '好'},
+                },
+              ],
+              'content': <Object?>[
+                <String, Object?>{'type': 'text', 'text': '好'},
+              ],
+            })),
+            200,
+          );
+        }),
+      );
+      await client.complete(
+        messages: <ChatMessage>[
+          ChatMessage(
+            role: 'user',
+            content: '这是什么',
+            at: DateTime(2026),
+            images: <String>[image],
+          ),
+        ],
+        tools: const <ToolSpec>[],
+        onDelta: (_) {},
+      );
+      return jsonDecode(captured.body) as Map<String, Object?>;
+    }
+
+    test('渠道认图时图片进 content 数组', () async {
+      final body = await sendWith(const LlmConfig(
+        baseUrl: 'https://example.com/v1',
+        apiKey: 'k',
+        model: 'm',
+        streamOutput: false,
+        sendImagesInline: true,
+      ));
+      final parts = (body['messages']! as List).first as Map<String, Object?>;
+      final content = parts['content']! as List;
+      expect(content.first, containsPair('type', 'image_url'));
+      expect(content.last, containsPair('text', '这是什么'));
+    });
+
+    test('渠道不认图时 content 退回字符串', () async {
+      // 关键的一条：不认图的模型收到数组形式的 content 会 400，
+      // 而更糟的是有的网关照单全收然后把图默默丢掉。
+      // 这时图应该由前置多模态处理，请求体里一张图都不该有。
+      final body = await sendWith(const LlmConfig(
+        baseUrl: 'https://example.com/v1',
+        apiKey: 'k',
+        model: 'm',
+        streamOutput: false,
+      ));
+      final message = (body['messages']! as List).first as Map<String, Object?>;
+      expect(message['content'], '这是什么');
+      // 整个请求体里不该出现 base64。
+      expect(jsonEncode(body), isNot(contains('base64')));
+    });
+
+    test('Anthropic 用 source/base64 而不是 image_url', () async {
+      final body = await sendWith(const LlmConfig(
+        apiFormat: 'anthropic',
+        baseUrl: 'https://example.com',
+        apiKey: 'k',
+        model: 'm',
+        streamOutput: false,
+        sendImagesInline: true,
+      ));
+      final message = (body['messages']! as List).first as Map<String, Object?>;
+      final content = message['content']! as List;
+      final first = content.first as Map<String, Object?>;
+      expect(first['type'], 'image');
+      expect((first['source']! as Map)['media_type'], 'image/png');
+    });
+
+    test('没有图的消息仍然发字符串 content', () async {
+      // 不少本地推理服务只认字符串形式的 content，
+      // 一律改成数组会把它们全打挂。
+      late http.Request captured;
+      final client = ConfigurableLlmClient(
+        config: const LlmConfig(
+          baseUrl: 'https://example.com/v1',
+          apiKey: 'k',
+          model: 'm',
+          streamOutput: false,
+          sendImagesInline: true,
+        ),
+        httpClient: MockClient((request) async {
+          captured = request;
+          return http.Response.bytes(
+            utf8.encode('{"choices":[{"message":{"content":"好"}}]}'),
+            200,
+          );
+        }),
+      );
+      await client.complete(
+        messages: <ChatMessage>[
+          ChatMessage(role: 'user', content: '你好', at: DateTime(2026)),
+        ],
+        tools: const <ToolSpec>[],
+        onDelta: (_) {},
+      );
+      final body = jsonDecode(captured.body) as Map<String, Object?>;
+      final message = (body['messages']! as List).first as Map<String, Object?>;
+      expect(message['content'], '你好');
+    });
+  });
+
   test('连接测试接受完整接口地址且不重复追加路径', () async {
     late http.Request captured;
     final client = ConfigurableLlmClient(

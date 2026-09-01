@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
 import '../llm/llm_client.dart';
+import '../llm/vision.dart';
 import 'channel_store.dart';
 import '../sandbox/sandbox_session.dart';
 
@@ -95,6 +96,7 @@ class SettingsStore extends ChangeNotifier {
     this._streamOutput,
     this._terminalModeDefault,
     this._embeddingModel,
+    this._imageMode,
     this._modelsByChannel,
     this._legacyModels,
     this._sandboxLevel,
@@ -118,6 +120,7 @@ class SettingsStore extends ChangeNotifier {
   static const _prefix = 'burrow.llm.';
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
   static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
+  static const _keyImageMode = 'burrow.llm.imageMode';
   static const _keyCachedModels = 'burrow.llm.cachedModels';
   static const _keyModelsByChannel = 'burrow.llm.modelsByChannel';
   static const _keySandboxLevel = 'burrow.sandbox.level';
@@ -153,6 +156,7 @@ class SettingsStore extends ChangeNotifier {
   /// 摊成下游要的 [LlmConfig]。
   ChannelStore? _channels;
   String _embeddingModel;
+  ImageMode _imageMode;
 
   /// 渠道 id → 上一次从**那个渠道**拉回来的模型列表。
   ///
@@ -189,6 +193,7 @@ class SettingsStore extends ChangeNotifier {
       channels.active,
       temperature: _temperature,
       streamOutput: _streamOutput,
+      sendImagesInline: sendImagesInline,
     );
   }
 
@@ -268,6 +273,27 @@ class SettingsStore extends ChangeNotifier {
       _prefs?.setString(_keyModelsByChannel, jsonEncode(_modelsByChannel)) ??
       Future<void>.value();
 
+  /// 图片怎么送到模型手里。
+  ImageMode get imageMode => _imageMode;
+
+  /// 这一刻要不要把图直接塞进请求。
+  ///
+  /// 两件事共用一个开关：模型认不认图（渠道上勾的），以及用户有没有强制
+  /// 走前置（省钱）。**强制前置时即使模型认图也不直发** —— 那正是这个
+  /// 选项存在的意义，不然它和 auto 就没区别了。
+  bool get sendImagesInline => switch (_imageMode) {
+        ImageMode.native => true,
+        ImageMode.preprocess => false,
+        ImageMode.auto => _channels?.active?.visionCapable ?? false,
+      };
+
+  Future<void> setImageMode(ImageMode mode) async {
+    if (_imageMode == mode) return;
+    _imageMode = mode;
+    notifyListeners();
+    await _prefs?.setString(_keyImageMode, mode.name);
+  }
+
   /// 记忆检索用的嵌入模型。空 = 不启用，检索退回两路词法。
   ///
   /// 和对话模型分开存：它们通常**不是同一个模型**，而且嵌入模型一旦选定就
@@ -334,6 +360,7 @@ class SettingsStore extends ChangeNotifier {
       prefs.getBool('${_prefix}streamOutput') ?? true,
       prefs.getBool(_keyTerminalDefault) ?? false,
       prefs.getString(_keyEmbeddingModel) ?? '',
+      _byName(ImageMode.values, prefs.getString(_keyImageMode), ImageMode.auto),
       _decodeModels(prefs.getString(_keyModelsByChannel)),
       prefs.getStringList(_keyCachedModels),
       _byName(SandboxLevel.values, prefs.getString(_keySandboxLevel),
