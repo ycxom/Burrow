@@ -311,7 +311,9 @@ class ChannelStore extends ChangeNotifier {
       {double temperature = 0.3, bool streamOutput = true}) {
     if (channel == null) return LlmConfig.empty;
     return LlmConfig(
-      apiFormat: channel.apiFormat,
+      apiFormat: channel.oauthProviderId == 'openai_oauth'
+          ? 'chatgptOAuth'
+          : channel.apiFormat,
       baseUrl: channel.baseUrl,
       apiKey: channel.usesOAuth ? '' : apiKeyOf(channel),
       model: channel.model,

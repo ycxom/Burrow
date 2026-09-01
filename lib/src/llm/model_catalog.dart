@@ -30,6 +30,60 @@ class ModelFetchException implements Exception {
   String toString() => message;
 }
 
+const _codexOAuthModelsUrl = 'https://chatgpt.com/backend-api/codex/models';
+const _codexClientVersion = '0.144.1';
+
+/// ChatGPT 订阅 OAuth 的模型目录不是 OpenAI API 的 `/v1/models`。
+/// 它属于 Codex 后端，并按账号工作区与客户端版本返回可用模型。
+Future<List<FetchedModel>> fetchChatGptOAuthModels({
+  required String accessToken,
+  required String accountId,
+  http.Client? client,
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  if (accessToken.trim().isEmpty) {
+    throw const ModelFetchException('ChatGPT OAuth token 为空，请重新登录');
+  }
+  if (accountId.trim().isEmpty) {
+    throw const ModelFetchException('登录凭据缺少 ChatGPT Account ID，请退出该账号后重新登录');
+  }
+  final httpClient = client ?? http.Client();
+  final uri = Uri.parse(_codexOAuthModelsUrl).replace(
+    queryParameters: const {'client_version': _codexClientVersion},
+  );
+  http.Response response;
+  try {
+    response = await httpClient.get(uri, headers: {
+      'Authorization': 'Bearer $accessToken',
+      'Accept': 'application/json',
+      'chatgpt-account-id': accountId,
+      'originator': 'codex_cli_rs',
+      'version': _codexClientVersion,
+      'User-Agent': 'codex_cli_rs/$_codexClientVersion',
+    }).timeout(timeout);
+  } catch (error) {
+    throw ModelFetchException('获取 ChatGPT 可用模型失败：$error');
+  }
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    final body = response.body.length > 400
+        ? '${response.body.substring(0, 400)}…'
+        : response.body;
+    throw ModelFetchException(
+        '获取 ChatGPT 可用模型失败：HTTP ${response.statusCode} $body');
+  }
+  try {
+    final models = parseModelsResponse(response.body);
+    if (models.isEmpty) {
+      throw const ModelFetchException('ChatGPT 返回了空模型列表，请确认订阅包含 Codex 权限');
+    }
+    return models;
+  } on ModelFetchException {
+    rethrow;
+  } catch (error) {
+    throw ModelFetchException('无法解析 ChatGPT 模型列表：$error');
+  }
+}
+
 /// 已知的「Anthropic 协议兼容子路径」后缀。
 ///
 /// 有些聚合站把 Anthropic 协议挂在这些子路径上，但模型列表在站点根上。
@@ -150,9 +204,21 @@ List<FetchedModel> parseModelsResponse(String body) {
   if (decoded is List) {
     entries = decoded;
   } else if (decoded is Map<String, Object?>) {
-    final data = decoded['data'] ?? decoded['models'];
-    if (data is! List) return const [];
-    entries = data;
+    final data = decoded['data'] ?? decoded['models'] ?? decoded['items'];
+    if (data is List) {
+      entries = data;
+    } else if (data is Map) {
+      entries = data.entries
+          .map<Object?>((entry) => entry.value is Map
+              ? <String, Object?>{
+                  'fallback_id': entry.key.toString(),
+                  ...Map<String, Object?>.from(entry.value as Map),
+                }
+              : entry.key.toString())
+          .toList();
+    } else {
+      return const [];
+    }
   } else {
     return const [];
   }
@@ -165,7 +231,11 @@ List<FetchedModel> parseModelsResponse(String body) {
     if (entry is String) {
       id = entry;
     } else if (entry is Map<String, Object?>) {
-      final raw = entry['id'] ?? entry['name'] ?? entry['model'];
+      final raw = entry['slug'] ??
+          entry['id'] ??
+          entry['model'] ??
+          entry['name'] ??
+          entry['fallback_id'];
       if (raw is String) id = raw;
       final owner = entry['owned_by'] ?? entry['ownedBy'];
       if (owner is String && owner.isNotEmpty) ownedBy = owner;

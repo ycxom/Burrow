@@ -95,6 +95,12 @@ class AccountStore extends ChangeNotifier {
   OAuthCredential? credentialOf(OAuthAccount account) =>
       _cache[account.storageKey];
 
+  OAuthCredential? credentialFor(Channel channel) {
+    if (!channel.usesOAuth) return null;
+    final bound = account(channel.oauthProviderId!, channel.oauthAccountId!);
+    return bound == null ? null : credentialOf(bound);
+  }
+
   static Future<AccountStore> load({
     List<DeviceFlowProvider>? providers,
     FlutterSecureStorage? secure,

@@ -365,6 +365,8 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
     );
     try {
       final auth = await _authFor(draft);
+      client.chatGptAccountIdProvider =
+          () async => widget.accounts.credentialFor(draft)?.accountId;
       await client.testConnection(
         widget.channels.configFor(draft).copyWith(apiKey: auth),
       );
@@ -386,11 +388,17 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
     final client = buildHttpClient(proxy: draft.proxy);
     try {
       final auth = await _authFor(draft);
-      final models = await fetchModels(
-        baseUrl: draft.baseUrl,
-        apiKey: auth,
-        client: client,
-      );
+      final models = draft.oauthProviderId == 'openai_oauth'
+          ? await fetchChatGptOAuthModels(
+              accessToken: auth,
+              accountId: widget.accounts.credentialFor(draft)?.accountId ?? '',
+              client: client,
+            )
+          : await fetchModels(
+              baseUrl: draft.baseUrl,
+              apiKey: auth,
+              client: client,
+            );
       if (mounted) setState(() => _models = models.map((m) => m.id).toList());
       _say('拿到 ${_models.length} 个模型');
     } catch (e) {

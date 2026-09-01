@@ -188,6 +188,18 @@ void main() {
       );
       expect(store.configFor(c).apiKey, isEmpty);
     });
+
+    test('ChatGPT OAuth 投影成专用 Responses 协议', () {
+      const c = Channel(
+        id: 'c2',
+        name: 'ChatGPT',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        model: 'gpt-codex-test',
+        oauthProviderId: 'openai_oauth',
+        oauthAccountId: 'a@b.com',
+      );
+      expect(store.configFor(c).apiFormat, 'chatgptOAuth');
+    });
   });
 
   _modelCacheTests();

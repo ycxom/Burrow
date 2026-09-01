@@ -75,6 +75,8 @@ class LlmConfig {
 
   bool get isConfigured => baseUrl.isNotEmpty && model.isNotEmpty;
 
+  bool get isChatGptOAuth => apiFormat == 'chatgptOAuth';
+
   LlmConfig copyWith({
     String? apiFormat,
     String? baseUrl,
@@ -109,6 +111,10 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
   /// 存进去就等于存了一份马上失效的副本。每次请求前现取才是对的。
   Future<String> Function()? bearerProvider;
 
+  /// ChatGPT Codex 后端还要求 workspace account id；它与登录账号的本地 id
+  /// 不是一回事，所以和 token 一样从凭据仓库现取。
+  Future<String?> Function()? chatGptAccountIdProvider;
+
   ConfigurableLlmClient({
     LlmConfig? config,
     http.Client? httpClient,
@@ -138,6 +144,29 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     return provider();
   }
 
+  Future<String> _chatGptAccountId() async {
+    final value = (await chatGptAccountIdProvider?.call())?.trim() ?? '';
+    if (value.isEmpty) {
+      throw const LlmConnectionException(
+          '登录凭据缺少 ChatGPT Account ID，请退出该账号后重新登录');
+    }
+    return value;
+  }
+
+  static const _codexEndpoint =
+      'https://chatgpt.com/backend-api/codex/responses';
+  static const _codexVersion = '0.144.1';
+
+  Future<Map<String, String>> _chatGptHeaders(String token) async => {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'Authorization': 'Bearer $token',
+        'chatgpt-account-id': await _chatGptAccountId(),
+        'originator': 'codex_cli_rs',
+        'version': _codexVersion,
+        'User-Agent': 'codex_cli_rs/$_codexVersion',
+      };
+
   @override
   void cancel() {
     _http.close();
@@ -152,34 +181,48 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
       throw StateError('请先填写 Base URL 和模型');
     }
     final anthropic = value.apiFormat == 'anthropic';
-    final uri =
-        _endpoint(value.baseUrl, anthropic ? '/messages' : '/chat/completions');
+    final chatGpt = value.isChatGptOAuth;
+    final uri = chatGpt
+        ? Uri.parse(_codexEndpoint)
+        : _endpoint(
+            value.baseUrl, anthropic ? '/messages' : '/chat/completions');
     http.Response response;
     try {
-      response = await _http
-          .post(
-            uri,
-            headers: <String, String>{
+      final headers = chatGpt
+          ? await _chatGptHeaders(value.apiKey)
+          : <String, String>{
               'Content-Type': 'application/json',
               if (anthropic) 'anthropic-version': '2023-06-01',
               if (anthropic && value.apiKey.isNotEmpty)
                 'x-api-key': value.apiKey,
               if (!anthropic && value.apiKey.isNotEmpty)
                 'Authorization': 'Bearer ${value.apiKey}',
-            },
-            body: jsonEncode(<String, Object?>{
-              'model': value.model,
-              // OpenAI 兼容服务普遍支持 max_tokens；max_completion_tokens
-              // 是较新的 OpenAI 专用字段，很多国内服务会拒绝。
-              if (uri.host == 'api.openai.com')
-                'max_completion_tokens': 1
-              else
-                'max_tokens': 1,
-              'stream': false,
-              'messages': <Map<String, String>>[
-                <String, String>{'role': 'user', 'content': 'Hi'},
-              ],
-            }),
+            };
+      response = await _http
+          .post(
+            uri,
+            headers: headers,
+            body: jsonEncode(chatGpt
+                ? <String, Object?>{
+                    'model': value.model,
+                    'instructions': 'You are a helpful assistant.',
+                    'input': <Map<String, String>>[
+                      {'role': 'user', 'content': 'Hi'},
+                    ],
+                    'stream': true,
+                    'store': false,
+                  }
+                : <String, Object?>{
+                    'model': value.model,
+                    if (uri.host == 'api.openai.com')
+                      'max_completion_tokens': 1
+                    else
+                      'max_tokens': 1,
+                    'stream': false,
+                    'messages': <Map<String, String>>[
+                      <String, String>{'role': 'user', 'content': 'Hi'},
+                    ],
+                  }),
           )
           .timeout(connectionTimeout);
     } on TimeoutException {
@@ -224,7 +267,126 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
         onDelta: onDelta,
       );
     }
+    if (config.isChatGptOAuth) {
+      return _completeChatGpt(
+        messages: messages,
+        tools: tools,
+        onDelta: onDelta,
+      );
+    }
     return _completeOpenAi(messages: messages, tools: tools, onDelta: onDelta);
+  }
+
+  Future<LlmTurn> _completeChatGpt({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required void Function(String delta) onDelta,
+    String? model,
+  }) async {
+    final auth = await _authValue();
+    final system = messages
+        .where((message) => message.role == 'system')
+        .map((message) => message.content)
+        .join('\n\n');
+    final request = http.Request('POST', Uri.parse(_codexEndpoint))
+      ..headers.addAll(await _chatGptHeaders(auth))
+      ..body = jsonEncode(<String, Object?>{
+        'model': model ?? config.model,
+        'instructions':
+            system.isEmpty ? 'You are a helpful assistant.' : system,
+        'input': messages
+            .where((message) => message.role != 'system')
+            .map((message) => <String, Object?>{
+                  'role': message.role == 'assistant' ? 'assistant' : 'user',
+                  'content': message.role == 'tool'
+                      ? '[工具结果]\n${message.content}'
+                      : message.content,
+                })
+            .toList(),
+        'stream': true,
+        'store': false,
+        if (tools.isNotEmpty)
+          'tools': tools
+              .map((tool) => <String, Object?>{
+                    'type': 'function',
+                    'name': tool.name,
+                    'description': tool.description,
+                    'parameters': tool.parameters,
+                  })
+              .toList(),
+      });
+    final response = await _http.send(request);
+    if (response.statusCode >= 400) {
+      final body = await response.stream.bytesToString();
+      if (_guard.isContextLimitError(response.statusCode, body)) {
+        throw ContextOverflowException(response.statusCode, body);
+      }
+      throw http.ClientException(
+          'LLM 返回 ${response.statusCode}: ${_brief(body)}');
+    }
+    return _readResponsesStream(response.stream, onDelta);
+  }
+
+  Future<LlmTurn> _readResponsesStream(
+    http.ByteStream stream,
+    void Function(String) onDelta,
+  ) async {
+    final text = StringBuffer();
+    final calls = <String, _PartialToolCall>{};
+    await for (final line
+        in stream.transform(utf8.decoder).transform(const LineSplitter())) {
+      if (!line.startsWith('data:')) continue;
+      final payload = line.substring(5).trim();
+      if (payload.isEmpty || payload == '[DONE]') continue;
+      Map<String, Object?> event;
+      try {
+        event = jsonDecode(payload) as Map<String, Object?>;
+      } catch (_) {
+        continue;
+      }
+      final type = event['type'];
+      if (type == 'response.output_text.delta') {
+        final delta = event['delta']?.toString() ?? '';
+        if (delta.isNotEmpty) {
+          text.write(delta);
+          onDelta(delta);
+        }
+      } else if (type == 'response.output_item.added' ||
+          type == 'response.output_item.done') {
+        final item = event['item'] as Map<String, Object?>?;
+        if (item?['type'] != 'function_call') continue;
+        final key = item?['id']?.toString() ??
+            item?['call_id']?.toString() ??
+            'call_${calls.length}';
+        final call = calls.putIfAbsent(key, _PartialToolCall.new);
+        call.id = item?['call_id']?.toString() ?? key;
+        call.name = item?['name']?.toString() ?? call.name;
+        final arguments = item?['arguments']?.toString() ?? '';
+        if (arguments.isNotEmpty) {
+          call.args.clear();
+          call.args.write(arguments);
+        }
+      } else if (type == 'response.function_call_arguments.delta') {
+        final key = event['item_id']?.toString() ??
+            event['call_id']?.toString() ??
+            'call_0';
+        calls
+            .putIfAbsent(key, _PartialToolCall.new)
+            .args
+            .write(event['delta']?.toString() ?? '');
+      }
+    }
+    return LlmTurn(
+      text: text.toString(),
+      toolCalls: calls.values
+          .where((call) => call.name.isNotEmpty)
+          .map((call) => ToolCall(
+                id: call.id.isEmpty ? 'call_0' : call.id,
+                name: call.name,
+                args: repairAndDecode(call.args.toString()),
+              ))
+          .toList(),
+    );
   }
 
   Future<LlmTurn> _completeOpenAi({
@@ -508,6 +670,19 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
   Future<String> summarize(String systemPrompt, String payload) async {
     if (!config.isConfigured) return '';
     try {
+      if (config.isChatGptOAuth) {
+        final result = await _completeChatGpt(
+          messages: [
+            ChatMessage(
+                role: 'system', content: systemPrompt, at: DateTime.now()),
+            ChatMessage(role: 'user', content: payload, at: DateTime.now()),
+          ],
+          tools: const [],
+          onDelta: (_) {},
+          model: config.summaryModelOrDefault,
+        );
+        return result.text.trim();
+      }
       final auth = await _authValue();
       final response = await _http.post(
         _endpoint(config.baseUrl, '/chat/completions'),

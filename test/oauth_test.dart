@@ -141,6 +141,19 @@ void main() {
     test('空列表就是空列表，不抛', () {
       expect(parseModelsResponse('{"data":[],"object":"list"}'), isEmpty);
     });
+
+    test('ChatGPT Codex 的 slug 字段也能解析', () {
+      final models = parseModelsResponse(
+          '{"models":[{"slug":"gpt-codex-test","display_name":"Codex"}]}');
+      expect(models.single.id, 'gpt-codex-test');
+    });
+
+    test('模型对象映射会把 key 当作模型 ID', () {
+      final models = parseModelsResponse(
+          '{"models":{"gpt-map-test":{"owned_by":"openai"}}}');
+      expect(models.single.id, 'gpt-map-test');
+      expect(models.single.ownedBy, 'openai');
+    });
   });
 
   group('拉模型', () {
@@ -173,6 +186,52 @@ void main() {
             baseUrl: 'http://192.168.1.1:3000', apiKey: 'k', client: client),
         throwsA(isA<ModelFetchException>()
             .having((e) => e.message, 'message', contains('没有可用模型'))),
+      );
+    });
+  });
+
+  group('ChatGPT OAuth 拉模型', () {
+    test('使用 Codex 专用端点并携带账号和客户端头', () async {
+      late http.Request captured;
+      final client = MockClient((request) async {
+        captured = request;
+        return http.Response(
+          '{"models":[{"slug":"gpt-codex-test"}]}',
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+
+      final models = await fetchChatGptOAuthModels(
+        accessToken: 'oauth-token',
+        accountId: 'account-123',
+        client: client,
+      );
+
+      expect(models.single.id, 'gpt-codex-test');
+      expect(captured.url.origin, 'https://chatgpt.com');
+      expect(captured.url.path, '/backend-api/codex/models');
+      expect(captured.url.queryParameters['client_version'], '0.144.1');
+      expect(captured.headers['authorization'], 'Bearer oauth-token');
+      expect(captured.headers['chatgpt-account-id'], 'account-123');
+      expect(captured.headers['originator'], 'codex_cli_rs');
+      expect(captured.headers['version'], '0.144.1');
+    });
+
+    test('旧登录记录缺少 account ID 时提示重新登录', () async {
+      await expectLater(
+        fetchChatGptOAuthModels(
+          accessToken: 'oauth-token',
+          accountId: '',
+          client: MockClient((_) async => http.Response('{}', 200)),
+        ),
+        throwsA(
+          isA<ModelFetchException>().having(
+            (error) => error.message,
+            'message',
+            contains('重新登录'),
+          ),
+        ),
       );
     });
   });

@@ -259,6 +259,10 @@ Future<void> _boot({
     if (account == null) return '';
     return accounts.validToken(account);
   };
+  llm.chatGptAccountIdProvider = () async {
+    final channel = channels.active;
+    return channel == null ? null : accounts.credentialFor(channel)?.accountId;
+  };
 
   // Skill 装在 rootfs 的 /opt/burrow-skills 里，索引留在 app 私有目录 ——
   // rootfs 会被「代目录 + 原子 rename」整个换掉，索引跟着丢的话
