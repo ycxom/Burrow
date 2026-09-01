@@ -72,6 +72,14 @@ enum ChatWallpaperPreset {
   midnight,
 }
 
+/// 聊天应用的整体明暗风格。默认使用参考图里的 Nekogram 夜间色板；
+/// 仍保留跟随系统和明亮模式，避免把外观选择绑死在 Android 系统主题上。
+enum ChatColorStyle {
+  nekogramNight,
+  followSystem,
+  light,
+}
+
 /// 悬浮输入区的材质。数值参数（模糊和不透明度）与材质分开存，切换回来时
 /// 用户调好的手感仍然保留。
 enum ChatComposerEffect {
@@ -94,6 +102,7 @@ class SettingsStore extends ChangeNotifier {
     this._overflowTrigger,
     this._messageThreshold,
     this._tokenThreshold,
+    this._chatColorStyle,
     this._chatWallpaperPreset,
     this._chatWallpaperPath,
     this._chatWallpaperDim,
@@ -116,6 +125,7 @@ class SettingsStore extends ChangeNotifier {
   static const _keyOverflowTrigger = 'burrow.context.trigger';
   static const _keyMessageThreshold = 'burrow.context.messageThreshold';
   static const _keyTokenThreshold = 'burrow.context.tokenThreshold';
+  static const _keyChatColorStyle = 'burrow.appearance.colorStyle';
   static const _keyChatWallpaperPreset = 'burrow.appearance.wallpaperPreset';
   static const _keyChatWallpaperPath = 'burrow.appearance.wallpaperPath';
   static const _keyChatWallpaperDim = 'burrow.appearance.wallpaperDim';
@@ -159,6 +169,7 @@ class SettingsStore extends ChangeNotifier {
   OverflowTrigger _overflowTrigger;
   int _messageThreshold;
   int _tokenThreshold;
+  ChatColorStyle _chatColorStyle;
   ChatWallpaperPreset _chatWallpaperPreset;
   String _chatWallpaperPath;
   double _chatWallpaperDim;
@@ -300,6 +311,7 @@ class SettingsStore extends ChangeNotifier {
   int get messageThreshold => _messageThreshold;
   int get tokenThreshold => _tokenThreshold;
 
+  ChatColorStyle get chatColorStyle => _chatColorStyle;
   ChatWallpaperPreset get chatWallpaperPreset => _chatWallpaperPreset;
   String get chatWallpaperPath => _chatWallpaperPath;
   double get chatWallpaperDim => _chatWallpaperDim;
@@ -334,6 +346,11 @@ class SettingsStore extends ChangeNotifier {
           OverflowTrigger.either),
       prefs.getInt(_keyMessageThreshold) ?? 30,
       prefs.getInt(_keyTokenThreshold) ?? 4000,
+      _byName(
+        ChatColorStyle.values,
+        prefs.getString(_keyChatColorStyle),
+        ChatColorStyle.nekogramNight,
+      ),
       _byName(
         ChatWallpaperPreset.values,
         prefs.getString(_keyChatWallpaperPreset),
@@ -461,6 +478,13 @@ class SettingsStore extends ChangeNotifier {
     await _prefs?.setBool(_keyTerminalDefault, on);
   }
 
+  Future<void> setChatColorStyle(ChatColorStyle value) async {
+    if (_chatColorStyle == value) return;
+    _chatColorStyle = value;
+    notifyListeners();
+    await _prefs?.setString(_keyChatColorStyle, value.name);
+  }
+
   Future<void> setChatWallpaperPreset(ChatWallpaperPreset preset) async {
     if (_chatWallpaperPreset == preset && _chatWallpaperPath.isEmpty) return;
     _chatWallpaperPreset = preset;
@@ -547,6 +571,7 @@ class SettingsStore extends ChangeNotifier {
 
   /// 只重置视觉项，不碰渠道、模型或沙箱配置。
   Future<void> resetChatAppearance() async {
+    _chatColorStyle = ChatColorStyle.nekogramNight;
     _chatWallpaperPreset = ChatWallpaperPreset.classic;
     _chatWallpaperPath = '';
     _chatWallpaperDim = 0;
@@ -561,6 +586,7 @@ class SettingsStore extends ChangeNotifier {
     final prefs = _prefs;
     if (prefs == null) return;
     await Future.wait(<Future<bool>>[
+      prefs.remove(_keyChatColorStyle),
       prefs.remove(_keyChatWallpaperPreset),
       prefs.remove(_keyChatWallpaperPath),
       prefs.remove(_keyChatWallpaperDim),

@@ -390,28 +390,36 @@ class BurrowApp extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-        title: 'Burrow',
-        locale: _appLocale,
-        supportedLocales: _supportedLocales,
-        localizationsDelegates: _localizationsDelegates,
-        theme: _buildTheme(Brightness.light),
-        darkTheme: _buildTheme(Brightness.dark),
-        home: ChatShell(
-          buildAgent: buildAgent,
-          buildRuntime: buildRuntime,
-          capabilities: capabilities,
-          prefixGens: prefixGens,
-          spawner: spawner,
-          activeDistro: activeDistro,
-          distros: distros,
-          abi: abi,
-          llm: llm,
-          settings: settings,
-          chats: chats,
-          skills: skills,
-          accounts: accounts,
-          channels: channels,
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: settings,
+        builder: (context, _) => MaterialApp(
+          title: 'Burrow',
+          locale: _appLocale,
+          supportedLocales: _supportedLocales,
+          localizationsDelegates: _localizationsDelegates,
+          theme: _buildTheme(Brightness.light),
+          darkTheme: _buildTheme(Brightness.dark),
+          themeMode: switch (settings.chatColorStyle) {
+            ChatColorStyle.nekogramNight => ThemeMode.dark,
+            ChatColorStyle.followSystem => ThemeMode.system,
+            ChatColorStyle.light => ThemeMode.light,
+          },
+          home: ChatShell(
+            buildAgent: buildAgent,
+            buildRuntime: buildRuntime,
+            capabilities: capabilities,
+            prefixGens: prefixGens,
+            spawner: spawner,
+            activeDistro: activeDistro,
+            distros: distros,
+            abi: abi,
+            llm: llm,
+            settings: settings,
+            chats: chats,
+            skills: skills,
+            accounts: accounts,
+            channels: channels,
+          ),
         ),
       );
 }

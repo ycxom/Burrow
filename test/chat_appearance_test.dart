@@ -14,6 +14,7 @@ void main() {
 
   test('聊天外观设置会持久化并可恢复默认值', () async {
     final store = await SettingsStore.load();
+    await store.setChatColorStyle(ChatColorStyle.light);
     await store.setChatWallpaperPreset(ChatWallpaperPreset.aurora);
     await store.setChatWallpaperPath('/private/wallpaper.image');
     await store.setChatWallpaperDim(0.35);
@@ -25,6 +26,7 @@ void main() {
     await store.setChatComposerOpacity(0.55);
 
     final restored = await SettingsStore.load();
+    expect(restored.chatColorStyle, ChatColorStyle.light);
     expect(restored.chatWallpaperPreset, ChatWallpaperPreset.aurora);
     expect(restored.chatWallpaperPath, '/private/wallpaper.image');
     expect(restored.chatWallpaperDim, 0.35);
@@ -36,6 +38,7 @@ void main() {
     expect(restored.chatComposerOpacity, 0.55);
 
     await restored.resetChatAppearance();
+    expect(restored.chatColorStyle, ChatColorStyle.nekogramNight);
     expect(restored.chatWallpaperPreset, ChatWallpaperPreset.classic);
     expect(restored.chatWallpaperPath, isEmpty);
     expect(restored.chatWallpaperDim, 0);
@@ -71,6 +74,7 @@ void main() {
     );
 
     expect(find.text('Burrow 助手'), findsOneWidget);
+    expect(find.text('夜间'), findsOneWidget);
     expect(find.text('聊天背景'), findsOneWidget);
     await tester.tap(find.text('极光'));
     await tester.pump();
