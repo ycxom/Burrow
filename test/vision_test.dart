@@ -8,8 +8,10 @@ library;
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:burrow/src/context/overflow_manager.dart';
 import 'package:burrow/src/llm/image_parts.dart';
 import 'package:burrow/src/llm/llm_client.dart';
+import 'package:burrow/src/llm/system_prompt.dart';
 import 'package:burrow/src/llm/vision.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -300,6 +302,8 @@ void main() {
     });
   });
 
+  _systemPromptTests();
+
   group('前置多模态的挑选与容灾', () {
     VisionCandidate candidate(String label) => VisionCandidate(
           label: label,
@@ -390,6 +394,108 @@ void main() {
       ).describe(const <String>['a.png', 'b.png']);
       expect(result.ok, isTrue);
       expect(calls, 1);
+    });
+  });
+}
+
+/// 系统提示词的三种送达方式，以及发不出图时的占位。
+///
+/// 这一块的失败方式**全都不是异常**：提示词被静默丢掉、图片被静默丢掉，
+/// 请求照样 200，模型照样答一段 —— 用户只会觉得"设了没用"。
+void _systemPromptTests() {
+  ChatMessage msg(String role, String content,
+          {List<String> images = const <String>[]}) =>
+      ChatMessage(
+          role: role, content: content, at: DateTime(2026), images: images);
+
+  group('系统提示词的送达方式', () {
+    final base = <ChatMessage>[
+      msg('system', '你是猫娘'),
+      msg('user', '你好'),
+      msg('assistant', '喵'),
+      msg('user', '再说一次'),
+    ];
+
+    test('默认原样不动', () {
+      final out = applySystemPromptStyle(base, SystemPromptStyle.systemRole);
+      expect(identical(out, base), isTrue);
+    });
+
+    test('拼进**第一条**用户消息，不是最后一条', () {
+      final out =
+          applySystemPromptStyle(base, SystemPromptStyle.firstUserMessage);
+      expect(out.any((m) => m.role == 'system'), isFalse);
+      expect(out.first.role, 'user');
+      expect(out.first.content, '你是猫娘\n\n你好');
+      // 后面那条用户消息不能被动过。
+      expect(out.last.content, '再说一次');
+    });
+
+    test('多条 system 合成一段，顺序保持', () {
+      // 检索注入和图片描述都会往历史里插 system 消息，降级时它们
+      // 得和人格提示一起过去 —— 少一条模型就少知道一件事。
+      final out = applySystemPromptStyle(<ChatMessage>[
+        msg('system', '人格'),
+        msg('system', '[图片内容]一只猫'),
+        msg('user', '这是什么'),
+      ], SystemPromptStyle.firstUserMessage);
+      expect(out, hasLength(1));
+      expect(out.single.content, '人格\n\n[图片内容]一只猫\n\n这是什么');
+    });
+
+    test('拼接不会把附件甩掉', () {
+      // 图跟着那条用户消息走，拼提示词是改正文，不该动附件。
+      final out = applySystemPromptStyle(<ChatMessage>[
+        msg('system', '人格'),
+        msg('user', '看这个', images: <String>['/a.png']),
+      ], SystemPromptStyle.firstUserMessage);
+      expect(out.single.images, <String>['/a.png']);
+    });
+
+    test('一条用户消息都没有时也不丢，造一条出来', () {
+      final out = applySystemPromptStyle(<ChatMessage>[
+        msg('system', '人格'),
+        msg('assistant', '你好'),
+      ], SystemPromptStyle.firstUserMessage);
+      expect(out.first.role, 'user');
+      expect(out.first.content, '人格');
+    });
+
+    test('空的 system 不占位置', () {
+      final out = applySystemPromptStyle(<ChatMessage>[
+        msg('system', '   '),
+        msg('user', '你好'),
+      ], SystemPromptStyle.firstUserMessage);
+      expect(out.single.content, '你好');
+    });
+
+    test('omit 是唯一真的丢内容的一种', () {
+      final out = applySystemPromptStyle(base, SystemPromptStyle.omit);
+      expect(out.any((m) => m.role == 'system'), isFalse);
+      expect(out.first.content, '你好');
+      expect(out, hasLength(3));
+    });
+  });
+
+  group('发不出图时的占位', () {
+    test('留一句话，不是什么都不留', () {
+      // 抄自 AstrBot：历史里那句「这张图里写了什么」旁边如果空无一物，
+      // 模型只会开始编；留个占位它至少知道"这里本来有张图，我没看到"。
+      final out = withImagePlaceholder('这张图里写了什么', 1);
+      expect(out, contains('这张图里写了什么'));
+      expect(out, contains('图片'));
+    });
+
+    test('多张图会说清是几张', () {
+      expect(withImagePlaceholder('看这些', 3), contains('3 张'));
+    });
+
+    test('没有图时一个字都不加', () {
+      expect(withImagePlaceholder('普通消息', 0), '普通消息');
+    });
+
+    test('只有图没有文字时，占位就是全部内容', () {
+      expect(withImagePlaceholder('', 1), imageOmittedMarker);
     });
   });
 }

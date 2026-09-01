@@ -9,6 +9,7 @@ import '../sandbox/snapshot_store.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
 import '../llm/vision.dart';
+import 'system_prompt_page.dart';
 import '../settings/settings_store.dart';
 import 'agent_settings_page.dart';
 import 'chat_appearance_page.dart';
@@ -88,6 +89,17 @@ class _SettingsPageState extends State<SettingsPage> {
       if (channel.proxy?.isNotEmpty ?? false) '代理',
     ];
     return bits.join(' · ');
+  }
+
+  Future<void> _editSystemPrompt() async {
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => SystemPromptPage(
+        title: '全局系统提示词',
+        initial: widget.store.systemPrompt,
+        onSave: widget.store.setSystemPrompt,
+      ),
+    ));
+    if (mounted) setState(() {});
   }
 
   String _imageModeSummary() =>
@@ -199,6 +211,23 @@ class _SettingsPageState extends State<SettingsPage> {
                   },
                 ),
                 const Divider(height: 1),
+                const Divider(height: 1),
+                ListTile(
+                  leading: const Icon(Icons.psychology_outlined),
+                  title: const Text('系统提示词'),
+                  subtitle: Text(
+                    widget.store.systemPrompt.trim().isEmpty
+                        ? '没设，只用内置那份'
+                        : widget.store.systemPrompt
+                            .trim()
+                            .replaceAll('\n', ' '),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _editSystemPrompt,
+                ),
                 const Divider(height: 1),
                 ListTile(
                   leading: const Icon(Icons.image_outlined),

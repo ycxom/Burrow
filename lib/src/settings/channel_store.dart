@@ -21,6 +21,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../llm/llm_client.dart';
+import '../llm/system_prompt.dart';
 
 @immutable
 class Channel {
@@ -48,6 +49,13 @@ class Channel {
   /// 更专门的模型干一件配角的活。空 = 这个渠道不提供视觉。
   final String? visionModel;
 
+  /// 系统提示词怎么送。
+  ///
+  /// 默认 `role: system`，但**不是所有服务都认**：一批本地推理服务只认
+  /// user/assistant 交替，收到 system 直接 400；更糟的一类是收下但完全
+  /// 无视 —— 用户看到的是"提示词写了没用"，没有任何错误可查。
+  final SystemPromptStyle systemPromptStyle;
+
   /// `host:port`。空 = 直连。
   final String? proxy;
 
@@ -64,6 +72,7 @@ class Channel {
     this.summaryModel,
     this.visionCapable = false,
     this.visionModel,
+    this.systemPromptStyle = SystemPromptStyle.systemRole,
     this.proxy,
     this.oauthProviderId,
     this.oauthAccountId,
@@ -131,6 +140,7 @@ class Channel {
     bool? visionCapable,
     String? visionModel,
     bool clearVisionModel = false,
+    SystemPromptStyle? systemPromptStyle,
     String? proxy,
     String? oauthProviderId,
     String? oauthAccountId,
@@ -146,6 +156,7 @@ class Channel {
         visionCapable: visionCapable ?? this.visionCapable,
         visionModel:
             clearVisionModel ? null : (visionModel ?? this.visionModel),
+        systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
         proxy: proxy ?? this.proxy,
         oauthProviderId:
             clearOAuth ? null : (oauthProviderId ?? this.oauthProviderId),
@@ -162,6 +173,7 @@ class Channel {
         'summary_model': summaryModel,
         'vision_capable': visionCapable,
         'vision_model': visionModel,
+        'system_prompt_style': systemPromptStyle.name,
         'proxy': proxy,
         'oauth_provider': oauthProviderId,
         'oauth_account': oauthAccountId,
@@ -176,6 +188,10 @@ class Channel {
         summaryModel: j['summary_model'] as String?,
         visionCapable: j['vision_capable'] as bool? ?? false,
         visionModel: j['vision_model'] as String?,
+        systemPromptStyle: SystemPromptStyle.values
+                .where((v) => v.name == j['system_prompt_style'])
+                .firstOrNull ??
+            SystemPromptStyle.systemRole,
         proxy: j['proxy'] as String?,
         oauthProviderId: j['oauth_provider'] as String?,
         oauthAccountId: j['oauth_account'] as String?,
@@ -382,6 +398,7 @@ class ChannelStore extends ChangeNotifier {
       model: channel.model,
       summaryModel: channel.summaryModel,
       proxy: channel.proxy,
+      systemPromptStyle: channel.systemPromptStyle,
       temperature: temperature,
       streamOutput: streamOutput,
       sendImagesInline: sendImagesInline,

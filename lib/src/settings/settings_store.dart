@@ -97,6 +97,7 @@ class SettingsStore extends ChangeNotifier {
     this._terminalModeDefault,
     this._embeddingModel,
     this._imageMode,
+    this._systemPrompt,
     this._modelsByChannel,
     this._legacyModels,
     this._sandboxLevel,
@@ -121,6 +122,7 @@ class SettingsStore extends ChangeNotifier {
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
   static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
   static const _keyImageMode = 'burrow.llm.imageMode';
+  static const _keySystemPrompt = 'burrow.llm.systemPrompt';
   static const _keyCachedModels = 'burrow.llm.cachedModels';
   static const _keyModelsByChannel = 'burrow.llm.modelsByChannel';
   static const _keySandboxLevel = 'burrow.sandbox.level';
@@ -157,6 +159,7 @@ class SettingsStore extends ChangeNotifier {
   ChannelStore? _channels;
   String _embeddingModel;
   ImageMode _imageMode;
+  String _systemPrompt;
 
   /// 渠道 id → 上一次从**那个渠道**拉回来的模型列表。
   ///
@@ -273,6 +276,19 @@ class SettingsStore extends ChangeNotifier {
       _prefs?.setString(_keyModelsByChannel, jsonEncode(_modelsByChannel)) ??
       Future<void>.value();
 
+  /// 全局系统提示词。空 = 只用内置的那份。
+  ///
+  /// 会话可以有自己的一份把它盖掉（见 [ChatThread.systemPrompt]）——
+  /// 全局的是"我一般想要的样子"，会话级的是"这一次不一样"。
+  String get systemPrompt => _systemPrompt;
+
+  Future<void> setSystemPrompt(String value) async {
+    if (_systemPrompt == value) return;
+    _systemPrompt = value;
+    notifyListeners();
+    await _prefs?.setString(_keySystemPrompt, value);
+  }
+
   /// 图片怎么送到模型手里。
   ImageMode get imageMode => _imageMode;
 
@@ -361,6 +377,7 @@ class SettingsStore extends ChangeNotifier {
       prefs.getBool(_keyTerminalDefault) ?? false,
       prefs.getString(_keyEmbeddingModel) ?? '',
       _byName(ImageMode.values, prefs.getString(_keyImageMode), ImageMode.auto),
+      prefs.getString(_keySystemPrompt) ?? '',
       _decodeModels(prefs.getString(_keyModelsByChannel)),
       prefs.getStringList(_keyCachedModels),
       _byName(SandboxLevel.values, prefs.getString(_keySandboxLevel),

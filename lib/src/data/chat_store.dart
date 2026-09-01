@@ -12,6 +12,7 @@ class ChatThread {
     required this.preview,
     required this.updatedAt,
     this.terminalMode = false,
+    this.systemPrompt,
   });
 
   final String id;
@@ -23,6 +24,13 @@ class ChatThread {
   /// 「帮我看看这段代码什么意思」和「把这个仓库编出来」是两种对话，
   /// 用同一个全局开关意味着每次切换都要手动拨一下。
   final bool terminalMode;
+
+  /// 这个会话专用的系统提示词。
+  ///
+  /// **null 和空串不是一回事**：null = 没设过，用全局那份；
+  /// 空串 = 这个会话明确不要任何自定义提示词。少了这个区分，
+  /// 「把会话提示词清空」就会变成「回退到全局」，而那是另一个意思。
+  final String? systemPrompt;
 }
 
 class ChatStore {
@@ -34,7 +42,7 @@ class ChatStore {
     final path = p.join(await getDatabasesPath(), 'burrow.db');
     final db = await openDatabase(
       path,
-      version: 5,
+      version: 6,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -57,6 +65,10 @@ class ChatStore {
           // 图片路径的 JSON 数组。老消息没有图，留空。
           await db.execute('ALTER TABLE messages ADD COLUMN images TEXT');
         }
+        if (from < 6) {
+          // 会话级系统提示词。NULL = 没设过，用全局那份。
+          await db.execute('ALTER TABLE threads ADD COLUMN system_prompt TEXT');
+        }
       },
       onCreate: (db, _) async {
         await db.execute('''
@@ -65,7 +77,8 @@ class ChatStore {
             title TEXT NOT NULL,
             preview TEXT NOT NULL,
             updated_at INTEGER NOT NULL,
-            terminal_mode INTEGER NOT NULL DEFAULT 0
+            terminal_mode INTEGER NOT NULL DEFAULT 0,
+            system_prompt TEXT
           )
         ''');
         await db.execute('''
@@ -100,6 +113,7 @@ class ChatStore {
                 row['updated_at']! as int,
               ),
               terminalMode: (row['terminal_mode'] as int? ?? 0) != 0,
+              systemPrompt: row['system_prompt'] as String?,
             ))
         .toList();
   }
@@ -116,6 +130,33 @@ class ChatStore {
     );
     if (rows.isEmpty) return null;
     return (rows.first['terminal_mode'] as int? ?? 0) != 0;
+  }
+
+  /// 这个会话的系统提示词。会话还没建时返回 null。
+  ///
+  /// 返回值分三种：会话不存在 / 没设过 / 设过（可能是空串）。前两种都是
+  /// null，调用方拿不到区别 —— 但它们的处理方式一样（都用全局那份），
+  /// 所以不值得为此多一层包装。
+  Future<String?> systemPromptOf(String threadId) async {
+    final rows = await _db.query(
+      'threads',
+      columns: <String>['system_prompt'],
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['system_prompt'] as String?;
+  }
+
+  /// 设这个会话的提示词。null = 清掉，回退到全局。
+  Future<void> setSystemPrompt(String threadId, String? prompt) async {
+    await _db.update(
+      'threads',
+      <String, Object?>{'system_prompt': prompt},
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+    );
   }
 
   Future<void> setTerminalMode(String threadId, bool on) async {

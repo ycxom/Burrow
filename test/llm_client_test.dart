@@ -78,10 +78,10 @@ void main() {
       expect(content.last, containsPair('text', '这是什么'));
     });
 
-    test('渠道不认图时 content 退回字符串', () async {
-      // 关键的一条：不认图的模型收到数组形式的 content 会 400，
-      // 而更糟的是有的网关照单全收然后把图默默丢掉。
-      // 这时图应该由前置多模态处理，请求体里一张图都不该有。
+    test('渠道不认图时退回字符串，并留一句占位说明', () async {
+      // 不认图的模型收到数组形式的 content 会 400，所以必须退回字符串。
+      // 但**不能什么都不留**：历史里那句「这张图里写了什么」旁边如果空无
+      // 一物，模型只会开始编。留个占位它至少知道这里本来有张图。
       final body = await sendWith(const LlmConfig(
         baseUrl: 'https://example.com/v1',
         apiKey: 'k',
@@ -89,8 +89,10 @@ void main() {
         streamOutput: false,
       ));
       final message = (body['messages']! as List).first as Map<String, Object?>;
-      expect(message['content'], '这是什么');
-      // 整个请求体里不该出现 base64。
+      final content = message['content']! as String;
+      expect(content, contains('这是什么'));
+      expect(content, contains('图片'));
+      // 图本身一个字节都不该发出去。
       expect(jsonEncode(body), isNot(contains('base64')));
     });
 

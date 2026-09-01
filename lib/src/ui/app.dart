@@ -38,6 +38,7 @@ import 'chat_view.dart';
 import 'image_attachments.dart';
 import 'model_bar.dart';
 import 'settings_page.dart';
+import 'system_prompt_page.dart';
 import 'skills_page.dart';
 
 /// 当前 UI 文案是中文。把 locale 明确交给 Material 本地化后，TextField 的
@@ -618,6 +619,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   bool _installingDistro = false;
   String? _threadId;
 
+  /// 这个会话自己的系统提示词。null = 没设过，用全局那份。
+  String? _threadPrompt;
+
   InstalledDistro? get _distro => widget.activeDistro.value;
 
   /// 顶栏副标题上的瞬时状态。
@@ -681,6 +685,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       _agent.sourceLabel = widget.settings.sourceLabel;
       // 换到不认图的渠道之后，下一条带图的消息要自动改走前置多模态。
       _agent.sendImagesInline = widget.settings.sendImagesInline;
+      // 改了全局提示词、而这个会话没有自己那份时，要当场跟上。
+      _agent.userSystemPrompt = _effectiveSystemPrompt;
       _agent.overflow
         ..trigger = widget.settings.overflowTrigger
         ..messageThreshold = widget.settings.messageThreshold
@@ -689,12 +695,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     setState(() {});
   }
 
+  /// 这一刻实际生效的系统提示词。会话级优先 —— 全局是"我一般想要的样子"，
+  /// 会话级是"这一次不一样"，后者不该被前者盖住。
+  String get _effectiveSystemPrompt =>
+      _threadPrompt ?? widget.settings.systemPrompt;
+
   Future<void> _prepareRuntime() async {
+    final threadId = widget.threadId;
+    if (threadId != null) {
+      _threadPrompt = await widget.chats.systemPromptOf(threadId);
+    }
     _runtime = await widget.runtime;
     _images = ImageAttachmentStore(Directory('${_runtime.root.path}/images'));
     _agent = widget.buildAgent(this, _runtime);
     _agent.sourceLabel = widget.settings.sourceLabel;
     _agent.sendImagesInline = widget.settings.sendImagesInline;
+    _agent.userSystemPrompt = _effectiveSystemPrompt;
     await _restoreTerminalMode();
     await _loadHistory();
     await _startShell();
@@ -1111,6 +1127,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         terminalMode: _agent.terminalMode,
       );
       _threadId = id;
+      // 会话是刚建的，之前设的那份提示词还只在内存里，补写进去。
+      if (_threadPrompt != null) {
+        await widget.chats.setSystemPrompt(id, _threadPrompt);
+      }
       // 外壳的标题要跟上，否则顶栏会一直显示「新对话」，
       // 而抽屉里那一条已经有名字了 —— 两处对不上很像是坏了。
       final title = text.isEmpty ? '[图片]' : text;
@@ -1271,6 +1291,16 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           // 终端和检查点都从顶栏进。终端本来就是给模型用的，用户偶尔进去看一眼，
           // 不值得在底部占一整格；底部那条留给真正会反复用的东西 —— 换模型。
           actions: [
+            IconButton(
+              tooltip: _threadPrompt == null ? '系统提示词' : '这个会话有自己的系统提示词',
+              icon: Icon(
+                Icons.psychology_outlined,
+                // 会话有自己那份时点亮：它会盖掉全局，而"为什么这个会话
+                // 说话方式不一样"要能一眼看出来。
+                color: _threadPrompt == null ? null : context.chat.brand,
+              ),
+              onPressed: _editThreadPrompt,
+            ),
             _tabAction(2, Icons.history_outlined, '检查点'),
             _tabAction(1, Icons.terminal_outlined, '终端'),
             // 设置 / 技能 / 账号都在抽屉里；终端模式和审批档位在输入框里。
@@ -1609,6 +1639,35 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   ///
   /// 不做成"长按相册图标拍照"那种隐藏手势：这两件事同样常用，
   /// 把其中一个藏起来只会让人以为不支持。
+  /// 编这个会话的系统提示词。
+  ///
+  /// 会话还没落库（一条消息都没发）时也能设 —— 先存在内存里，
+  /// 第一条消息落库时一起写进去。否则"新开一个对话、先定好人格再说话"
+  /// 这个很自然的顺序做不了。
+  Future<void> _editThreadPrompt() async {
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => SystemPromptPage(
+        title: '这个会话的系统提示词',
+        initial: _threadPrompt,
+        globalPreview: widget.settings.systemPrompt,
+        terminalMode: _agent.terminalMode,
+        onSave: (value) async {
+          setState(() => _threadPrompt = value);
+          _agent.userSystemPrompt = _effectiveSystemPrompt;
+          final id = _threadId;
+          if (id != null) await widget.chats.setSystemPrompt(id, value);
+        },
+        onRevertToGlobal: () async {
+          setState(() => _threadPrompt = null);
+          _agent.userSystemPrompt = _effectiveSystemPrompt;
+          final id = _threadId;
+          if (id != null) await widget.chats.setSystemPrompt(id, null);
+        },
+      ),
+    ));
+    if (mounted) setState(() {});
+  }
+
   Future<void> _pickImages() async {
     if (_busy) return;
     if (_attachments.length >= maxAttachments) {

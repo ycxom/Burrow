@@ -25,6 +25,7 @@ import 'model_catalog.dart';
 
 import '../agent/agent_loop.dart';
 import 'image_parts.dart';
+import 'system_prompt.dart';
 import '../agent/tools.dart';
 import '../context/overflow_manager.dart';
 
@@ -71,6 +72,9 @@ class LlmConfig {
   /// 换渠道就跟着换，不需要给每条历史消息都记一份。
   final bool sendImagesInline;
 
+  /// 系统提示词怎么送。不认 `role: system` 的服务改成拼进第一条用户消息。
+  final SystemPromptStyle systemPromptStyle;
+
   const LlmConfig({
     this.apiFormat = 'openAI',
     required this.baseUrl,
@@ -81,6 +85,7 @@ class LlmConfig {
     this.temperature = 0.3,
     this.streamOutput = true,
     this.sendImagesInline = false,
+    this.systemPromptStyle = SystemPromptStyle.systemRole,
   });
 
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
@@ -99,6 +104,7 @@ class LlmConfig {
     double? temperature,
     bool? streamOutput,
     bool? sendImagesInline,
+    SystemPromptStyle? systemPromptStyle,
   }) =>
       LlmConfig(
         apiFormat: apiFormat ?? this.apiFormat,
@@ -110,6 +116,7 @@ class LlmConfig {
         temperature: temperature ?? this.temperature,
         streamOutput: streamOutput ?? this.streamOutput,
         sendImagesInline: sendImagesInline ?? this.sendImagesInline,
+        systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
       );
 }
 
@@ -275,13 +282,18 @@ class ConfigurableLlmClient
       throw StateError('尚未配置模型服务，请先在设置里填 baseUrl 和 model');
     }
 
+    // 系统提示词先按渠道的写法重排。放在最前面：后面三条协议路径各有各的
+    // system 处理（Anthropic 提到顶层 `system` 字段、Responses 提到
+    // `instructions`），重排完再进去，那三处就都不用各写一遍降级逻辑。
+    final prepared = applySystemPromptStyle(messages, config.systemPromptStyle);
+
     // 图先读出来再分派：三条协议路径都要用，而读盘是异步的 ——
     // 放到各自的 body 拼装里就得把整条链路改成异步 map，很难看。
-    final images = await _loadImages(messages);
+    final images = await _loadImages(prepared);
 
     if (config.apiFormat == 'anthropic') {
       return _completeAnthropic(
-        messages: messages,
+        messages: prepared,
         tools: tools,
         onDelta: onDelta,
         images: images,
@@ -289,14 +301,14 @@ class ConfigurableLlmClient
     }
     if (config.isChatGptOAuth) {
       return _completeChatGpt(
-        messages: messages,
+        messages: prepared,
         tools: tools,
         onDelta: onDelta,
         images: images,
       );
     }
     return _completeOpenAi(
-      messages: messages,
+      messages: prepared,
       tools: tools,
       onDelta: onDelta,
       images: images,
@@ -357,7 +369,8 @@ class ConfigurableLlmClient
             'content': attached.isEmpty
                 ? (message.role == 'tool'
                     ? '[工具结果]\n${message.content}'
-                    : message.content)
+                    : withImagePlaceholder(
+                        message.content, message.images.length))
                 : responsesContentParts(message.content, attached),
           };
         }).toList(),
@@ -544,7 +557,8 @@ class ConfigurableLlmClient
             'content': attached.isEmpty
                 ? (message.role == 'tool'
                     ? '[工具结果]\n${message.content}'
-                    : message.content)
+                    : withImagePlaceholder(
+                        message.content, message.images.length))
                 : anthropicContentParts(message.content, attached),
           };
         }).toList(),
@@ -880,7 +894,9 @@ class ConfigurableLlmClient
       // （llama.cpp、部分 vLLM 版本）只认字符串形式的 content，
       // 一律改成数组会把它们全打挂。
       'content': attached.isEmpty
-          ? (m.role == 'tool' ? '[工具结果]\n${m.content}' : m.content)
+          ? (m.role == 'tool'
+              ? '[工具结果]\n${m.content}'
+              : withImagePlaceholder(m.content, m.images.length))
           : openAiContentParts(m.content, attached),
     };
   }

@@ -20,6 +20,7 @@ import '../llm/model_catalog.dart';
 import '../llm/oauth.dart';
 import '../net/proxy_client.dart';
 import '../settings/account_store.dart';
+import '../llm/system_prompt.dart';
 import '../settings/channel_store.dart';
 import 'chat_theme.dart';
 
@@ -284,6 +285,7 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
 
   late String _apiFormat;
   late bool _visionCapable;
+  late SystemPromptStyle _systemPromptStyle;
   String? _oauthProviderId;
   String? _oauthAccountId;
 
@@ -309,6 +311,7 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
     _proxy = TextEditingController(text: c?.proxy ?? '');
     _apiFormat = c?.apiFormat ?? 'openAI';
     _visionCapable = c?.visionCapable ?? false;
+    _systemPromptStyle = c?.systemPromptStyle ?? SystemPromptStyle.systemRole;
     _oauthProviderId = c?.oauthProviderId;
     _oauthAccountId = c?.oauthAccountId;
   }
@@ -341,6 +344,7 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
             ? null
             : _summaryModel.text.trim(),
         visionCapable: _visionCapable,
+        systemPromptStyle: _systemPromptStyle,
         visionModel:
             _visionModel.text.trim().isEmpty ? null : _visionModel.text.trim(),
         proxy: normalizeProxy(_proxy.text),
@@ -608,6 +612,32 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
               helperText: '留空 = 用对话模型。长对话压缩可以换个更便宜的',
               prefixIcon: Icon(Icons.compress),
               border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 24),
+          const _SectionTitle(
+            '系统提示词',
+            subtitle: '不认 role: system 的服务改用下面两种写法',
+          ),
+          RadioGroup<SystemPromptStyle>(
+            groupValue: _systemPromptStyle,
+            onChanged: (v) {
+              if (v != null) setState(() => _systemPromptStyle = v);
+            },
+            child: Column(
+              children: <Widget>[
+                for (final entry in _promptStyleLabels.entries)
+                  RadioListTile<SystemPromptStyle>(
+                    contentPadding: EdgeInsets.zero,
+                    value: entry.key,
+                    title: Text(entry.value.label,
+                        style: const TextStyle(fontSize: 14)),
+                    subtitle: Text(
+                      entry.value.hint,
+                      style: TextStyle(fontSize: 11, color: t.tintTertiary),
+                    ),
+                  ),
+              ],
             ),
           ),
           const SizedBox(height: 24),
@@ -958,3 +988,22 @@ class _SectionTitle extends StatelessWidget {
     );
   }
 }
+
+/// 三种写法的说明。
+///
+/// 「完全不发」的说明里明说**会丢内容** —— 另外两种都只是换个位置，
+/// 只有这一种是真的把提示词扔了，用户得知道自己在选什么。
+const _promptStyleLabels = <SystemPromptStyle, ({String label, String hint})>{
+  SystemPromptStyle.systemRole: (
+    label: '正常发 system 消息',
+    hint: '绝大多数服务都这样，先试这个',
+  ),
+  SystemPromptStyle.firstUserMessage: (
+    label: '拼进第一条用户消息',
+    hint: '给不认 system 角色的服务用。内容一个字不少，只是换了位置',
+  ),
+  SystemPromptStyle.omit: (
+    label: '完全不发',
+    hint: '给明确要求不带 system 的模型用。这一项会真的丢掉提示词',
+  ),
+};
