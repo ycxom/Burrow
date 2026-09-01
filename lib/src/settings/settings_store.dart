@@ -228,18 +228,16 @@ class SettingsStore extends ChangeNotifier {
       (channelId == null ? null : _modelsByChannel[channelId]) ??
           const <String>[]);
 
-  /// 当前来源的署名，形如 `渠道名 · 模型名`。
-  ///
-  /// 只有一个渠道时省掉渠道名 —— 没有第二个来源要区分，那个前缀就只是噪音。
-  /// 反过来，有多个渠道时它必须出现在每一处显示模型的地方：同名模型挂在
-  /// 两个渠道上是常态（一个免费网关、一个计费官方），光看模型名分不出来。
+  /// 当前来源的署名，形如 `提供商 · 模型名`。
+  /// Base URL 是连接细节，不应在聊天界面里反复暴露。
   String get sourceLabel {
     final model = config.model;
     final channels = _channels;
     final active = channels?.active;
     if (active == null) return model;
-    if ((channels?.channels.length ?? 0) < 2) return model;
-    return model.isEmpty ? active.name : '${active.name} · $model';
+    return model.isEmpty
+        ? active.providerLabel
+        : '${active.providerLabel} · $model';
   }
 
   /// 命令的执行边界。真的会进 argv/env（见 SandboxSession.buildArgv），

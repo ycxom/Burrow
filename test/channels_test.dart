@@ -31,6 +31,38 @@ void main() {
       expect(at('不是个地址').host, '不是个地址');
       expect(at('').host, '');
     });
+
+    test('ChatGPT OAuth 显示提供商而不是 API 地址', () {
+      const channel = Channel(
+        id: 'c',
+        name: 'https://chatgpt.com/backend-api/codex',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        model: 'gpt-5.4',
+        oauthProviderId: 'openai_oauth',
+        oauthAccountId: 'account',
+      );
+      expect(channel.providerLabel, 'ChatGPT');
+    });
+
+    test('OpenAI API Key 渠道显示 OpenAI', () {
+      const channel = Channel(
+        id: 'c',
+        name: 'https://api.openai.com/v1',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5.4',
+      );
+      expect(channel.providerLabel, 'OpenAI');
+    });
+
+    test('自定义网关保留用户起的提供商名', () {
+      const channel = Channel(
+        id: 'c',
+        name: '公司网关',
+        baseUrl: 'https://gateway.example/v1',
+        model: 'model',
+      );
+      expect(channel.providerLabel, '公司网关');
+    });
   });
 
   group('代理地址解析', () {
@@ -330,14 +362,14 @@ void _modelCacheTests() {
   group('来源署名', () {
     setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
 
-    test('只有一个渠道时不标来源', () async {
+    test('只有一个渠道也显示提供商和模型', () async {
       final settings = await SettingsStore.load();
       settings
           .bindChannels(ChannelStore.forTest(channels: [a], activeId: 'c1'));
-      expect(settings.sourceLabel, 'glm-5');
+      expect(settings.sourceLabel, '本地网关 · glm-5');
     });
 
-    test('多渠道时带上渠道名', () async {
+    test('多渠道时显示提供商和模型', () async {
       // 同名模型挂在两个渠道上是常态（一个免费网关、一个计费官方），
       // 光看模型名分不出花的是谁的钱。
       final settings = await SettingsStore.load();

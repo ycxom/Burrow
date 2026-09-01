@@ -68,6 +68,38 @@ class Channel {
       (oauthProviderId?.isNotEmpty ?? false) &&
       (oauthAccountId?.isNotEmpty ?? false);
 
+  /// 只用于聊天界面署名，不暴露 Base URL。
+  String get providerLabel {
+    switch (oauthProviderId) {
+      case 'openai_oauth':
+        return 'ChatGPT';
+      case 'xai_oauth':
+        return 'xAI';
+    }
+    final inferred = providerLabelForBaseUrl(baseUrl);
+    if (inferred != '自定义 API') return inferred;
+    final trimmed = name.trim();
+    return trimmed.isEmpty || Uri.tryParse(trimmed)?.hasScheme == true
+        ? '自定义 API'
+        : trimmed;
+  }
+
+  static String providerLabelForBaseUrl(String value) {
+    final host = Uri.tryParse(value.trim())?.host.toLowerCase() ?? '';
+    if (host == 'chatgpt.com') return 'ChatGPT';
+    if (host == 'api.openai.com') return 'OpenAI';
+    if (host == 'api.anthropic.com') return 'Anthropic';
+    if (host.contains('deepseek.com')) return 'DeepSeek';
+    if (host.contains('bigmodel.cn')) return 'GLM';
+    if (host.contains('moonshot.cn') || host.contains('moonshot.ai')) {
+      return 'Kimi';
+    }
+    if (host.contains('siliconflow')) return '硅基流动';
+    if (host == 'api.x.ai') return 'xAI';
+    if (host == 'localhost' || host == '127.0.0.1') return '本地模型';
+    return '自定义 API';
+  }
+
   /// secure storage 里放这个渠道 API key 的键。
   String get apiKeyStorageKey => '${ChannelStore.keyPrefix}$id';
 
