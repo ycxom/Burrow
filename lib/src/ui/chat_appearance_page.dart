@@ -142,6 +142,14 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
             _buildPreview(),
             const SizedBox(height: 24),
             const _SectionTitle(
+              icon: Icons.nightlight_round,
+              title: '界面风格',
+              subtitle: '参考 Nekogram 的夜间聊天色板，也可跟随系统',
+            ),
+            const SizedBox(height: 10),
+            _buildColorStyleCard(),
+            const SizedBox(height: 24),
+            const _SectionTitle(
               icon: Icons.wallpaper_rounded,
               title: '聊天背景',
               subtitle: '选择内置配色，或使用相册中的图片',
@@ -168,6 +176,53 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
             ),
             const SizedBox(height: 10),
             _buildAvatarCard(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildColorStyleCard() {
+    const labels = <ChatColorStyle, String>{
+      ChatColorStyle.nekogramNight: 'Nekogram 夜间',
+      ChatColorStyle.followSystem: '跟随系统',
+      ChatColorStyle.light: '明亮',
+    };
+    const icons = <ChatColorStyle, IconData>{
+      ChatColorStyle.nekogramNight: Icons.dark_mode_rounded,
+      ChatColorStyle.followSystem: Icons.brightness_auto_rounded,
+      ChatColorStyle.light: Icons.light_mode_rounded,
+    };
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: <Widget>[
+                for (final value in ChatColorStyle.values)
+                  ChoiceChip(
+                    avatar: Icon(icons[value], size: 17),
+                    label: Text(labels[value]!),
+                    selected: widget.store.chatColorStyle == value,
+                    onSelected: (_) => widget.store.setChatColorStyle(value),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              widget.store.chatColorStyle == ChatColorStyle.nekogramNight
+                  ? '深蓝黑顶栏、低对比涂鸦壁纸与蓝灰消息气泡'
+                  : widget.store.chatColorStyle == ChatColorStyle.followSystem
+                      ? '随 Android 的浅色或深色外观自动切换'
+                      : '保留相同布局，使用清爽的浅色聊天色板',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ],
         ),
       ),

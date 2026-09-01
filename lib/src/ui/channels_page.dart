@@ -279,9 +279,11 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
   late final TextEditingController _key;
   late final TextEditingController _model;
   late final TextEditingController _summaryModel;
+  late final TextEditingController _visionModel;
   late final TextEditingController _proxy;
 
   late String _apiFormat;
+  late bool _visionCapable;
   String? _oauthProviderId;
   String? _oauthAccountId;
 
@@ -303,8 +305,10 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
         text: c == null ? '' : widget.channels.apiKeyOf(c));
     _model = TextEditingController(text: c?.model ?? '');
     _summaryModel = TextEditingController(text: c?.summaryModel ?? '');
+    _visionModel = TextEditingController(text: c?.visionModel ?? '');
     _proxy = TextEditingController(text: c?.proxy ?? '');
     _apiFormat = c?.apiFormat ?? 'openAI';
+    _visionCapable = c?.visionCapable ?? false;
     _oauthProviderId = c?.oauthProviderId;
     _oauthAccountId = c?.oauthAccountId;
   }
@@ -316,6 +320,7 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
     _key.dispose();
     _model.dispose();
     _summaryModel.dispose();
+    _visionModel.dispose();
     _proxy.dispose();
     super.dispose();
   }
@@ -335,6 +340,9 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
         summaryModel: _summaryModel.text.trim().isEmpty
             ? null
             : _summaryModel.text.trim(),
+        visionCapable: _visionCapable,
+        visionModel:
+            _visionModel.text.trim().isEmpty ? null : _visionModel.text.trim(),
         proxy: normalizeProxy(_proxy.text),
         oauthProviderId: _usesOAuth ? _oauthProviderId : null,
         oauthAccountId: _usesOAuth ? _oauthAccountId : null,
@@ -407,6 +415,27 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
       client.close();
       if (mounted) setState(() => _fetching = false);
     }
+  }
+
+  Future<void> _pickVisionModel() async {
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SizedBox(
+        height: MediaQuery.of(ctx).size.height * 0.6,
+        child: ListView(
+          children: <Widget>[
+            for (final m in _models)
+              ListTile(
+                dense: true,
+                title: Text(m, style: const TextStyle(fontSize: 14)),
+                onTap: () => Navigator.pop(ctx, m),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) setState(() => _visionModel.text = picked);
   }
 
   Future<void> _save() async {
@@ -579,6 +608,45 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
               helperText: '留空 = 用对话模型。长对话压缩可以换个更便宜的',
               prefixIcon: Icon(Icons.compress),
               border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 24),
+          const _SectionTitle(
+            '图片',
+            subtitle: '不认图的模型也能收到图 —— 先让视觉模型描述一遍',
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _visionCapable,
+            onChanged: (v) => setState(() => _visionCapable = v),
+            title: const Text('对话模型能直接看图'),
+            // 手动勾而不是自动判断：聚合网关返回的模型 id 五花八门，
+            // 靠名字猜"是不是视觉模型"猜错的代价是一次 400，或者更糟 ——
+            // 模型收到图却当没看见，照常答一段，而用户以为它看过了。
+            subtitle: Text(
+              '勾上之后图会直接进请求体。不确定就别勾，'
+              '让它走下面的视觉模型更稳',
+              style: TextStyle(fontSize: 11, color: t.tintTertiary),
+            ),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _visionModel,
+            autocorrect: false,
+            decoration: InputDecoration(
+              labelText: '视觉模型（可选）',
+              helperText: '填了之后，这个渠道就能被拿来把图描述成文字，'
+                  '给任何不认图的模型用',
+              prefixIcon: const Icon(Icons.visibility_outlined),
+              border: const OutlineInputBorder(),
+              // 模型列表已经拉过的话，直接从里面挑，省得手打。
+              suffixIcon: _models.isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: '从已获取的列表里选',
+                      icon: const Icon(Icons.list),
+                      onPressed: _pickVisionModel,
+                    ),
             ),
           ),
           if (_message != null) ...<Widget>[

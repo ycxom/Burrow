@@ -24,6 +24,7 @@ import '../net/proxy_client.dart';
 import 'model_catalog.dart';
 
 import '../agent/agent_loop.dart';
+import 'image_parts.dart';
 import '../agent/tools.dart';
 import '../context/overflow_manager.dart';
 
@@ -60,6 +61,16 @@ class LlmConfig {
   final double temperature;
   final bool streamOutput;
 
+  /// 允不允许把图片直接塞进请求。
+  ///
+  /// 这是**一个开关管两件事**：对话模型认不认图（渠道上勾的），以及用户
+  /// 有没有强制走前置多模态（省钱）。两种情况下都不该发原图 —— 前者会
+  /// 400 或者更糟（模型收到图却当没看见），后者是白花一次图片的钱。
+  ///
+  /// 放在配置里而不是每条消息上：它是"当前这个接入点怎么用"的属性，
+  /// 换渠道就跟着换，不需要给每条历史消息都记一份。
+  final bool sendImagesInline;
+
   const LlmConfig({
     this.apiFormat = 'openAI',
     required this.baseUrl,
@@ -69,6 +80,7 @@ class LlmConfig {
     this.proxy,
     this.temperature = 0.3,
     this.streamOutput = true,
+    this.sendImagesInline = false,
   });
 
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
@@ -86,6 +98,7 @@ class LlmConfig {
     String? proxy,
     double? temperature,
     bool? streamOutput,
+    bool? sendImagesInline,
   }) =>
       LlmConfig(
         apiFormat: apiFormat ?? this.apiFormat,
@@ -96,10 +109,12 @@ class LlmConfig {
         proxy: proxy ?? this.proxy,
         temperature: temperature ?? this.temperature,
         streamOutput: streamOutput ?? this.streamOutput,
+        sendImagesInline: sendImagesInline ?? this.sendImagesInline,
       );
 }
 
-class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
+class ConfigurableLlmClient
+    implements LlmClient, CancellableLlmClient, ImageDescriber {
   LlmConfig _config;
   http.Client _http;
   final bool _ownsClient;
@@ -260,11 +275,16 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
       throw StateError('尚未配置模型服务，请先在设置里填 baseUrl 和 model');
     }
 
+    // 图先读出来再分派：三条协议路径都要用，而读盘是异步的 ——
+    // 放到各自的 body 拼装里就得把整条链路改成异步 map，很难看。
+    final images = await _loadImages(messages);
+
     if (config.apiFormat == 'anthropic') {
       return _completeAnthropic(
         messages: messages,
         tools: tools,
         onDelta: onDelta,
+        images: images,
       );
     }
     if (config.isChatGptOAuth) {
@@ -272,9 +292,42 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
         messages: messages,
         tools: tools,
         onDelta: onDelta,
+        images: images,
       );
     }
-    return _completeOpenAi(messages: messages, tools: tools, onDelta: onDelta);
+    return _completeOpenAi(
+      messages: messages,
+      tools: tools,
+      onDelta: onDelta,
+      images: images,
+    );
+  }
+
+  /// 读出这批消息里引用到的所有图。
+  ///
+  /// 读不出来的那张不会让整条消息发不出去，而是**在正文里留一句话** ——
+  /// 静默丢掉的话，模型会对着一条提到"这张图"却没有图的消息硬答，
+  /// 而用户完全看不出图没发出去。
+  Future<Map<String, InlineImage>> _loadImages(
+      List<ChatMessage> messages) async {
+    // 不发图的渠道连读都不用读。几张图就是几 MB 的盘 IO，
+    // 读出来只为了在下一步扔掉，纯浪费。
+    if (!config.sendImagesInline) return const <String, InlineImage>{};
+    final paths = <String>[
+      for (final message in messages) ...message.images,
+    ];
+    if (paths.isEmpty) return const <String, InlineImage>{};
+    final (loaded, failures) = await loadInlineImages(paths);
+    _imageWarnings.addAll(failures);
+    return loaded;
+  }
+
+  /// 上一次请求里读图失败的原因。UI 拿去提示用户。
+  final List<String> _imageWarnings = <String>[];
+  List<String> takeImageWarnings() {
+    final out = List<String>.from(_imageWarnings);
+    _imageWarnings.clear();
+    return out;
   }
 
   Future<LlmTurn> _completeChatGpt({
@@ -282,6 +335,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
     String? model,
+    Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final auth = await _authValue();
     final system = messages
@@ -296,13 +350,17 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
             system.isEmpty ? 'You are a helpful assistant.' : system,
         'input': messages
             .where((message) => message.role != 'system')
-            .map((message) => <String, Object?>{
-                  'role': message.role == 'assistant' ? 'assistant' : 'user',
-                  'content': message.role == 'tool'
-                      ? '[工具结果]\n${message.content}'
-                      : message.content,
-                })
-            .toList(),
+            .map((message) {
+          final attached = _attached(message, images);
+          return <String, Object?>{
+            'role': message.role == 'assistant' ? 'assistant' : 'user',
+            'content': attached.isEmpty
+                ? (message.role == 'tool'
+                    ? '[工具结果]\n${message.content}'
+                    : message.content)
+                : responsesContentParts(message.content, attached),
+          };
+        }).toList(),
         'stream': true,
         'store': false,
         if (tools.isNotEmpty)
@@ -393,6 +451,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final auth = await _authValue();
     final request = http.Request(
@@ -407,7 +466,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
         'model': config.model,
         'temperature': config.temperature,
         'stream': config.streamOutput,
-        'messages': messages.map(_toWire).toList(),
+        'messages': messages.map((m) => _toWire(m, images)).toList(),
         if (tools.isNotEmpty)
           'tools': tools.map((t) => t.toOpenAiJson()).toList(),
       });
@@ -454,6 +513,7 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final system = messages
         .where((message) => message.role == 'system')
@@ -477,13 +537,17 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
         if (system.isNotEmpty) 'system': system,
         'messages': messages
             .where((message) => message.role != 'system')
-            .map((message) => <String, Object?>{
-                  'role': message.role == 'assistant' ? 'assistant' : 'user',
-                  'content': message.role == 'tool'
-                      ? '[工具结果]\n${message.content}'
-                      : message.content,
-                })
-            .toList(),
+            .map((message) {
+          final attached = _attached(message, images);
+          return <String, Object?>{
+            'role': message.role == 'assistant' ? 'assistant' : 'user',
+            'content': attached.isEmpty
+                ? (message.role == 'tool'
+                    ? '[工具结果]\n${message.content}'
+                    : message.content)
+                : anthropicContentParts(message.content, attached),
+          };
+        }).toList(),
         if (tools.isNotEmpty)
           'tools': tools
               .map((tool) => <String, Object?>{
@@ -653,6 +717,99 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     return LlmTurn(text: text.toString(), toolCalls: toolCalls);
   }
 
+  /// 让**这个客户端配的模型**描述几张图，返回一段纯文本。
+  ///
+  /// 前置多模态的那一次调用（见 vision.dart）。三个刻意的选择：
+  ///   - **不带历史**：它自带一句"请描述这张图"，那句话不该混进用户的对话。
+  ///   - **不带工具**：描述任务里给工具，某些模型会转头去调 exec。
+  ///   - **不流式**：调用方要的是完整的一段描述，中间态没有用处。
+  ///
+  /// 和 [summarize] 相反，这里**会抛**：摘要失败无非上下文长一点，
+  /// 而描述失败意味着"这张图模型根本没看到"—— 静默吞掉的话，
+  /// 模型会对着一条提到图却没有图的消息硬答。
+  @override
+  Future<String> describeImages({
+    required List<String> imagePaths,
+    required String prompt,
+  }) async {
+    if (!config.isConfigured) {
+      throw StateError('视觉渠道没有配置完整（缺 baseUrl 或模型）');
+    }
+    final (images, failures) = await loadInlineImages(imagePaths);
+    if (images.isEmpty) {
+      throw ImageLoadException(
+          failures.isEmpty ? '没有可用的图片' : failures.join('\n'));
+    }
+    final attached = images.values.toList();
+    final auth = await _authValue();
+
+    if (config.apiFormat == 'anthropic') {
+      final response = await _http.post(
+        _endpoint(config.baseUrl, '/messages'),
+        headers: <String, String>{
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          if (auth.isNotEmpty) 'x-api-key': auth,
+        },
+        body: jsonEncode(<String, Object?>{
+          'model': config.model,
+          'max_tokens': 1024,
+          'messages': <Map<String, Object?>>[
+            <String, Object?>{
+              'role': 'user',
+              'content': anthropicContentParts(prompt, attached),
+            },
+          ],
+        }),
+      );
+      _throwForStatus(response);
+      final body = jsonDecode(utf8.decode(response.bodyBytes));
+      if (body is! Map<String, Object?>) return '';
+      final content = body['content'] as List? ?? const [];
+      return content
+          .whereType<Map<String, Object?>>()
+          .where((block) => block['type'] == 'text')
+          .map((block) => block['text']?.toString() ?? '')
+          .join()
+          .trim();
+    }
+
+    final response = await _http.post(
+      _endpoint(config.baseUrl, '/chat/completions'),
+      headers: <String, String>{
+        'Content-Type': 'application/json',
+        if (auth.isNotEmpty) 'Authorization': 'Bearer $auth',
+      },
+      body: jsonEncode(<String, Object?>{
+        'model': config.model,
+        'messages': <Map<String, Object?>>[
+          <String, Object?>{
+            'role': 'user',
+            'content': openAiContentParts(prompt, attached),
+          },
+        ],
+      }),
+    );
+    _throwForStatus(response);
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    if (decoded is! Map<String, Object?>) return '';
+    final choices = decoded['choices'] as List?;
+    if (choices == null || choices.isEmpty) return '';
+    final message = (choices.first as Map)['message'] as Map<String, Object?>?;
+    return (message?['content'] as String?)?.trim() ?? '';
+  }
+
+  /// 把非 2xx 变成一句能读的错误。
+  ///
+  /// 正文原样带上（截断）—— 视觉模型最常见的失败是「这个模型不支持图片」，
+  /// 而那句话只在正文里，状态码全都是 400。
+  void _throwForStatus(http.Response response) {
+    if (response.statusCode < 400) return;
+    final body = utf8.decode(response.bodyBytes, allowMalformed: true);
+    throw LlmConnectionException(
+        'HTTP ${response.statusCode} ${_brief(body.trim())}');
+  }
+
   /// [Summarizer] 的实现，交给 [OverflowManager]。
   ///
   /// 非流式、低温度、不带工具 —— 摘要不该调用工具，带上 tools 只会诱导
@@ -711,13 +868,30 @@ class ConfigurableLlmClient implements LlmClient, CancellableLlmClient {
     }
   }
 
-  static Map<String, Object?> _toWire(ChatMessage m) => {
-        // tool 角色的消息在 OpenAI 协议里需要 tool_call_id 配对。为简化，
-        // 这里统一降级成 user 消息并加前缀 —— 兼容性远好于严格配对，
-        // 而且本地模型对严格的 tool 消息格式支持普遍很差。
-        'role': m.role == 'tool' ? 'user' : m.role,
-        'content': m.role == 'tool' ? '[工具结果]\n${m.content}' : m.content,
-      };
+  static Map<String, Object?> _toWire(
+      ChatMessage m, Map<String, InlineImage> images) {
+    final attached = _attached(m, images);
+    return <String, Object?>{
+      // tool 角色的消息在 OpenAI 协议里需要 tool_call_id 配对。为简化，
+      // 这里统一降级成 user 消息并加前缀 —— 兼容性远好于严格配对，
+      // 而且本地模型对严格的 tool 消息格式支持普遍很差。
+      'role': m.role == 'tool' ? 'user' : m.role,
+      // 没有图时仍然发**字符串**而不是单元素数组：不少本地推理服务
+      // （llama.cpp、部分 vLLM 版本）只认字符串形式的 content，
+      // 一律改成数组会把它们全打挂。
+      'content': attached.isEmpty
+          ? (m.role == 'tool' ? '[工具结果]\n${m.content}' : m.content)
+          : openAiContentParts(m.content, attached),
+    };
+  }
+
+  /// 这条消息实际带上的图。读失败的那张不在 [images] 里，自然就被跳过。
+  static List<InlineImage> _attached(
+          ChatMessage m, Map<String, InlineImage> images) =>
+      <InlineImage>[
+        for (final path in m.images)
+          if (images[path] case final image?) image,
+      ];
 
   static String _brief(String s) =>
       s.length > 300 ? '${s.substring(0, 300)}…' : s;

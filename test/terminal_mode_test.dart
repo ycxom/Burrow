@@ -48,6 +48,7 @@ class _ScriptedLlm implements LlmClient {
 
 class _RecordingHost implements AgentHost {
   final List<String> statuses = <String>[];
+  final List<ChatMessage> injected = <ChatMessage>[];
   int approvalsAsked = 0;
 
   @override
@@ -64,6 +65,9 @@ class _RecordingHost implements AgentHost {
 
   @override
   void onStatus(String message) => statuses.add(message);
+
+  @override
+  void onContextMessage(ChatMessage message) => injected.add(message);
 }
 
 class _NeverSpawns implements NativePtySpawner {

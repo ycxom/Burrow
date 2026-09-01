@@ -46,6 +46,13 @@ class ChatMessage {
   /// 而这份记录的全部价值就在于渠道被删/改之后还读得懂。
   final String? source;
 
+  /// 随这条消息一起发出去的图片，绝对路径。
+  ///
+  /// 存路径不存字节：一张手机照片压完也有几百 KB，base64 再涨三分之一，
+  /// 而 `replaceMessages` 每轮都会把整个会话删了重插 —— 把图塞进 sqlite
+  /// 等于每轮重写几 MB。落在会话自己的目录里，删会话时一起没。
+  final List<String> images;
+
   const ChatMessage({
     required this.role,
     required this.content,
@@ -53,7 +60,10 @@ class ChatMessage {
     this.outputRef,
     this.checkpoint,
     this.source,
+    this.images = const <String>[],
   });
+
+  bool get hasImages => images.isNotEmpty;
 
   ChatMessage copyWith({String? content, int? checkpoint}) => ChatMessage(
         role: role,
@@ -62,6 +72,7 @@ class ChatMessage {
         outputRef: outputRef,
         checkpoint: checkpoint ?? this.checkpoint,
         source: source,
+        images: images,
       );
 }
 

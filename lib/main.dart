@@ -23,6 +23,8 @@ import 'src/data/chat_store.dart';
 import 'src/data/task_runtime.dart';
 import 'src/llm/embeddings.dart';
 import 'src/llm/llm_client.dart';
+import 'src/llm/vision.dart';
+import 'src/net/proxy_client.dart';
 import 'src/sandbox/exec_policy.dart';
 import 'src/sandbox/prefix_generations.dart';
 import 'src/sandbox/pty_channel.dart';
@@ -282,6 +284,30 @@ Future<void> _boot({
   );
   await skills.open();
 
+  // 前置多模态：对话模型不认图时，先找一个配了视觉模型的渠道把图描述成文字。
+  //
+  // 候选**每次现算**而不是启动时定好：渠道随时会被改、被删，
+  // 定好的一份列表迟早会指向一个不存在的渠道。
+  final vision = VisionPreprocessor(
+    candidates: () => <VisionCandidate>[
+      for (final channel in channels.channels)
+        if (channel.canDescribeImages)
+          VisionCandidate(
+            label: '${channel.name} · ${channel.visionModel}',
+            // 地址、协议、代理都跟着那个渠道走，只把模型换成视觉模型。
+            config: channels
+                .configFor(channel, sendImagesInline: true)
+                .copyWith(model: channel.visionModel),
+            auth: () =>
+                accounts.authFor(channel, apiKey: channels.apiKeyOf(channel)),
+          ),
+    ],
+    createClient: (config, auth) => ConfigurableLlmClient(
+      config: config,
+      httpClient: buildHttpClient(proxy: config.proxy),
+    )..bearerProvider = auth,
+  );
+
   runApp(BurrowApp(
     buildRuntime: buildRuntime,
     buildAgent: (host, runtime) => AgentLoop(
@@ -303,6 +329,7 @@ Future<void> _boot({
       distiller: OutputDistiller(),
       limitGuard: ContextLimitGuard(),
       skills: skills,
+      vision: vision,
       mode: settings.approvalMode,
       sandboxLevel: settings.sandboxLevel,
       outputArchiveDir:

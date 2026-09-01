@@ -12,6 +12,7 @@ import '../context/memory_retrieval.dart';
 import '../context/output_distiller.dart';
 import '../context/overflow_manager.dart';
 import '../context/token_counter.dart';
+import '../llm/vision.dart';
 import '../sandbox/exec_policy.dart';
 import '../sandbox/prefix_generations.dart';
 import '../sandbox/sandbox_session.dart';
@@ -47,6 +48,14 @@ abstract class AgentHost {
 
   /// 状态变化：打了检查点、触发了摘要、沙箱降级等。用于 UI 上的小提示。
   void onStatus(String message);
+
+  /// 往历史里插了一条**不是用户也不是模型说的**消息：检索回来的片段、
+  /// 图片的文字描述。
+  ///
+  /// 有这个回调是因为 UI 手工维护着一份 `_visible`，而这些消息是在
+  /// AgentLoop 内部塞进 history 的 —— 不通知的话它们要等到下次重开会话
+  /// 才出现，而"重开之后多出来几条消息"比一开始就看见更让人困惑。
+  void onContextMessage(ChatMessage message);
 }
 
 /// LLM 后端。用一个窄接口隔开，chatbox 那套 provider 抽象可以直接塞进来实现它。
@@ -117,6 +126,14 @@ class EmptyCompletionException implements Exception {
       '可以在设置里点「测试连接」确认，或者把 Base URL 写到 /v1 那一层。';
 }
 
+/// 图片送不到模型手里。
+class VisionUnavailableException implements Exception {
+  final String message;
+  const VisionUnavailableException(this.message);
+  @override
+  String toString() => message;
+}
+
 class ContextOverflowException implements Exception {
   final int status;
   final String body;
@@ -161,8 +178,37 @@ class AgentLoop {
   /// 常常挂着同名的模型，一个免费一个计费，那正是要分清的情形。
   String? sourceLabel;
 
+  /// 这一路能不能把图直接发给对话模型。
+  ///
+  /// 由 UI 推过来（和 [sourceLabel] 一样），和 `LlmConfig.sendImagesInline`
+  /// 是同一个判断的两份拷贝 —— 这里要它是为了**在发请求之前**就决定走不走
+  /// 前置多模态，那时还没到客户端那一层。
+  bool sendImagesInline = false;
+
+  /// 前置多模态。null = 没接（单测里就是 null）。
+  final VisionPreprocessor? vision;
+
   /// 全量历史。**永不删除** —— overflow 只控制哪些进 prompt。
   final List<ChatMessage> history = [];
+
+  /// 走一次前置多模态，返回要插进历史的那段描述。
+  ///
+  /// **失败就抛**，不静默降级成"当没有图"：用户附了图就是要它起作用，
+  /// 悄悄丢掉的话模型会对着一条提到图却没有图的消息硬答，
+  /// 而用户完全看不出图没送到。
+  Future<String> _describeImages(List<String> images) async {
+    final preprocessor = vision;
+    if (preprocessor == null) {
+      throw const VisionUnavailableException('当前渠道的对话模型不认图，也没有配前置视觉模型。'
+          '到「渠道管理」里给某个渠道填一个视觉模型，'
+          '或者勾上「对话模型能直接看图」。');
+    }
+    host.onStatus('正在识别图片…');
+    final result = await preprocessor.describe(images);
+    if (!result.ok) throw VisionUnavailableException(result.error);
+    host.onStatus('已由 ${result.usedLabel} 识别图片');
+    return '[图片内容]\n${result.description}';
+  }
 
   /// 单个 turn 内最多几轮工具调用。防止模型陷入
   /// 「跑命令 → 看输出 → 再跑同一条命令」的死循环。
@@ -182,6 +228,7 @@ class AgentLoop {
     required this.limitGuard,
     required this.outputArchiveDir,
     this.skills,
+    this.vision,
     this.mode = ApprovalMode.onRequest,
     this.sandboxLevel = SandboxLevel.workspaceWrite,
     this.terminalMode = false,
@@ -189,8 +236,21 @@ class AgentLoop {
     this.maxToolRounds = 24,
   });
 
-  Future<void> send(String userInput) async {
+  /// 发一条用户消息。[images] 是本地图片的绝对路径。
+  ///
+  /// 图片有两条路：
+  ///   - **直发**（[sendImagesInline]）：图跟着这条消息进请求体，
+  ///     由对话模型自己看。
+  ///   - **前置多模态**：先让一个视觉模型把图描述成文字，描述作为一条
+  ///     system 消息插在用户这句话前面。图仍然记在消息上 —— 界面要显示
+  ///     它，历史里也该看得出"这轮是带图的"。
+  Future<void> send(String userInput, {List<String> images = const []}) async {
     final epoch = _cancelEpoch;
+    // 先把图处理掉再打检查点：前置多模态要发一次网络请求，可能失败，
+    // 失败就整轮不发。放在检查点后面的话，会留下一个空转的检查点。
+    final String? description = images.isEmpty || sendImagesInline
+        ? null
+        : await _describeImages(images);
     // 每个 turn 开头自动打检查点。绝大多数 turn 没改文件，diff 为空，
     // checkpoint() 直接返回 null 且不推进代号 —— 所以这是免费的。
     // 它换来的是「任何一轮都能整体撤销」这个非常好用的性质。
@@ -208,11 +268,25 @@ class AgentLoop {
       checkpoint = snapshots.head;
     }
 
+    // 描述排在用户那句话**前面**：模型读到的顺序和人一样 ——
+    // 先看见图里有什么，再看见问题。反过来的话，模型读到问题时
+    // 还不知道图里是什么，某些模型会先反问一句"哪张图？"。
+    if (description != null) {
+      final note = ChatMessage(
+        role: 'system',
+        content: description,
+        at: DateTime.now(),
+      );
+      history.add(note);
+      host.onContextMessage(note);
+    }
+
     history.add(ChatMessage(
       role: 'user',
       content: userInput,
       at: DateTime.now(),
       checkpoint: checkpoint,
+      images: images,
     ));
 
     // 用户提问里如果指向了被摘要挤出去的内容，先把它捞回来。
@@ -229,8 +303,10 @@ class AgentLoop {
       if (hits.isNotEmpty) {
         final injected = retrieval.format(hits, tokenBudget: 600);
         if (injected.isNotEmpty) {
-          history.add(ChatMessage(
-              role: 'system', content: injected, at: DateTime.now()));
+          final note = ChatMessage(
+              role: 'system', content: injected, at: DateTime.now());
+          history.add(note);
+          host.onContextMessage(note);
         }
       }
     }

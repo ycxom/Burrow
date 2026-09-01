@@ -27,6 +27,7 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../settings/settings_store.dart';
 import 'chat_theme.dart';
+import 'image_attachments.dart';
 
 // ---------------------------------------------------------------------------
 // 壁纸
@@ -143,8 +144,8 @@ class ChatWallpaper extends StatelessWidget {
   }
 }
 
-/// 很淡的几何纹理。Nekogram/Telegram 的壁纸之所以不像一块普通渐变色，
-/// 靠的就是这层几乎注意不到、但能让大块空白有质感的图案。
+/// 很淡的涂鸦纹理。参考 Nekogram/Telegram 的聊天壁纸，用对话、纸飞机、
+/// 星光、代码和机器人等小图案打散重复感；透明度很低，不和消息正文抢视觉。
 class _WallpaperPatternPainter extends CustomPainter {
   const _WallpaperPatternPainter({required this.color});
 
@@ -155,22 +156,126 @@ class _WallpaperPatternPainter extends CustomPainter {
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2;
-    const step = 76.0;
-    for (double y = -20; y < size.height + step; y += step) {
-      final shifted = ((y / step).round().isEven) ? 0.0 : step / 2;
-      for (double x = -20 + shifted; x < size.width + step; x += step) {
-        canvas.drawCircle(Offset(x, y), 13, paint);
-        canvas.drawArc(
-          Rect.fromCircle(center: Offset(x + 25, y + 23), radius: 10),
-          0.2,
-          2.2,
-          false,
-          paint,
-        );
-        canvas.drawLine(Offset(x + 8, y + 27), Offset(x + 20, y + 34), paint);
+      ..strokeWidth = 1.15
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    const step = 78.0;
+    var row = 0;
+    for (double y = -18; y < size.height + step; y += step, row++) {
+      final shifted = row.isEven ? 0.0 : step / 2;
+      var column = 0;
+      for (double x = -18 + shifted;
+          x < size.width + step;
+          x += step, column++) {
+        canvas.save();
+        canvas.translate(x, y);
+        switch ((row * 3 + column * 5).abs() % 6) {
+          case 0:
+            _drawChat(canvas, paint);
+          case 1:
+            _drawPlane(canvas, paint);
+          case 2:
+            _drawSparkles(canvas, paint);
+          case 3:
+            _drawCode(canvas, paint);
+          case 4:
+            _drawBot(canvas, paint);
+          case 5:
+            _drawHeart(canvas, paint);
+        }
+        canvas.restore();
       }
     }
+  }
+
+  static void _drawChat(Canvas canvas, Paint paint) {
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        const Rect.fromLTWH(-15, -11, 30, 21),
+        const Radius.circular(7),
+      ),
+      paint,
+    );
+    canvas.drawPath(
+      Path()
+        ..moveTo(-7, 10)
+        ..lineTo(-11, 16)
+        ..lineTo(-1, 11),
+      paint,
+    );
+    canvas.drawCircle(const Offset(-6, 0), 1.2, paint);
+    canvas.drawCircle(Offset.zero, 1.2, paint);
+    canvas.drawCircle(const Offset(6, 0), 1.2, paint);
+  }
+
+  static void _drawPlane(Canvas canvas, Paint paint) {
+    canvas.drawPath(
+      Path()
+        ..moveTo(-16, -9)
+        ..lineTo(17, -15)
+        ..lineTo(7, 16)
+        ..lineTo(0, 4)
+        ..close()
+        ..moveTo(0, 4)
+        ..lineTo(17, -15),
+      paint,
+    );
+  }
+
+  static void _drawSparkles(Canvas canvas, Paint paint) {
+    Path sparkle(double x, double y, double r) => Path()
+      ..moveTo(x, y - r)
+      ..quadraticBezierTo(x + 1, y - 1, x + r, y)
+      ..quadraticBezierTo(x + 1, y + 1, x, y + r)
+      ..quadraticBezierTo(x - 1, y + 1, x - r, y)
+      ..quadraticBezierTo(x - 1, y - 1, x, y - r)
+      ..close();
+
+    canvas.drawPath(sparkle(-4, 1, 13), paint);
+    canvas.drawPath(sparkle(12, -10, 6), paint);
+    canvas.drawPath(sparkle(12, 12, 4), paint);
+  }
+
+  static void _drawCode(Canvas canvas, Paint paint) {
+    canvas.drawPath(
+      Path()
+        ..moveTo(-5, -10)
+        ..lineTo(-15, 0)
+        ..lineTo(-5, 10)
+        ..moveTo(5, -10)
+        ..lineTo(15, 0)
+        ..lineTo(5, 10),
+      paint,
+    );
+    canvas.drawLine(const Offset(3, -14), const Offset(-3, 14), paint);
+  }
+
+  static void _drawBot(Canvas canvas, Paint paint) {
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        const Rect.fromLTWH(-15, -10, 30, 23),
+        const Radius.circular(7),
+      ),
+      paint,
+    );
+    canvas.drawLine(const Offset(0, -10), const Offset(0, -16), paint);
+    canvas.drawCircle(const Offset(0, -18), 2, paint);
+    canvas.drawCircle(const Offset(-6, 0), 2, paint);
+    canvas.drawCircle(const Offset(6, 0), 2, paint);
+    canvas.drawArc(const Rect.fromLTWH(-7, 3, 14, 6), 0.2, 2.75, false, paint);
+  }
+
+  static void _drawHeart(Canvas canvas, Paint paint) {
+    canvas.drawPath(
+      Path()
+        ..moveTo(0, 15)
+        ..cubicTo(-4, 9, -16, 3, -16, -6)
+        ..cubicTo(-16, -15, -5, -18, 0, -9)
+        ..cubicTo(5, -18, 16, -15, 16, -6)
+        ..cubicTo(16, 3, 4, 9, 0, 15)
+        ..close(),
+      paint,
+    );
   }
 
   @override
@@ -377,7 +482,7 @@ class ChatAvatar extends StatelessWidget {
 ///
 /// Telegram 把这类"不是谁说的话"的内容都做成这个样子，和左右两侧的气泡
 /// 明确区分开 —— 系统提示长得像助手说的话，用户会以为模型在自言自语。
-class ServicePill extends StatelessWidget {
+class ServicePill extends StatefulWidget {
   final String text;
 
   /// 报错。用红字，但仍然是胶囊 —— 它不是对话内容。
@@ -385,25 +490,66 @@ class ServicePill extends StatelessWidget {
 
   const ServicePill({super.key, required this.text, this.isError = false});
 
+  /// 超过这么多字就折起来。
+  ///
+  /// 胶囊本来是给「今天」「检查点 #3」这种一行字用的。而注进历史的东西
+  /// （检索片段、图片描述）动辄几百字，铺开会把整屏占满 —— 用户滚半天
+  /// 找不到自己那句话。折起来之后它仍然在那里，点一下就能核对。
+  static const _collapseAbove = 90;
+
+  @override
+  State<ServicePill> createState() => _ServicePillState();
+}
+
+class _ServicePillState extends State<ServicePill> {
+  bool _expanded = false;
+
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
+    final collapsible = widget.text.length > ServicePill._collapseAbove;
+    final color = widget.isError ? t.tintError : t.tintOnService;
+    final showFull = _expanded || !collapsible;
+
     return Center(
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 32),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-        decoration: BoxDecoration(
-          color: isError ? t.bgErrorSecondary : t.servicePill,
-          borderRadius: BorderRadius.circular(14),
-        ),
-        child: Text(
-          text,
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            fontSize: 12,
-            height: 1.4,
-            fontWeight: FontWeight.w500,
-            color: isError ? t.tintError : t.tintOnService,
+      child: GestureDetector(
+        onTap:
+            collapsible ? () => setState(() => _expanded = !_expanded) : null,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 32),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+          decoration: BoxDecoration(
+            color: widget.isError ? t.bgErrorSecondary : t.servicePill,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(
+                widget.text,
+                textAlign: showFull ? TextAlign.start : TextAlign.center,
+                maxLines: showFull ? null : 2,
+                overflow: showFull ? null : TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  height: 1.4,
+                  fontWeight: FontWeight.w500,
+                  color: color,
+                ),
+              ),
+              if (collapsible)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    _expanded ? '收起' : '展开',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: color.withValues(alpha: 0.75),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
       ),
@@ -425,6 +571,9 @@ class ChatBubble extends StatelessWidget {
 
   /// 时间前面的一小段附加信息，目前是模型名。
   final String? meta;
+
+  /// 随这条消息发出去的图片，绝对路径。
+  final List<String> images;
 
   /// 这条是报错。
   final bool isError;
@@ -453,6 +602,7 @@ class ChatBubble extends StatelessWidget {
     required this.text,
     this.time,
     this.meta,
+    this.images = const <String>[],
     this.isError = false,
     this.generating = false,
     this.lastInGroup = true,
@@ -561,13 +711,42 @@ class ChatBubble extends StatelessWidget {
   }
 
   Widget _buildBody(BuildContext context, Color fg, Widget? footer) {
+    // 带图时先画图。图和文字之间不留边距是刻意的 —— Telegram 的图是
+    // "贴着气泡内沿"的，留白会让它看起来像一张插在文字里的附件。
+    final gallery = images.isEmpty
+        ? null
+        : BubbleImages(
+            paths: images,
+            maxWidth:
+                MediaQuery.of(context).size.width * (showAvatar ? 0.76 : 0.84) -
+                    // 减掉气泡自己的左右内边距，否则图会顶出圆角。
+                    (22 + ChatShape.tailWidth),
+          );
+
     // 用户消息是纯文本，走内联时间戳那条路 —— 短消息的时间跟在同一行，
     // 这是 Telegram 气泡最容易认出来的形状。
     if (_outgoing) {
-      return _InlineTimeText(
+      final body = _InlineTimeText(
         text: text,
         style: TextStyle(fontSize: 15.5, height: 1.35, color: fg),
         footer: footer,
+      );
+      if (gallery == null) return body;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Padding(padding: const EdgeInsets.only(top: 2), child: gallery),
+          // 只有图、没有文字时，时间戳还得有地方待 —— 让它单独占一行，
+          // 不然一条纯图片消息看不出发送时间。
+          if (text.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(top: 5), child: body)
+          else if (footer != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Align(alignment: Alignment.centerRight, child: footer),
+            ),
+        ],
       );
     }
 

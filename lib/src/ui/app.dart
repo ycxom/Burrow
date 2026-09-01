@@ -25,6 +25,7 @@ import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../llm/llm_client.dart';
 import '../llm/model_catalog.dart';
+import '../llm/vision.dart';
 import '../net/proxy_client.dart';
 import '../settings/settings_store.dart';
 import '../settings/account_store.dart';
@@ -34,6 +35,7 @@ import 'channels_page.dart';
 import 'chat_drawer.dart';
 import 'chat_theme.dart';
 import 'chat_view.dart';
+import 'image_attachments.dart';
 import 'model_bar.dart';
 import 'settings_page.dart';
 import 'skills_page.dart';
@@ -390,28 +392,36 @@ class BurrowApp extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-        title: 'Burrow',
-        locale: _appLocale,
-        supportedLocales: _supportedLocales,
-        localizationsDelegates: _localizationsDelegates,
-        theme: _buildTheme(Brightness.light),
-        darkTheme: _buildTheme(Brightness.dark),
-        home: ChatShell(
-          buildAgent: buildAgent,
-          buildRuntime: buildRuntime,
-          capabilities: capabilities,
-          prefixGens: prefixGens,
-          spawner: spawner,
-          activeDistro: activeDistro,
-          distros: distros,
-          abi: abi,
-          llm: llm,
-          settings: settings,
-          chats: chats,
-          skills: skills,
-          accounts: accounts,
-          channels: channels,
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: settings,
+        builder: (context, _) => MaterialApp(
+          title: 'Burrow',
+          locale: _appLocale,
+          supportedLocales: _supportedLocales,
+          localizationsDelegates: _localizationsDelegates,
+          theme: _buildTheme(Brightness.light),
+          darkTheme: _buildTheme(Brightness.dark),
+          themeMode: switch (settings.chatColorStyle) {
+            ChatColorStyle.nekogramNight => ThemeMode.dark,
+            ChatColorStyle.followSystem => ThemeMode.system,
+            ChatColorStyle.light => ThemeMode.light,
+          },
+          home: ChatShell(
+            buildAgent: buildAgent,
+            buildRuntime: buildRuntime,
+            capabilities: capabilities,
+            prefixGens: prefixGens,
+            spawner: spawner,
+            activeDistro: activeDistro,
+            distros: distros,
+            abi: abi,
+            llm: llm,
+            settings: settings,
+            chats: chats,
+            skills: skills,
+            accounts: accounts,
+            channels: channels,
+          ),
         ),
       );
 }
@@ -593,6 +603,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   final _input = TextEditingController();
   final _scroll = ScrollController();
 
+  /// 已经选好、还没发出去的图。存的是**拷进会话目录之后**的路径 ——
+  /// 相册给的那个路径在系统缓存里，随时会被清掉。
+  final List<String> _attachments = <String>[];
+  late final ImageAttachmentStore _images;
+
   int _tab = 0;
   String? _status;
   Timer? _statusTimer;
@@ -664,6 +679,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       _agent.mode = widget.settings.approvalMode;
       // 换渠道/换模型之后，接下来生成的助手消息要署新的来源。
       _agent.sourceLabel = widget.settings.sourceLabel;
+      // 换到不认图的渠道之后，下一条带图的消息要自动改走前置多模态。
+      _agent.sendImagesInline = widget.settings.sendImagesInline;
       _agent.overflow
         ..trigger = widget.settings.overflowTrigger
         ..messageThreshold = widget.settings.messageThreshold
@@ -674,8 +691,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   Future<void> _prepareRuntime() async {
     _runtime = await widget.runtime;
+    _images = ImageAttachmentStore(Directory('${_runtime.root.path}/images'));
     _agent = widget.buildAgent(this, _runtime);
     _agent.sourceLabel = widget.settings.sourceLabel;
+    _agent.sendImagesInline = widget.settings.sendImagesInline;
     await _restoreTerminalMode();
     await _loadHistory();
     await _startShell();
@@ -1070,36 +1089,51 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   @override
   void onStatus(String message) => _setStatus(message);
 
+  @override
+  void onContextMessage(ChatMessage message) {
+    // 插在流式气泡**之前**：这条是模型开口之前就已经存在的输入，
+    // 排在回答后面会让人以为是模型说的。
+    if (mounted) setState(() => _visible.add(message));
+  }
+
   // ---- 交互 ----
 
   Future<void> _send() async {
     final text = _input.text.trim();
-    if (text.isEmpty || _busy || _loadingHistory) return;
+    final images = List<String>.from(_attachments);
+    // 只有图、没有文字也能发 —— 「你看这个」本来就是一种完整的表达。
+    if ((text.isEmpty && images.isEmpty) || _busy || _loadingHistory) return;
     var id = _threadId;
     if (id == null) {
       id = await widget.chats.createThread(
-        text,
+        text.isEmpty ? '[图片]' : text,
         preferredId: widget.runtimeId,
         terminalMode: _agent.terminalMode,
       );
       _threadId = id;
       // 外壳的标题要跟上，否则顶栏会一直显示「新对话」，
       // 而抽屉里那一条已经有名字了 —— 两处对不上很像是坏了。
+      final title = text.isEmpty ? '[图片]' : text;
       widget.onTitleChanged(
-          text.length > 28 ? '${text.substring(0, 28)}…' : text);
+          title.length > 28 ? '${title.substring(0, 28)}…' : title);
     }
     _input.clear();
     setState(() {
       _busy = true;
       _cancelRequested = false;
-      _visible
-          .add(ChatMessage(role: 'user', content: text, at: DateTime.now()));
+      _visible.add(ChatMessage(
+        role: 'user',
+        content: text,
+        at: DateTime.now(),
+        images: images,
+      ));
+      _attachments.clear();
       _streaming.clear();
     });
     await widget.chats.append(id, _visible.last);
 
     try {
-      await _agent.send(text);
+      await _agent.send(text, images: images);
     } catch (e) {
       if (!_cancelRequested) {
         final error = ChatMessage(
@@ -1303,6 +1337,15 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
+              AttachmentTray(
+                paths: _attachments,
+                onRemove: (path) => setState(() {
+                  _attachments.remove(path);
+                  // 文件也删掉。留着的话，会话目录里会慢慢堆满"选了又取消"的图，
+                  // 而没有任何一条消息引用它们 —— 谁也不会想起来去清。
+                  unawaited(File(path).delete().catchError((_) => File(path)));
+                }),
+              ),
               ModelSwitchBar(
                 model: widget.settings.config.model,
                 embeddingModel: widget.settings.embeddingModel,
@@ -1322,7 +1365,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                 effect: widget.settings.chatComposerEffect,
                 blur: widget.settings.chatComposerBlur,
                 opacity: widget.settings.chatComposerOpacity,
-                leading: [_buildTerminalButton()],
+                leading: [_buildAttachButton(), _buildTerminalButton()],
                 // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
                 trailing: [if (_agent.terminalMode) _buildApprovalButton()],
               ),
@@ -1389,6 +1432,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     return ChatBubble(
       role: message.role,
       text: message.content,
+      images: message.images,
       time: message.at,
       // 用消息**自己记下的**来源，而不是当前配置。换个渠道就把满屏历史
       // 全部改署成新渠道的话，恰好会在用户回头查"刚才那次是谁花的额度"时
@@ -1559,6 +1603,90 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 那里也是两个空间。
     _agent.retrieval.vectorIndex.clear();
     _agent.retrieval.lastEmbeddingError = null;
+  }
+
+  /// 选图。相册 / 拍照两个入口摊在一个小弹层里。
+  ///
+  /// 不做成"长按相册图标拍照"那种隐藏手势：这两件事同样常用，
+  /// 把其中一个藏起来只会让人以为不支持。
+  Future<void> _pickImages() async {
+    if (_busy) return;
+    if (_attachments.length >= maxAttachments) {
+      _setStatus('一次最多附 $maxAttachments 张图');
+      return;
+    }
+    final source = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: context.chat.bgPrimary,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('从相册选择'),
+              onTap: () => Navigator.pop(ctx, 'gallery'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('拍一张'),
+              onTap: () => Navigator.pop(ctx, 'camera'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null || !mounted) return;
+
+    try {
+      final room = maxAttachments - _attachments.length;
+      final picked = source == 'camera'
+          ? await _images.pickFromCamera()
+          : await _images.pickFromGallery(limit: room);
+      if (!mounted || picked.isEmpty) return;
+      setState(() => _attachments.addAll(picked.take(room)));
+      // 图片进不了模型手里的话，现在说比发出去之后再报错好 ——
+      // 那时用户已经等了一次网络往返。
+      final warning = _visionWarning();
+      if (warning != null) _setStatus(warning);
+    } catch (e) {
+      // 用户拒权限、相机不可用都走这里。原样显示 —— 这类错误的原文
+      // （"用户拒绝了访问照片"）比任何转述都清楚。
+      if (mounted) _setStatus('选图失败：$e');
+    }
+  }
+
+  /// 当前配置能不能真的把图送到模型手里。能就返回 null。
+  String? _visionWarning() {
+    if (widget.settings.sendImagesInline) return null;
+    if (widget.channels.channels.any((c) => c.canDescribeImages)) {
+      return widget.settings.imageMode == ImageMode.preprocess
+          ? '会先用视觉模型把图描述成文字，再发给对话模型'
+          : '当前模型不认图，会先用视觉模型描述一遍';
+    }
+    return '当前渠道不认图，也没有配视觉模型 —— 发出去图会被丢掉。'
+        '到「渠道管理」里填一个视觉模型';
+  }
+
+  Widget _buildAttachButton() {
+    // 当前这套配置能不能真的把图送进去，直接画在图标上：
+    // 送不进去时是警告色，点开选图之前就看得见。
+    final blocked = !widget.settings.sendImagesInline &&
+        !widget.channels.channels.any((c) => c.canDescribeImages);
+    return ComposerIconButton(
+      icon: Icons.add_photo_alternate_outlined,
+      tooltip: blocked
+          ? '当前渠道不认图，也没配视觉模型'
+          : widget.settings.sendImagesInline
+              ? '直接把图发给对话模型'
+              : '先用视觉模型把图描述成文字',
+      enabled: !_busy,
+      color: blocked ? context.chat.tintWarning : null,
+      onTap: _pickImages,
+    );
   }
 
   Widget _buildTerminalButton() {

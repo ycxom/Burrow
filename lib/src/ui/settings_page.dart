@@ -8,6 +8,7 @@ import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
+import '../llm/vision.dart';
 import '../settings/settings_store.dart';
 import 'agent_settings_page.dart';
 import 'chat_appearance_page.dart';
@@ -89,6 +90,46 @@ class _SettingsPageState extends State<SettingsPage> {
     return bits.join(' · ');
   }
 
+  String _imageModeSummary() =>
+      _imageModeSummaryFor(widget.store, widget.channels);
+
+  Future<void> _pickImageMode() async {
+    const labels = <ImageMode, (String, String)>{
+      ImageMode.auto: ('自动', '渠道勾了「能看图」就直发，否则先描述'),
+      ImageMode.native: ('总是直接发图', '模型不认图的话会报错 —— 但报错来自服务端，比这里拦下来更有信息量'),
+      ImageMode.preprocess: (
+        '总是先描述',
+        '即使对话模型认图也先描述。用便宜的视觉模型看一次，比让旗舰模型每轮重读一张图便宜'
+      ),
+    };
+    final picked = await showModalBottomSheet<ImageMode>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            for (final entry in labels.entries)
+              ListTile(
+                leading: Icon(
+                  entry.key == widget.store.imageMode
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                ),
+                title: Text(entry.value.$1),
+                subtitle:
+                    Text(entry.value.$2, style: const TextStyle(fontSize: 11)),
+                onTap: () => Navigator.pop(ctx, entry.key),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) {
+      await widget.store.setImageMode(picked);
+      if (mounted) setState(() {});
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -156,6 +197,18 @@ class _SettingsPageState extends State<SettingsPage> {
                     setState(() => _streamOutput = value);
                     widget.store.setStreamOutput(value);
                   },
+                ),
+                const Divider(height: 1),
+                const Divider(height: 1),
+                ListTile(
+                  leading: const Icon(Icons.image_outlined),
+                  title: const Text('图片怎么发'),
+                  subtitle: Text(
+                    _imageModeSummary(),
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _pickImageMode,
                 ),
                 const Divider(height: 1),
                 ListTile(
@@ -246,6 +299,25 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
     );
   }
+}
+
+/// 图片模式那一行的副标题：**说清楚现在会发生什么**，而不是复述选项名。
+///
+/// 「自动」这三个字本身不含任何信息 —— 用户想知道的是"我现在附一张图，
+/// 它会走哪条路"，而那取决于当前渠道勾没勾"能看图"。
+String _imageModeSummaryFor(SettingsStore store, ChannelStore channels) {
+  final capable = channels.active?.visionCapable ?? false;
+  final hasVision = channels.channels.any((c) => c.canDescribeImages);
+  return switch (store.imageMode) {
+    ImageMode.native => '总是直接发给对话模型',
+    ImageMode.preprocess =>
+      hasVision ? '总是先用视觉模型描述成文字，再发给对话模型' : '总是先描述 —— 但还没有任何渠道配了视觉模型',
+    ImageMode.auto => capable
+        ? '当前渠道勾了「能看图」，会直接发'
+        : hasVision
+            ? '当前渠道不认图，会先用视觉模型描述一遍'
+            : '当前渠道不认图，也没有渠道配了视觉模型 —— 现在发不了图',
+  };
 }
 
 class _Header extends StatelessWidget {

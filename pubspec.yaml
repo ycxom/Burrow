@@ -42,6 +42,10 @@ dependencies:
   # Debian 官方 rootfs 使用 tar.xz；流式解成临时 tar 后复用安全 tar 解包器。
   archive: ^4.0.9
 
+  # 选图。maxWidth/imageQuality 在平台层就把图缩好，
+  # 不用把一张 12MP 的原图整个读进 Dart 堆再自己缩。
+  image_picker: ^1.1.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

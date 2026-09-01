@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
@@ -32,7 +34,7 @@ class ChatStore {
     final path = p.join(await getDatabasesPath(), 'burrow.db');
     final db = await openDatabase(
       path,
-      version: 4,
+      version: 5,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -50,6 +52,10 @@ class ChatStore {
           // 那等于给历史消息盖一个多半是错的章，而这个字段存在的意义
           // 就是让「这条是谁答的」可信。UI 对空值不显示署名。
           await db.execute('ALTER TABLE messages ADD COLUMN source TEXT');
+        }
+        if (from < 5) {
+          // 图片路径的 JSON 数组。老消息没有图，留空。
+          await db.execute('ALTER TABLE messages ADD COLUMN images TEXT');
         }
       },
       onCreate: (db, _) async {
@@ -71,7 +77,8 @@ class ChatStore {
             created_at INTEGER NOT NULL,
             output_ref TEXT,
             checkpoint INTEGER,
-            source TEXT
+            source TEXT,
+            images TEXT
           )
         ''');
         await db.execute(
@@ -160,6 +167,25 @@ class ChatStore {
     });
   }
 
+  /// 图片路径列表 ⇄ JSON。
+  ///
+  /// 没有图时存 null 而不是 `'[]'`：绝大多数消息都没有图，几万条消息各省
+  /// 两个字节是次要的，重要的是**读的时候不用先解析一次 JSON 才知道是空的**。
+  static String? _encodeImages(List<String> images) =>
+      images.isEmpty ? null : jsonEncode(images);
+
+  static List<String> _decodeImages(String? raw) {
+    if (raw == null || raw.isEmpty) return const <String>[];
+    try {
+      return <String>[
+        for (final path in jsonDecode(raw) as List) path as String
+      ];
+    } catch (_) {
+      // 这一列坏了只是丢图，不该让整个会话打不开。
+      return const <String>[];
+    }
+  }
+
   Future<List<ChatMessage>> messages(String threadId) async {
     final rows = await _db.query(
       'messages',
@@ -177,6 +203,7 @@ class ChatStore {
               outputRef: row['output_ref'] as String?,
               checkpoint: row['checkpoint'] as int?,
               source: row['source'] as String?,
+              images: _decodeImages(row['images'] as String?),
             ))
         .toList();
   }
@@ -190,6 +217,7 @@ class ChatStore {
       'output_ref': message.outputRef,
       'checkpoint': message.checkpoint,
       'source': message.source,
+      'images': _encodeImages(message.images),
     });
     await _db.update(
       'threads',
@@ -221,6 +249,7 @@ class ChatStore {
           'output_ref': message.outputRef,
           'checkpoint': message.checkpoint,
           'source': message.source,
+          'images': _encodeImages(message.images),
         });
       }
     });

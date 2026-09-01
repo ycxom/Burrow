@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
 import '../llm/llm_client.dart';
+import '../llm/vision.dart';
 import 'channel_store.dart';
 import '../sandbox/sandbox_session.dart';
 
@@ -72,6 +73,14 @@ enum ChatWallpaperPreset {
   midnight,
 }
 
+/// 聊天应用的整体明暗风格。默认使用参考图里的 Nekogram 夜间色板；
+/// 仍保留跟随系统和明亮模式，避免把外观选择绑死在 Android 系统主题上。
+enum ChatColorStyle {
+  nekogramNight,
+  followSystem,
+  light,
+}
+
 /// 悬浮输入区的材质。数值参数（模糊和不透明度）与材质分开存，切换回来时
 /// 用户调好的手感仍然保留。
 enum ChatComposerEffect {
@@ -87,6 +96,7 @@ class SettingsStore extends ChangeNotifier {
     this._streamOutput,
     this._terminalModeDefault,
     this._embeddingModel,
+    this._imageMode,
     this._modelsByChannel,
     this._legacyModels,
     this._sandboxLevel,
@@ -94,6 +104,7 @@ class SettingsStore extends ChangeNotifier {
     this._overflowTrigger,
     this._messageThreshold,
     this._tokenThreshold,
+    this._chatColorStyle,
     this._chatWallpaperPreset,
     this._chatWallpaperPath,
     this._chatWallpaperDim,
@@ -109,6 +120,7 @@ class SettingsStore extends ChangeNotifier {
   static const _prefix = 'burrow.llm.';
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
   static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
+  static const _keyImageMode = 'burrow.llm.imageMode';
   static const _keyCachedModels = 'burrow.llm.cachedModels';
   static const _keyModelsByChannel = 'burrow.llm.modelsByChannel';
   static const _keySandboxLevel = 'burrow.sandbox.level';
@@ -116,6 +128,7 @@ class SettingsStore extends ChangeNotifier {
   static const _keyOverflowTrigger = 'burrow.context.trigger';
   static const _keyMessageThreshold = 'burrow.context.messageThreshold';
   static const _keyTokenThreshold = 'burrow.context.tokenThreshold';
+  static const _keyChatColorStyle = 'burrow.appearance.colorStyle';
   static const _keyChatWallpaperPreset = 'burrow.appearance.wallpaperPreset';
   static const _keyChatWallpaperPath = 'burrow.appearance.wallpaperPath';
   static const _keyChatWallpaperDim = 'burrow.appearance.wallpaperDim';
@@ -143,6 +156,7 @@ class SettingsStore extends ChangeNotifier {
   /// 摊成下游要的 [LlmConfig]。
   ChannelStore? _channels;
   String _embeddingModel;
+  ImageMode _imageMode;
 
   /// 渠道 id → 上一次从**那个渠道**拉回来的模型列表。
   ///
@@ -159,6 +173,7 @@ class SettingsStore extends ChangeNotifier {
   OverflowTrigger _overflowTrigger;
   int _messageThreshold;
   int _tokenThreshold;
+  ChatColorStyle _chatColorStyle;
   ChatWallpaperPreset _chatWallpaperPreset;
   String _chatWallpaperPath;
   double _chatWallpaperDim;
@@ -178,6 +193,7 @@ class SettingsStore extends ChangeNotifier {
       channels.active,
       temperature: _temperature,
       streamOutput: _streamOutput,
+      sendImagesInline: sendImagesInline,
     );
   }
 
@@ -257,6 +273,27 @@ class SettingsStore extends ChangeNotifier {
       _prefs?.setString(_keyModelsByChannel, jsonEncode(_modelsByChannel)) ??
       Future<void>.value();
 
+  /// 图片怎么送到模型手里。
+  ImageMode get imageMode => _imageMode;
+
+  /// 这一刻要不要把图直接塞进请求。
+  ///
+  /// 两件事共用一个开关：模型认不认图（渠道上勾的），以及用户有没有强制
+  /// 走前置（省钱）。**强制前置时即使模型认图也不直发** —— 那正是这个
+  /// 选项存在的意义，不然它和 auto 就没区别了。
+  bool get sendImagesInline => switch (_imageMode) {
+        ImageMode.native => true,
+        ImageMode.preprocess => false,
+        ImageMode.auto => _channels?.active?.visionCapable ?? false,
+      };
+
+  Future<void> setImageMode(ImageMode mode) async {
+    if (_imageMode == mode) return;
+    _imageMode = mode;
+    notifyListeners();
+    await _prefs?.setString(_keyImageMode, mode.name);
+  }
+
   /// 记忆检索用的嵌入模型。空 = 不启用，检索退回两路词法。
   ///
   /// 和对话模型分开存：它们通常**不是同一个模型**，而且嵌入模型一旦选定就
@@ -298,6 +335,7 @@ class SettingsStore extends ChangeNotifier {
   int get messageThreshold => _messageThreshold;
   int get tokenThreshold => _tokenThreshold;
 
+  ChatColorStyle get chatColorStyle => _chatColorStyle;
   ChatWallpaperPreset get chatWallpaperPreset => _chatWallpaperPreset;
   String get chatWallpaperPath => _chatWallpaperPath;
   double get chatWallpaperDim => _chatWallpaperDim;
@@ -322,6 +360,7 @@ class SettingsStore extends ChangeNotifier {
       prefs.getBool('${_prefix}streamOutput') ?? true,
       prefs.getBool(_keyTerminalDefault) ?? false,
       prefs.getString(_keyEmbeddingModel) ?? '',
+      _byName(ImageMode.values, prefs.getString(_keyImageMode), ImageMode.auto),
       _decodeModels(prefs.getString(_keyModelsByChannel)),
       prefs.getStringList(_keyCachedModels),
       _byName(SandboxLevel.values, prefs.getString(_keySandboxLevel),
@@ -332,6 +371,11 @@ class SettingsStore extends ChangeNotifier {
           OverflowTrigger.either),
       prefs.getInt(_keyMessageThreshold) ?? 30,
       prefs.getInt(_keyTokenThreshold) ?? 4000,
+      _byName(
+        ChatColorStyle.values,
+        prefs.getString(_keyChatColorStyle),
+        ChatColorStyle.nekogramNight,
+      ),
       _byName(
         ChatWallpaperPreset.values,
         prefs.getString(_keyChatWallpaperPreset),
@@ -459,6 +503,13 @@ class SettingsStore extends ChangeNotifier {
     await _prefs?.setBool(_keyTerminalDefault, on);
   }
 
+  Future<void> setChatColorStyle(ChatColorStyle value) async {
+    if (_chatColorStyle == value) return;
+    _chatColorStyle = value;
+    notifyListeners();
+    await _prefs?.setString(_keyChatColorStyle, value.name);
+  }
+
   Future<void> setChatWallpaperPreset(ChatWallpaperPreset preset) async {
     if (_chatWallpaperPreset == preset && _chatWallpaperPath.isEmpty) return;
     _chatWallpaperPreset = preset;
@@ -545,6 +596,7 @@ class SettingsStore extends ChangeNotifier {
 
   /// 只重置视觉项，不碰渠道、模型或沙箱配置。
   Future<void> resetChatAppearance() async {
+    _chatColorStyle = ChatColorStyle.nekogramNight;
     _chatWallpaperPreset = ChatWallpaperPreset.classic;
     _chatWallpaperPath = '';
     _chatWallpaperDim = 0;
@@ -559,6 +611,7 @@ class SettingsStore extends ChangeNotifier {
     final prefs = _prefs;
     if (prefs == null) return;
     await Future.wait(<Future<bool>>[
+      prefs.remove(_keyChatColorStyle),
       prefs.remove(_keyChatWallpaperPreset),
       prefs.remove(_keyChatWallpaperPath),
       prefs.remove(_keyChatWallpaperDim),
