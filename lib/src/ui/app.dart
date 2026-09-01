@@ -1477,11 +1477,18 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     final client = buildHttpClient(proxy: channel.proxy);
     final List<FetchedModel> models;
     try {
-      models = await fetchModels(
-        baseUrl: channel.baseUrl,
-        apiKey: auth,
-        client: client,
-      );
+      models = channel.oauthProviderId == 'openai_oauth'
+          ? await fetchChatGptOAuthModels(
+              accessToken: auth,
+              accountId:
+                  widget.accounts.credentialFor(channel)?.accountId ?? '',
+              client: client,
+            )
+          : await fetchModels(
+              baseUrl: channel.baseUrl,
+              apiKey: auth,
+              client: client,
+            );
     } finally {
       client.close();
     }
