@@ -1,0 +1,183 @@
+# 打 tag 就发版：编 APK、传 Release。
+#
+#     git tag v0.2.0 && git push origin v0.2.0
+#
+# 也可以在 Actions 页面手动跑（workflow_dispatch）—— 那种情况下只产出
+# artifact，不建 Release。想在发版前先拿个包装到手机上试，走这条。
+#
+# ## 三件仓库里没有、但构建需要的东西
+#
+# 1. **lib/secrets/google_oauth.dart** 被 .gitignore 挡着（里面是 OAuth 凭据）。
+#    没有它 `import` 直接编译失败。下面从 example 模板生成一份，
+#    仓库配了 secrets 就用 secrets 里的值覆盖。
+#
+# 2. **jniLibs 里的 proot 二进制**同样不入 git（GPL/LGPL，见 .gitignore 里的
+#    说明）。要用 NDK 现编。缺了它 app 能跑但沙箱降级，所以这一步不能跳。
+#
+# 3. **签名密钥**。配了 secrets 就用正式密钥签，没配就退回 debug 签名 ——
+#    见 android/app/build.gradle.kts。debug 签名的包能装能跑，只是和正式包
+#    互相覆盖不了，发给别人之前记得先配上密钥。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不带 v，例如 0.2.0）。留空则用 pubspec 里的。"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.47.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号从 tag 来。versionCode 用 run_number —— 它单调递增，
+      # 而 tag 里的语义化版本号没法可靠地折成一个递增整数
+      # （0.10.0 要排在 0.9.0 后面，按位拼出来的数字却是反的）。
+      - name: 定版本号
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            name="${{ inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            name="${GITHUB_REF_NAME#v}"
+          else
+            name="$(grep -m1 '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "版本 $name (versionCode ${GITHUB_RUN_NUMBER})"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # 凭据文件。仓库里只有 example 模板（它带着 gemini-cli 公开分发的那对
+      # 默认值），配了 secrets 就换成自己的。
+      - name: 生成 OAuth 凭据文件
+        env:
+          CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        run: |
+          cp lib/secrets/google_oauth.example.dart lib/secrets/google_oauth.dart
+          if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ]; then
+            cat > lib/secrets/google_oauth.dart <<EOF
+          /// CI 生成，来自仓库 secrets。不要提交。
+          library;
+
+          const googleOAuthClientId = '$CLIENT_ID';
+
+          const googleOAuthClientSecret = '$CLIENT_SECRET';
+          EOF
+            echo "用的是仓库 secrets 里的凭据"
+          else
+            echo "没配 secrets，用 example 里的默认凭据"
+          fi
+
+      - run: flutter pub get
+
+      # 编译不过的东西没必要再花十分钟去打包。
+      # --no-fatal-infos：仓库里有几条 deprecation 提示（Flutter 自己
+      # 弃用的 API），它们不该让 CI 变红。错误和警告照常拦。
+      - run: flutter analyze --no-fatal-infos
+      - run: flutter test
+
+      # proot 每次都重编要好几分钟，而它只在 tool/build_proot.sh 变了之后
+      # 才会产出不同的东西 —— 拿脚本自己的哈希当缓存键。
+      - name: 缓存 proot 构建
+        id: proot-cache
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs
+          key: proot-${{ runner.os }}-${{ hashFiles('tool/build_proot.sh') }}
+
+      - name: 编译 proot
+        if: steps.proot-cache.outputs.cache-hit != 'true'
+        run: |
+          # runner 镜像自带 NDK，但环境变量名有三个（ANDROID_NDK /
+          # ANDROID_NDK_HOME / ANDROID_NDK_ROOT），哪个存在跟镜像版本有关。
+          # 脚本只认前两个，这里补齐。
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_NDK}}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          bash tool/build_proot.sh arm64-v8a x86_64
+
+      # 没有这一步，构建照样能过 —— 但产出的是一个装不上正式渠道的包。
+      # 所以要在日志里说清楚它到底签没签。
+      - name: 准备签名密钥
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE" ]; then
+            echo "::warning::没配 ANDROID_KEYSTORE_BASE64，这次用 debug 签名。"
+            exit 0
+          fi
+          echo "$KEYSTORE" | base64 -d > android/app/upload-keystore.jks
+          cat > android/key.properties <<EOF
+          storeFile=app/upload-keystore.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          echo "用正式密钥签名"
+
+      # 分 ABI 打包而不是打一个通用包：两份 ABI 各自带一套原生库，
+      # 合在一起的包白白大一倍，而任何一台设备都只用得上其中一份。
+      - name: 构建 APK
+        run: |
+          flutter build apk --release --split-per-abi \
+            --build-name=${{ steps.version.outputs.name }} \
+            --build-number=${{ steps.version.outputs.code }}
+
+      - name: 按版本号重命名
+        id: apks
+        run: |
+          mkdir -p dist
+          version="${{ steps.version.outputs.name }}"
+          for abi in arm64-v8a x86_64; do
+            src="build/app/outputs/flutter-apk/app-$abi-release.apk"
+            [ -f "$src" ] || { echo "缺了 $src"; exit 1; }
+            cp "$src" "dist/Burrow-$version-$abi.apk"
+          done
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: burrow-apk-${{ steps.version.outputs.name }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      # 只有打 tag 才发 Release。手动触发时上面那个 artifact 就够了 ——
+      # 试装一个包不该在发布页留下一条记录。
+      - name: 发布 Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            绝大多数手机装 **arm64-v8a** 那个。`x86_64` 是给模拟器的。
+
+            首次安装需要在系统设置里允许「安装未知来源应用」。

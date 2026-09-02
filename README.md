@@ -1,10 +1,25 @@
-# Burrow 地洞
+<p align="center">
+  <img src="assets/branding/logo.png" alt="Burrow" width="180">
+</p>
+
+<h1 align="center">Burrow 地洞</h1>
+
+<table>
+<tr>
+<td width="60%" valign="middle">
 
 Burrow 是一款运行在 Android 设备上的 AI 对话与 Agent 应用。
 
 它既可以作为日常 AI 聊天客户端，也可以在需要时进入终端模式，让 AI 在手机上处理文件、编写代码、运行命令和完成更复杂的任务。
 
 > **Burrow** 意为“地洞”。它代表一个独立、私密且可控的工作空间，也象征着 AI 深入任务、理解问题并完成工作的过程。
+
+</td>
+<td width="40%" align="center">
+<img src="docs/OC/Burron_oc.png" width="260" alt="Burrow 形象">
+</td>
+</tr>
+</table>
 
 ## 主要特性
 
@@ -89,10 +104,55 @@ Burrow 适合希望在手机上使用 AI 完成实际任务的用户，包括：
 
 - 随时进行 AI 对话与写作。
 - 在移动设备上阅读和调整代码。
-- 运行 Python、Shell 及其https://ai.google.dev/他命令行任务。
+- 运行 Python、Shell 及其他命令行任务。
 - 处理本地文件和小型项目。
 - 使用云端模型或本地模型搭建私人 AI 工作环境。
 - 在外出时查看、继续或恢复 Agent 任务。
+
+## 安装
+
+到 [Releases](https://github.com/ycxom/Burrow/releases) 下载最新的 APK。
+绝大多数手机装 **arm64-v8a** 那个，`x86_64` 是给模拟器用的。
+
+首次安装需要在系统设置里允许「安装未知来源应用」。
+
+## 自己构建
+
+```bash
+# 凭据文件不入 git，先从模板复制一份
+cp lib/secrets/google_oauth.example.dart lib/secrets/google_oauth.dart
+
+flutter pub get
+tool/build_proot.sh arm64-v8a      # 需要 Android NDK，缺了它沙箱会降级
+flutter build apk --release --split-per-abi
+```
+
+没有签名密钥时会自动退回 debug 签名，能装能跑，只是和 Release 里的包
+互相覆盖不了。
+
+### 发版
+
+打 tag 就会自动构建并发布：
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+也可以在 Actions 页面手动触发 Release，那种情况下只产出可下载的
+artifact，不建 Release 条目 —— 适合发版前先拿个包试装。
+
+想让 CI 用正式密钥签名，在仓库 Settings → Secrets 里配这四项：
+
+| Secret | 说明 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | keystore 文件的 base64（`base64 -w0 upload-keystore.jks`） |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_ALIAS` | 密钥别名 |
+| `ANDROID_KEY_PASSWORD` | 密钥密码 |
+
+另外两项可选，用来替换内置的 Google OAuth 客户端：
+`GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`。不配就用
+`lib/secrets/google_oauth.example.dart` 里的默认值。
 
 ## 当前状态
 
@@ -103,3 +163,9 @@ Burrow 目前处于早期开发阶段，界面、功能和兼容性仍在持续�
 Burrow 使用 [Apache License 2.0](LICENSE) 开源。
 
 项目使用的第三方组件及相关许可信息请参阅 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+<p align="center">
+  <img src="docs/OC/work.jpg" width="180" alt="手机在自己干活">
+  <br>
+  <sub>手机在自己干活</sub>
+</p>

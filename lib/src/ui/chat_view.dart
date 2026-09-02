@@ -32,6 +32,7 @@ import 'chat_theme.dart';
 import 'image_attachments.dart';
 import 'skin_parts.dart';
 import 'skin_style.dart';
+import 'thinking.dart';
 
 // ---------------------------------------------------------------------------
 // 壁纸
@@ -669,6 +670,18 @@ class ChatBubble extends StatelessWidget {
   /// 半截内容上的"复制"和"重新生成"都没有意义。
   final bool generating;
 
+  /// 模型给出这条回答之前的思考过程。空 = 不画那一块。
+  final String reasoning;
+
+  /// 思考还没结束。为真时那一块自己在走秒、点在跳。
+  final bool reasoningActive;
+
+  /// 开始思考的时刻，只有正在生成的那条有。
+  final DateTime? reasoningStartedAt;
+
+  /// 思考一共花了多久，毫秒。历史消息从库里读出来。
+  final int reasoningMs;
+
   /// 这条是一组连续消息里的最后一条：画尾巴、显示头像。
   final bool lastInGroup;
 
@@ -698,6 +711,10 @@ class ChatBubble extends StatelessWidget {
     this.images = const <String>[],
     this.isError = false,
     this.generating = false,
+    this.reasoning = '',
+    this.reasoningActive = false,
+    this.reasoningStartedAt,
+    this.reasoningMs = 0,
     this.lastInGroup = true,
     this.firstInGroup = true,
     this.avatarPath = '',
@@ -985,6 +1002,33 @@ class ChatBubble extends StatelessWidget {
       );
     }
 
+    final thinking = reasoning.trim().isEmpty
+        ? null
+        : ThinkingBlock(
+            text: reasoning,
+            active: reasoningActive,
+            foreground: fg,
+            startedAt: reasoningStartedAt,
+            elapsedMs: reasoningMs,
+          );
+
+    // 还一个字都没吐出来。这一刻**必须有东西在动** —— 推理模型开口前
+    // 沉默十几秒是常事，静止的空气泡和卡死了长得一模一样。
+    if (generating && text.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            if (thinking != null) thinking,
+            // 思考已经在跳点了，再来一组是两处动画抢注意力。
+            if (thinking == null) TypingDots(color: fg.withValues(alpha: 0.5)),
+          ],
+        ),
+      );
+    }
+
     final Widget body;
     if (isError) {
       // 报错不走 markdown：异常信息里的 `*`、`_`、`#` 会被解析成格式，
@@ -1007,6 +1051,9 @@ class ChatBubble extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
+        // 思考排在正文**上面**：它发生在回答之前，排在下面会读成
+        // "答完了又补了一段"。
+        if (thinking != null) thinking,
         body,
         if (footer != null)
           Align(alignment: Alignment.centerRight, child: footer),

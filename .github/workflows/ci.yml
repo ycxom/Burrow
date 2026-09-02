@@ -1,0 +1,34 @@
+# 每次推送和 PR 都跑一遍静态检查和单测。
+#
+# **刻意不在这里编 APK。** 编一次要装 NDK、编 proot、跑 Gradle，十几分钟起步，
+# 而它能发现的问题（编译错误）`flutter analyze` 早就在一分钟内报出来了。
+# 想要装机包的话去 Actions 里手动跑 Release，或者打个 tag。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.2"
+          channel: stable
+          cache: true
+
+      # 凭据文件不入 git，缺了它整个 lib 都编译不过。
+      # 这里只要能编过就行，用模板里的默认值。
+      - run: cp lib/secrets/google_oauth.example.dart lib/secrets/google_oauth.dart
+
+      - run: flutter pub get
+      # --no-fatal-infos：仓库里有几条 deprecation 提示（Flutter 自己
+      # 弃用的 API），它们不该让 CI 变红。错误和警告照常拦。
+      - run: flutter analyze --no-fatal-infos
+      - run: flutter test

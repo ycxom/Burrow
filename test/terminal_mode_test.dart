@@ -36,17 +36,20 @@ class _ScriptedLlm implements LlmClient {
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    void Function(String delta)? onReasoning,
   }) async {
     toolsSeen.add(tools);
     messagesSeen.add(messages);
     final turn =
         _next < _turns.length ? _turns[_next++] : const LlmTurn(text: '完');
+    if (turn.reasoning.isNotEmpty) onReasoning?.call(turn.reasoning);
     if (turn.text.isNotEmpty) onDelta(turn.text);
     return turn;
   }
 }
 
 class _RecordingHost implements AgentHost {
+  final StringBuffer thoughts = StringBuffer();
   final List<String> statuses = <String>[];
   final List<ChatMessage> injected = <ChatMessage>[];
   int approvalsAsked = 0;
@@ -59,6 +62,9 @@ class _RecordingHost implements AgentHost {
 
   @override
   void onAssistantDelta(String text) {}
+
+  @override
+  void onAssistantReasoning(String text) => thoughts.write(text);
 
   @override
   void onTerminalChunk(List<int> chunk) {}

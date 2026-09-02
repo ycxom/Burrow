@@ -43,6 +43,13 @@ abstract class AgentHost {
   /// 助手文本的流式增量。
   void onAssistantDelta(String text);
 
+  /// 助手**思考过程**的流式增量。
+  ///
+  /// 和 [onAssistantDelta] 分成两条回调，是因为这两股流会交错到达（模型
+  /// 边想边说），共用一条的话 UI 无从知道刚收到的这一段该进思考区还是正文区，
+  /// 只能靠猜分隔符 —— 而那是各家都不保证的东西。
+  void onAssistantReasoning(String text);
+
   /// 命令输出的实时字节流，喂给终端视图。
   void onTerminalChunk(List<int> chunk);
 
@@ -69,6 +76,7 @@ abstract class LlmClient {
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    void Function(String delta)? onReasoning,
   });
 
   /// 当前渠道标识，供 ContextLimitGuard 分桶。
@@ -90,7 +98,19 @@ class LlmTurn {
   /// 服务端回报的本次调用用量。null = 这个服务没回报。
   final TokenUsage? usage;
 
-  const LlmTurn({required this.text, this.toolCalls = const [], this.usage});
+  /// 这次调用吐出的思考过程。空 = 这个模型/协议没有思考，或者没开。
+  final String reasoning;
+
+  /// 思考花掉的墙上时间，毫秒。0 = 没思考，或者没测出来。
+  final int reasoningMs;
+
+  const LlmTurn({
+    required this.text,
+    this.toolCalls = const [],
+    this.usage,
+    this.reasoning = '',
+    this.reasoningMs = 0,
+  });
 }
 
 /// 一次 LLM 调用的 token 用量，**服务端口径**。
@@ -454,6 +474,11 @@ class AgentLoop {
           content: turn.text,
           at: DateTime.now(),
           source: sourceLabel,
+          // 思考跟着**产出它的那一条**走。整轮攒到最后再挂的话，一个跑了
+          // 八轮工具的任务会把八段思考堆在最后一条上，而每一段实际对应的
+          // 是它前面那次决策。
+          reasoning: turn.reasoning,
+          reasoningMs: turn.reasoningMs,
           // 挂在**这一条**上而不是等回合结束再回填：中间轮次也可能产出正文
           // （模型边说边调工具），那些消息同样是这一轮的一部分。累加值挂在
           // 最后写出的那条上，前面几条各自带自己那一段。
@@ -598,6 +623,7 @@ class AgentLoop {
           messages: messages,
           tools: tools,
           onDelta: host.onAssistantDelta,
+          onReasoning: host.onAssistantReasoning,
         );
       } on ContextOverflowException catch (e) {
         final estimate = TokenCounter.estimateMessages(

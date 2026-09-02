@@ -22,6 +22,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../llm/llm_client.dart';
 import '../llm/system_prompt.dart';
+import '../llm/thinking_effort.dart';
 
 @immutable
 /// 一个**具体模型**的能力。
@@ -541,7 +542,8 @@ class ChannelStore extends ChangeNotifier {
   LlmConfig configFor(Channel? channel,
       {double temperature = 0.3,
       bool streamOutput = true,
-      bool sendImagesInline = false}) {
+      bool sendImagesInline = false,
+      ThinkingEffort thinkingEffort = ThinkingEffort.auto}) {
     if (channel == null) return LlmConfig.empty;
     return LlmConfig(
       apiFormat: channel.oauthProviderId == 'openai_oauth'
@@ -560,6 +562,7 @@ class ChannelStore extends ChangeNotifier {
       // 未知的函数声明，整轮请求 400 —— 一个开着没用的开关不算无害。
       webSearch: channel.apiFormat == 'geminiNative' &&
           channel.capabilityOf(channel.model).search,
+      thinkingEffort: thinkingEffort,
     );
   }
 }

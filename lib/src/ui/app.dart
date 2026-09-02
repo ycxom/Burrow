@@ -692,6 +692,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   final _streaming = StringBuffer();
   Timer? _streamPaintTimer;
 
+  /// 这一轮的思考过程。和 [_streaming] 一样是攒着的 —— 它同样按 token 到达，
+  /// 而且推理模型的思考往往比答案还长。
+  final _reasoning = StringBuffer();
+
+  /// 第一段思考到达的时刻。界面靠它走秒；这一轮结束时换成
+  /// [AgentLoop] 那份量出来的定值。
+  DateTime? _thinkStartedAt;
+
   /// 用户手动敲命令的那个 shell。**和 Agent 用的是两个不同的会话** ——
   /// 共用一个的话，Agent 的 cd 会污染用户的会话，用户的 export 会污染
   /// Agent 的可复现性（见 ARCHITECTURE.md §3）。
@@ -1263,8 +1271,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   @override
   void onAssistantDelta(String text) {
     _streaming.write(text);
-    // 网络分片可能细到一个字符一次。最多约 30fps 刷新，既保持实时感，
-    // 又避免 Markdown 每个 token 全量排版造成跳动和掉帧。
+    _schedulePaint();
+  }
+
+  /// 这一轮最后一条助手消息量出来的思考时长。找不到就是 0。
+  int _lastAssistantReasoningMs() {
+    for (var i = _agent.history.length - 1; i >= 0; i--) {
+      if (_agent.history[i].role == 'assistant') {
+        return _agent.history[i].reasoningMs;
+      }
+    }
+    return 0;
+  }
+
+  /// 网络分片可能细到一个字符一次。最多约 30fps 刷新，既保持实时感，
+  /// 又避免 Markdown 每个 token 全量排版造成跳动和掉帧。
+  void _schedulePaint() {
     _streamPaintTimer ??= Timer(const Duration(milliseconds: 33), () {
       _streamPaintTimer = null;
       if (mounted) {
@@ -1272,6 +1294,15 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         _scrollToEnd(animated: true);
       }
     });
+  }
+
+  @override
+  void onAssistantReasoning(String text) {
+    _thinkStartedAt ??= DateTime.now();
+    _reasoning.write(text);
+    // 和正文共用同一个节流器：两股流会交错到达，各自开一个的话
+    // 一秒钟能排到 60 次，白白多一倍的重排。
+    _schedulePaint();
   }
 
   @override
@@ -1329,6 +1360,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       ));
       _attachments.clear();
       _streaming.clear();
+      _reasoning.clear();
+      _thinkStartedAt = null;
     });
     await widget.chats.append(id, _visible.last);
 
@@ -1352,11 +1385,24 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             content: _streaming.toString(),
             at: DateTime.now(),
             source: widget.settings.sourceLabel,
+            // 思考也接上，不接的话回答写完的瞬间那一块会整个消失，
+            // 而它明明刚刚还在。
+            //
+            // 内容用界面自己攒的这份：工具循环里一个回合会产出好几条助手
+            // 消息，而这里合成的是**一条**气泡 —— 正文已经是全部拼在一起的，
+            // 思考只取其中一条会对不上。
+            reasoning: _reasoning.toString(),
+            // 时长只有 AgentLoop 那边量得到。取最后一条助手消息的 ——
+            // 多轮时这是不完整的，但把几轮加起来会得到一个"想了 40 秒"
+            // 这种明显不对的数，而绝大多数回合本来就只有一轮。
+            reasoningMs: _lastAssistantReasoningMs(),
             // 用量取整轮的。这条气泡是这里现造的，AgentLoop 挂在 history 上的
             // 那份取不到 —— 不接这一条，token 要等到重新载入会话才显示出来。
             usage: _agent.lastTurnUsage,
           ));
           _streaming.clear();
+          _reasoning.clear();
+          _thinkStartedAt = null;
         }
         _busy = false;
       });
@@ -1582,8 +1628,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   Widget _buildChat() {
     // 流式那条单独接在后面，而不是每个 delta 都往 _visible 里塞 ——
     // 否则每个 token 都要重建整个列表。
-    final streaming = _streaming.toString();
-    final rows = _buildRows(streaming.isEmpty ? null : streaming);
+    // 正在跑就一定有这一行，哪怕一个字都还没到 —— 那一行会画成三个跳动的
+    // 点。**发出消息之后界面上什么都不变**是这个页面最容易被当成 bug 的
+    // 表现，而它恰好发生在等待最久的推理模型上。
+    final rows = _buildRows(_busy ? _streaming.toString() : null);
 
     final bottomInset = MediaQuery.paddingOf(context).bottom;
     return Stack(
@@ -1695,6 +1743,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         role: 'assistant',
         text: streaming,
         generating: true,
+        reasoning: _reasoning.toString(),
+        // 正文一开始流，思考就算结束了 —— 模型不会先答一半再回去想。
+        reasoningActive: streaming.isEmpty,
+        reasoningStartedAt: _thinkStartedAt,
         avatarPath: widget.settings.assistantAvatarPath,
         showAvatar: widget.settings.showMessageAvatars,
       );
@@ -1729,6 +1781,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       meta: _displayMessageSource(message.source),
       usage: message.usage,
       showTokens: widget.settings.showTokenUsage,
+      reasoning: message.reasoning,
+      reasoningMs: message.reasoningMs,
       isError: isError,
       lastInGroup: row.lastInGroup,
       firstInGroup: row.firstInGroup,

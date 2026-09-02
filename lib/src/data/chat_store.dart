@@ -43,7 +43,7 @@ class ChatStore {
     final path = p.join(await getDatabasesPath(), 'burrow.db');
     final db = await openDatabase(
       path,
-      version: 8,
+      version: 9,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -78,6 +78,13 @@ class ChatStore {
               .execute('ALTER TABLE messages ADD COLUMN tokens_out INTEGER');
           await db.execute(
               'ALTER TABLE messages ADD COLUMN tokens_cached INTEGER');
+        }
+        if (from < 9) {
+          // 思考过程。老消息没有 —— 那时候压根没收这个字段，留空即可。
+          // UI 对空值不画思考区，所以历史对话看起来和以前一模一样。
+          await db.execute('ALTER TABLE messages ADD COLUMN reasoning TEXT');
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN reasoning_ms INTEGER');
         }
         if (from < 8) {
           // 这一条是不是估算值。1 = 估算。
@@ -114,7 +121,9 @@ class ChatStore {
             tokens_in INTEGER,
             tokens_out INTEGER,
             tokens_cached INTEGER,
-            tokens_estimated INTEGER
+            tokens_estimated INTEGER,
+            reasoning TEXT,
+            reasoning_ms INTEGER
           )
         ''');
         await db.execute(
@@ -269,6 +278,8 @@ class ChatStore {
               source: row['source'] as String?,
               images: _decodeImages(row['images'] as String?),
               usage: _decodeUsage(row),
+              reasoning: row['reasoning'] as String? ?? '',
+              reasoningMs: row['reasoning_ms'] as int? ?? 0,
             ))
         .toList();
   }
@@ -301,6 +312,8 @@ class ChatStore {
       'tokens_out': message.usage?.output,
       'tokens_cached': message.usage?.cached,
       'tokens_estimated': (message.usage?.estimated ?? false) ? 1 : 0,
+      'reasoning': message.reasoning.isEmpty ? null : message.reasoning,
+      'reasoning_ms': message.reasoningMs == 0 ? null : message.reasoningMs,
     });
     await _db.update(
       'threads',
@@ -337,6 +350,8 @@ class ChatStore {
           'tokens_out': message.usage?.output,
           'tokens_cached': message.usage?.cached,
           'tokens_estimated': (message.usage?.estimated ?? false) ? 1 : 0,
+          'reasoning': message.reasoning.isEmpty ? null : message.reasoning,
+          'reasoning_ms': message.reasoningMs == 0 ? null : message.reasoningMs,
         });
       }
     });

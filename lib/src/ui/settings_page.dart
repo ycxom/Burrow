@@ -8,6 +8,7 @@ import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
+import '../llm/thinking_effort.dart';
 import '../llm/vision.dart';
 import 'system_prompt_page.dart';
 import '../settings/settings_store.dart';
@@ -147,6 +148,35 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  Future<void> _pickThinkingEffort() async {
+    final picked = await showModalBottomSheet<ThinkingEffort>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            for (final effort in ThinkingEffort.values)
+              ListTile(
+                leading: Icon(
+                  effort == widget.store.thinkingEffort
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                ),
+                title: Text(effort.label),
+                subtitle:
+                    Text(effort.hint, style: const TextStyle(fontSize: 11)),
+                onTap: () => Navigator.pop(ctx, effort),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) {
+      await widget.store.setThinkingEffort(picked);
+      if (mounted) setState(() {});
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -245,6 +275,20 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: _pickImageMode,
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: const Icon(Icons.psychology_outlined),
+                  title: const Text('思考强度'),
+                  // 副标题带一句"只对会思考的模型有效"：这个设置对着一个
+                  // 普通模型调是没有任何反应的，不说清楚会被当成坏了。
+                  subtitle: Text(
+                    '${widget.store.thinkingEffort.label} · '
+                    '只对会思考的模型有效',
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _pickThinkingEffort,
                 ),
                 const Divider(height: 1),
                 ListTile(

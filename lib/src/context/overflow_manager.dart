@@ -64,6 +64,21 @@ class ChatMessage {
   /// 「这一句花了多少」，想知道的是这一问一答的总账，不是其中某一次请求。
   final TokenUsage? usage;
 
+  /// 模型在给出这条回答之前的思考过程。空 = 这个模型不吐思考，或没开。
+  ///
+  /// **和 [content] 分开存，而且永远不回传给模型。** 思考是一次性的草稿：
+  /// 各家的文档都说得很明白，把上一轮的思考塞回下一轮的上下文会让模型
+  /// 跟着自己的旧草稿走，而且那部分 token 要重新计费。分成两个字段之后
+  /// 「发给模型的」和「给人看的」天然就是两回事，不需要在发送前再过滤一遍。
+  final String reasoning;
+
+  /// 思考花了多久，毫秒。0 = 没思考，或者这条是从旧版本的库里读出来的。
+  ///
+  /// 存下来而不是显示时现算：流式结束的那一刻这条消息就被换成了一条普通的
+  /// 历史消息，现算的话那个数字会在回答写完的瞬间消失 —— 看起来像刚显示的
+  /// 东西又坏掉了。
+  final int reasoningMs;
+
   const ChatMessage({
     required this.role,
     required this.content,
@@ -73,6 +88,8 @@ class ChatMessage {
     this.source,
     this.images = const <String>[],
     this.usage,
+    this.reasoning = '',
+    this.reasoningMs = 0,
   });
 
   bool get hasImages => images.isNotEmpty;
@@ -81,6 +98,8 @@ class ChatMessage {
     String? content,
     int? checkpoint,
     TokenUsage? usage,
+    String? reasoning,
+    int? reasoningMs,
   }) =>
       ChatMessage(
         role: role,
@@ -91,6 +110,8 @@ class ChatMessage {
         source: source,
         images: images,
         usage: usage ?? this.usage,
+        reasoning: reasoning ?? this.reasoning,
+        reasoningMs: reasoningMs ?? this.reasoningMs,
       );
 }
 

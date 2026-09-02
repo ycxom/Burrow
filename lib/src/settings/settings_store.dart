@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
 import '../llm/llm_client.dart';
+import '../llm/thinking_effort.dart';
 import '../llm/vision.dart';
 import 'channel_store.dart';
 import '../sandbox/sandbox_session.dart';
@@ -142,6 +143,7 @@ class SettingsStore extends ChangeNotifier {
   static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
   static const _keyImageMode = 'burrow.llm.imageMode';
   static const _keySystemPrompt = 'burrow.llm.systemPrompt';
+  static const _keyThinkingEffort = 'burrow.llm.thinkingEffort';
   static const _keyCachedModels = 'burrow.llm.cachedModels';
   static const _keyModelsByChannel = 'burrow.llm.modelsByChannel';
   static const _keySandboxLevel = 'burrow.sandbox.level';
@@ -222,6 +224,7 @@ class SettingsStore extends ChangeNotifier {
       temperature: _temperature,
       streamOutput: _streamOutput,
       sendImagesInline: sendImagesInline,
+      thinkingEffort: _thinkingEffort,
     );
   }
 
@@ -229,6 +232,21 @@ class SettingsStore extends ChangeNotifier {
 
   double get temperature => _temperature;
   bool get streamOutput => _streamOutput;
+
+  /// 让模型想多久。默认「自动」= 一个参数都不发。
+  ///
+  /// 全局而不是跟着渠道走：它和 temperature 是同一类东西 —— "我希望模型
+  /// 怎么答"，跟人走，不跟接入点走。各协议怎么翻译它是 [ThinkingEffort]
+  /// 自己的事。
+  ThinkingEffort get thinkingEffort => _thinkingEffort;
+  ThinkingEffort _thinkingEffort = ThinkingEffort.auto;
+
+  Future<void> setThinkingEffort(ThinkingEffort value) async {
+    if (_thinkingEffort == value) return;
+    _thinkingEffort = value;
+    notifyListeners();
+    await _prefs?.setString(_keyThinkingEffort, value.storage);
+  }
 
   /// 接上渠道列表。渠道一变就跟着通知 —— 下游只订阅了 SettingsStore，
   /// 不接这一条的话换渠道不会触发任何刷新。
@@ -419,7 +437,7 @@ class SettingsStore extends ChangeNotifier {
 
   static Future<SettingsStore> load() async {
     final prefs = await SharedPreferences.getInstance();
-    return SettingsStore._(
+    final store = SettingsStore._(
       prefs.getDouble('${_prefix}temperature') ?? 0.3,
       prefs.getBool('${_prefix}streamOutput') ?? true,
       prefs.getBool(_keyTerminalDefault) ?? false,
@@ -467,6 +485,9 @@ class SettingsStore extends ChangeNotifier {
           .toDouble(),
       prefs,
     );
+    store._thinkingEffort =
+        ThinkingEffort.fromStorage(prefs.getString(_keyThinkingEffort));
+    return store;
   }
 
   /// 按 name 反查枚举，认不出来就用默认值。

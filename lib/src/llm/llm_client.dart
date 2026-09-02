@@ -28,6 +28,8 @@ import 'image_parts.dart';
 import 'system_prompt.dart';
 import '../agent/tools.dart';
 import 'gemini_protocol.dart';
+import 'reasoning.dart';
+import 'thinking_effort.dart';
 import 'oauth.dart';
 import '../context/overflow_manager.dart';
 
@@ -85,6 +87,13 @@ class LlmConfig {
   /// 界面上也只在原生协议下才显示。
   final bool webSearch;
 
+  /// 让模型想多久。默认 [ThinkingEffort.auto] —— 一个字段都不发。
+  ///
+  /// 不做成"哪些模型支持"的判断表：能思考的模型每周都在变，而判错的代价是
+  /// 整轮请求 400。默认不发，用户主动调了才发，撞上不支持的模型时报错里会
+  /// 直接说是这个旋钮的事。
+  final ThinkingEffort thinkingEffort;
+
   const LlmConfig({
     this.apiFormat = 'openAI',
     required this.baseUrl,
@@ -97,6 +106,7 @@ class LlmConfig {
     this.sendImagesInline = false,
     this.systemPromptStyle = SystemPromptStyle.systemRole,
     this.webSearch = false,
+    this.thinkingEffort = ThinkingEffort.auto,
   });
 
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
@@ -117,6 +127,7 @@ class LlmConfig {
     bool? sendImagesInline,
     SystemPromptStyle? systemPromptStyle,
     bool? webSearch,
+    ThinkingEffort? thinkingEffort,
   }) =>
       LlmConfig(
         apiFormat: apiFormat ?? this.apiFormat,
@@ -130,6 +141,7 @@ class LlmConfig {
         sendImagesInline: sendImagesInline ?? this.sendImagesInline,
         systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
         webSearch: webSearch ?? this.webSearch,
+        thinkingEffort: thinkingEffort ?? this.thinkingEffort,
       );
 }
 
@@ -290,7 +302,11 @@ class ConfigurableLlmClient
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    void Function(String delta)? onReasoning,
   }) async {
+    // 可选参数在这里收成一个必定存在的函数，下面五条协议路径就不用各写一遍
+    // 空判断 —— 漏写一处的表现是"某个渠道的思考不显示"，很难被注意到。
+    final reason = onReasoning ?? (_) {};
     if (!config.isConfigured) {
       throw StateError('尚未配置模型服务，请先在设置里填 baseUrl 和 model');
     }
@@ -309,6 +325,7 @@ class ConfigurableLlmClient
         messages: prepared,
         tools: tools,
         onDelta: onDelta,
+        onReasoning: reason,
         images: images,
       );
     }
@@ -317,6 +334,7 @@ class ConfigurableLlmClient
         messages: prepared,
         tools: tools,
         onDelta: onDelta,
+        onReasoning: reason,
         images: images,
       );
     }
@@ -325,6 +343,7 @@ class ConfigurableLlmClient
         messages: prepared,
         tools: tools,
         onDelta: onDelta,
+        onReasoning: reason,
         images: images,
       );
     }
@@ -333,6 +352,7 @@ class ConfigurableLlmClient
         messages: prepared,
         tools: tools,
         onDelta: onDelta,
+        onReasoning: reason,
         images: images,
       );
     }
@@ -340,6 +360,7 @@ class ConfigurableLlmClient
       messages: prepared,
       tools: tools,
       onDelta: onDelta,
+      onReasoning: reason,
       images: images,
     );
   }
@@ -375,6 +396,7 @@ class ConfigurableLlmClient
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    required void Function(String delta) onReasoning,
     String? model,
     Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
@@ -405,6 +427,10 @@ class ConfigurableLlmClient
         }).toList(),
         'stream': true,
         'store': false,
+        if (config.thinkingEffort.openAiEffort != null)
+          'reasoning': <String, Object?>{
+            'effort': config.thinkingEffort.openAiEffort,
+          },
         if (tools.isNotEmpty)
           'tools': tools
               .map((tool) => <String, Object?>{
@@ -427,7 +453,7 @@ class ConfigurableLlmClient
     // ChatGPT 唯一能拿到**真实余量**的地方就是这里的响应头 —— 没有独立的
     // 查询接口。所以余量是"聊过一句之后才知道"，而不是登录完就有。
     _reportRateLimit(response.headers);
-    return _readResponsesStream(response.stream, onDelta);
+    return _readResponsesStream(response.stream, onDelta, onReasoning);
   }
 
   /// 从响应头里读到用量时回调出去。由 main.dart 接到 AccountStore 上。
@@ -446,8 +472,11 @@ class ConfigurableLlmClient
   Future<LlmTurn> _readResponsesStream(
     http.ByteStream stream,
     void Function(String) onDelta,
+    void Function(String) onReasoning,
   ) async {
     final text = StringBuffer();
+    final reasoning = StringBuffer();
+    final clock = _ThinkClock();
     final calls = <String, _PartialToolCall>{};
     TokenUsage? usage;
     await for (final line
@@ -471,9 +500,25 @@ class ConfigurableLlmClient
       if (type == 'response.output_text.delta') {
         final delta = event['delta']?.toString() ?? '';
         if (delta.isNotEmpty) {
+          clock.answer();
           text.write(delta);
           onDelta(delta);
         }
+      } else if (type == 'response.reasoning_summary_text.delta') {
+        // 推理模型只肯给**摘要**，原始思维链拿不到（服务端策略）。
+        // 摘要要在请求里显式要（`reasoning.summary`），有些接入点默认就给，
+        // 所以这里照收不误 —— 收到了就显示，收不到也不算错。
+        final delta = event['delta']?.toString() ?? '';
+        if (delta.isNotEmpty) {
+          clock.think();
+          reasoning.write(delta);
+          onReasoning(delta);
+        }
+      } else if (type == 'response.reasoning_summary_part.added' &&
+          reasoning.isNotEmpty) {
+        // 多段摘要之间空一行，否则两段会黏成一句读不断的话。
+        reasoning.write('\n\n');
+        onReasoning('\n\n');
       } else if (type == 'response.output_item.added' ||
           type == 'response.output_item.done') {
         final item = event['item'] as Map<String, Object?>?;
@@ -510,6 +555,8 @@ class ConfigurableLlmClient
               ))
           .toList(),
       usage: usage,
+      reasoning: reasoning.toString(),
+      reasoningMs: clock.ms,
     );
   }
 
@@ -517,6 +564,7 @@ class ConfigurableLlmClient
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    required void Function(String delta) onReasoning,
     Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final auth = await _authValue();
@@ -532,6 +580,8 @@ class ConfigurableLlmClient
         'model': config.model,
         'temperature': config.temperature,
         'stream': config.streamOutput,
+        if (config.thinkingEffort.openAiEffort != null)
+          'reasoning_effort': config.thinkingEffort.openAiEffort,
         'messages': messages.map((m) => _toWire(m, images)).toList(),
         // 流式下服务端默认**不**回报用量，要显式要一次，它才会在最后补一个
         // choices 为空、只带 usage 的块。非流式无条件返回，不用要。
@@ -557,12 +607,14 @@ class ConfigurableLlmClient
           messages: messages,
           tools: tools,
           onDelta: onDelta,
+          onReasoning: onReasoning,
           images: images,
         );
       }
       if (_guard.isContextLimitError(400, body)) {
         throw ContextOverflowException(400, body);
       }
+      _rejectIfThinkingEffort(body);
       throw http.ClientException('LLM 返回 400: ${_brief(body)}');
     }
 
@@ -573,11 +625,14 @@ class ConfigurableLlmClient
       if (_guard.isContextLimitError(response.statusCode, body)) {
         throw ContextOverflowException(response.statusCode, body);
       }
+      _rejectIfThinkingEffort(body);
       throw http.ClientException(
           'LLM 返回 ${response.statusCode}: ${_brief(body)}');
     }
 
-    if (config.streamOutput) return _readStream(response.stream, onDelta);
+    if (config.streamOutput) {
+      return _readStream(response.stream, onDelta, onReasoning);
+    }
     final body = jsonDecode(await response.stream.bytesToString())
         as Map<String, Object?>;
     final choices = body['choices'] as List?;
@@ -585,6 +640,8 @@ class ConfigurableLlmClient
         ? null
         : (choices.first as Map)['message'] as Map?;
     final text = message?['content']?.toString() ?? '';
+    final thought = openAiReasoningOf(message);
+    if (thought.isNotEmpty) onReasoning(thought);
     if (text.isNotEmpty) onDelta(text);
     final rawCalls = message?['tool_calls'] as List? ?? const [];
     final calls = rawCalls
@@ -603,6 +660,9 @@ class ConfigurableLlmClient
       text: text,
       toolCalls: calls,
       usage: TokenUsage.fromOpenAi(body['usage']),
+      // 非流式量不出思考时长 —— 整个响应是一次性到的。留 0，UI 不显示，
+      // 而不是拿整次请求的耗时冒充"想了多久"。
+      reasoning: thought,
     );
   }
 
@@ -731,6 +791,9 @@ class ConfigurableLlmClient
     required Map<String, InlineImage> images,
   }) {
     final wire = geminiTools(tools, webSearch: config.webSearch);
+    // 思考摘要要**主动要**才给，强度也一样。整块只发给认得它的那几代模型 ——
+    // 2.0 和更老收到 thinkingConfig 会直接 400，把整轮对话弄失败。
+    final thoughts = geminiSupportsThoughts(config.model);
     return <String, Object?>{
       'contents': geminiContents(messages, images),
       if (geminiSystemInstruction(messages) != null)
@@ -738,6 +801,9 @@ class ConfigurableLlmClient
       if (wire.isNotEmpty) 'tools': wire,
       'generationConfig': <String, Object?>{
         'temperature': config.temperature,
+        if (thoughts)
+          'thinkingConfig':
+              geminiThinkingConfig(config.model, config.thinkingEffort),
       },
     };
   }
@@ -754,6 +820,7 @@ class ConfigurableLlmClient
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    required void Function(String delta) onReasoning,
     Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final key = await _authValue();
@@ -789,6 +856,7 @@ class ConfigurableLlmClient
           '系列，要么在渠道里关掉这个模型的联网搜索、或者关掉终端模式。',
         );
       }
+      _rejectIfThinkingEffort(body);
       // 配额说明放在**截断之前**。Google 把套话写在前面、把"哪个配额满了"
       // 写在最后，照原样截断的话留下的全是套话。
       final quota = describeGoogleQuota(body);
@@ -798,13 +866,19 @@ class ConfigurableLlmClient
       );
     }
 
-    return _readGeminiStream(response, onDelta: onDelta, codeAssist: false);
+    return _readGeminiStream(
+      response,
+      onDelta: onDelta,
+      onReasoning: onReasoning,
+      codeAssist: false,
+    );
   }
 
   Future<LlmTurn> _completeCodeAssist({
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    required void Function(String delta) onReasoning,
     Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final project = await _ensureCodeAssistProject();
@@ -839,16 +913,24 @@ class ConfigurableLlmClient
           'LLM 返回 ${response.statusCode}: ${_brief(body)}');
     }
 
-    return _readGeminiStream(response, onDelta: onDelta, codeAssist: true);
+    return _readGeminiStream(
+      response,
+      onDelta: onDelta,
+      onReasoning: onReasoning,
+      codeAssist: true,
+    );
   }
 
   /// 读一条 Gemini 的 SSE 流。两条路径唯一的差别是要不要剥 `response` 壳。
   Future<LlmTurn> _readGeminiStream(
     http.StreamedResponse response, {
     required void Function(String delta) onDelta,
+    required void Function(String delta) onReasoning,
     required bool codeAssist,
   }) async {
     final text = StringBuffer();
+    final reasoning = StringBuffer();
+    final clock = _ThinkClock();
     final calls = <ToolCall>[];
     TokenUsage? usage;
     final queries = <String>[];
@@ -862,8 +944,14 @@ class ConfigurableLlmClient
       final chunk = parseGeminiResponse(
           codeAssist ? unwrapCodeAssistResponse(event) : event);
       if (chunk.text.isNotEmpty) {
+        clock.answer();
         text.write(chunk.text);
         if (config.streamOutput) onDelta(chunk.text);
+      }
+      if (chunk.reasoning.isNotEmpty) {
+        clock.think();
+        reasoning.write(chunk.reasoning);
+        if (config.streamOutput) onReasoning(chunk.reasoning);
       }
       calls.addAll(chunk.calls);
       // 用量是**累计值**（每个块报的都是到目前为止的总数），所以覆盖而不是累加。
@@ -886,12 +974,17 @@ class ConfigurableLlmClient
     }
 
     // 非流式时一次性把正文喂过去，保持和另外几条路径一样的回调契约。
-    if (!config.streamOutput && text.isNotEmpty) onDelta(text.toString());
+    if (!config.streamOutput) {
+      if (reasoning.isNotEmpty) onReasoning(reasoning.toString());
+      if (text.isNotEmpty) onDelta(text.toString());
+    }
 
     return LlmTurn(
       text: text.toString(),
       toolCalls: calls,
       usage: usage,
+      reasoning: reasoning.toString(),
+      reasoningMs: clock.ms,
     );
   }
 
@@ -899,12 +992,14 @@ class ConfigurableLlmClient
     required List<ChatMessage> messages,
     required List<ToolSpec> tools,
     required void Function(String delta) onDelta,
+    required void Function(String delta) onReasoning,
     Map<String, InlineImage> images = const <String, InlineImage>{},
   }) async {
     final system = messages
         .where((message) => message.role == 'system')
         .map((message) => message.content)
         .join('\n\n');
+    final thinking = anthropicThinking(config.thinkingEffort);
     final auth = await _authValue();
     final request = http.Request(
       'POST',
@@ -917,8 +1012,15 @@ class ConfigurableLlmClient
       })
       ..body = jsonEncode(<String, Object?>{
         'model': config.model,
-        'max_tokens': 4096,
-        'temperature': config.temperature.clamp(0, 1),
+        'max_tokens': thinking?.maxTokens ?? 4096,
+        // 开了扩展思考就**不能再送 temperature** —— Anthropic 要求它必须是 1，
+        // 送别的值会 400。这里整个省掉，让服务端用它自己那份。
+        if (thinking == null) 'temperature': config.temperature.clamp(0, 1),
+        if (thinking != null)
+          'thinking': <String, Object?>{
+            'type': 'enabled',
+            'budget_tokens': thinking.budget,
+          },
         'stream': config.streamOutput,
         if (system.isNotEmpty) 'system': system,
         'messages': messages
@@ -950,11 +1052,12 @@ class ConfigurableLlmClient
       if (_guard.isContextLimitError(response.statusCode, body)) {
         throw ContextOverflowException(response.statusCode, body);
       }
+      _rejectIfThinkingEffort(body);
       throw http.ClientException(
           'LLM 返回 ${response.statusCode}: ${_brief(body)}');
     }
     if (config.streamOutput) {
-      return _readAnthropicStream(response.stream, onDelta);
+      return _readAnthropicStream(response.stream, onDelta, onReasoning);
     }
     final body = jsonDecode(await response.stream.bytesToString())
         as Map<String, Object?>;
@@ -964,6 +1067,12 @@ class ConfigurableLlmClient
         .where((block) => block['type'] == 'text')
         .map((block) => block['text']?.toString() ?? '')
         .join();
+    final thought = content
+        .whereType<Map>()
+        .where((block) => block['type'] == 'thinking')
+        .map((block) => block['thinking']?.toString() ?? '')
+        .join();
+    if (thought.isNotEmpty) onReasoning(thought);
     if (text.isNotEmpty) onDelta(text);
     final calls = content
         .whereType<Map>()
@@ -981,14 +1090,18 @@ class ConfigurableLlmClient
       text: text,
       toolCalls: calls,
       usage: TokenUsage.fromAnthropic(body['usage']),
+      reasoning: thought,
     );
   }
 
   Future<LlmTurn> _readAnthropicStream(
     http.ByteStream stream,
     void Function(String) onDelta,
+    void Function(String) onReasoning,
   ) async {
     final text = StringBuffer();
+    final reasoning = StringBuffer();
+    final clock = _ThinkClock();
     final partial = <int, _PartialToolCall>{};
     // Anthropic 把用量拆成两半送：input 在 message_start，output 在
     // message_delta。所以要边收边并，不能等某一个事件一次读全。
@@ -1028,8 +1141,17 @@ class ConfigurableLlmClient
         final delta = event['delta'] as Map<String, Object?>?;
         if (delta?['type'] == 'text_delta') {
           final value = delta?['text']?.toString() ?? '';
+          clock.answer();
           text.write(value);
           onDelta(value);
+        } else if (delta?['type'] == 'thinking_delta') {
+          // 只**收**不**开**：扩展思考要在请求里显式声明预算，而那个开关
+          // 还会强制 temperature=1。这里照单全收，是为了让已经在网关那侧
+          // 开了思考的渠道也能把内容显示出来。
+          final value = delta?['thinking']?.toString() ?? '';
+          clock.think();
+          reasoning.write(value);
+          onReasoning(value);
         } else if (delta?['type'] == 'input_json_delta') {
           partial.putIfAbsent(index, _PartialToolCall.new).args.write(
                 delta?['partial_json']?.toString() ?? '',
@@ -1050,6 +1172,21 @@ class ConfigurableLlmClient
               ))
           .toList(),
       usage: usage.isEmpty ? null : usage,
+      reasoning: reasoning.toString(),
+      reasoningMs: clock.ms,
+    );
+  }
+
+  /// 这一轮的失败是不是"思考强度这个旋钮惹的"。是的话换一句人话抛出去。
+  ///
+  /// 检查放在**抛错之前**而不是让原始报错直出：原始那句只提到一个字段名，
+  /// 而用户看不到请求体，没法把它和自己在设置页调过的档位对上。
+  void _rejectIfThinkingEffort(String body) {
+    if (config.thinkingEffort == ThinkingEffort.auto) return;
+    if (!isThinkingEffortRejected(body)) return;
+    throw http.ClientException(
+      '这个模型不支持「思考强度」（当前设为「${config.thinkingEffort.label}」）。\n\n'
+      '把设置里的思考强度调回「自动」，或者换一个会思考的模型。',
     );
   }
 
@@ -1067,8 +1204,11 @@ class ConfigurableLlmClient
   Future<LlmTurn> _readStream(
     http.ByteStream stream,
     void Function(String) onDelta,
+    void Function(String) onReasoning,
   ) async {
     final text = StringBuffer();
+    final reasoning = StringBuffer();
+    final clock = _ThinkClock();
     TokenUsage? usage;
 
     // 工具调用是**分片到达**的：id 和 name 在第一片，arguments 逐字符累加。
@@ -1098,8 +1238,16 @@ class ConfigurableLlmClient
       final delta =
           (choices.first as Map)['delta'] as Map<String, Object?>? ?? {};
 
+      final thought = openAiReasoningOf(delta);
+      if (thought.isNotEmpty) {
+        clock.think();
+        reasoning.write(thought);
+        onReasoning(thought);
+      }
+
       final content = delta['content'] as String?;
       if (content != null && content.isNotEmpty) {
+        clock.answer();
         text.write(content);
         onDelta(content);
       }
@@ -1132,6 +1280,8 @@ class ConfigurableLlmClient
       text: text.toString(),
       toolCalls: toolCalls,
       usage: usage,
+      reasoning: reasoning.toString(),
+      reasoningMs: clock.ms,
     );
   }
 
@@ -1254,6 +1404,8 @@ class ConfigurableLlmClient
           ],
           tools: const [],
           onDelta: (_) {},
+          // 摘要只要正文。思考丢掉 —— 它是给用户看的过程，不是摘要的素材。
+          onReasoning: (_) {},
           model: config.summaryModelOrDefault,
         );
         return result.text.trim();
@@ -1329,6 +1481,35 @@ class _PartialToolCall {
   String id = '';
   String name = '';
   final StringBuffer args = StringBuffer();
+}
+
+/// 「想了多久」的秒表。
+///
+/// 量的是**第一段思考到第一段正文**之间的墙上时间，不是整轮耗时 ——
+/// 后者还含着答案本身的生成时间和工具往返，而用户看这个数字时想知道的
+/// 只有一件事：它在开口之前琢磨了多久。
+///
+/// 没有思考就一直是 0，UI 据此不显示。
+class _ThinkClock {
+  DateTime? _start;
+  int _ms = 0;
+
+  /// 收到一段思考。只有第一次有效。
+  void think() => _start ??= DateTime.now();
+
+  /// 收到一段正文 —— 思考到此为止。
+  void answer() {
+    final start = _start;
+    if (start != null && _ms == 0) {
+      _ms = DateTime.now().difference(start).inMilliseconds;
+    }
+  }
+
+  /// 有的回合想完就结束了（只有工具调用、没有正文），这时收尾即结算。
+  int get ms {
+    answer();
+    return _ms;
+  }
 }
 
 /// 修复并解析工具调用参数。

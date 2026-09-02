@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 8 起的自适应图标。启动器拿这两层去套自己的形状遮罩（圆形、
+  方形、水滴……），所以前景**不能**画满 —— 108dp 画布里只有中间那块一定
+  可见，边缘会被啃掉。前景 PNG 已经按安全区缩进过了，见 tool/make_icons.py。
+
+  背景是纯色，而且刻意取的就是图标方块自己的底色：这样方块的圆角落在
+  背景上是看不见的，无论启动器把它切成什么形状都不会露出一圈方角。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

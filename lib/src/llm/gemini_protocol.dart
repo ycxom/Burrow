@@ -290,6 +290,25 @@ class GroundingSource {
   int get hashCode => Object.hash(uri, title);
 }
 
+/// 这个模型认不认 `thinkingConfig`。
+///
+/// **必须先判再发。** 不支持的模型（2.0 和更老）收到这个字段会直接 400
+/// 退回来，整轮对话失败 —— 为了一个"顺带显示思考"的功能把发消息弄坏，
+/// 是明显不划算的交易。
+///
+/// 判据是模型名里的代次。按名字猜确实脆，但另外两条路更差：探测一次要多打
+/// 一个来回，而维护一张模型白名单意味着 Google 每发一个新模型就得改代码，
+/// 漏改的表现是"新模型没有思考"—— 那比误判更难被发现。
+bool geminiSupportsThoughts(String model) {
+  final name = model.toLowerCase();
+  // 2.5 是第一代吐思考摘要的。3 及以后按代次号往上算，避免每出一个新版本
+  // 就回来加一条。
+  if (name.contains('gemini-2.5')) return true;
+  final match = RegExp(r'gemini-(\d+)').firstMatch(name);
+  if (match == null) return false;
+  return (int.tryParse(match.group(1)!) ?? 0) >= 3;
+}
+
 /// 从一个 Gemini `GenerateContentResponse` 里取出文本、工具调用和用量。
 class GeminiTurnChunk {
   const GeminiTurnChunk({
@@ -298,9 +317,16 @@ class GeminiTurnChunk {
     this.usage,
     this.queries = const <String>[],
     this.sources = const <GroundingSource>[],
+    this.reasoning = '',
   });
 
   final String text;
+
+  /// 带 `thought: true` 的那些分片拼起来 —— 模型的思考摘要。
+  ///
+  /// 和 [text] 分开是因为它们在同一个 `parts` 数组里混着来，只有这个布尔位
+  /// 能区分。混进正文的话，用户会看到模型把自己的草稿当答案念出来。
+  final String reasoning;
   final List<ToolCall> calls;
   final TokenUsage? usage;
 
@@ -371,6 +397,7 @@ String formatGroundingSources(
 GeminiTurnChunk parseGeminiResponse(Map<String, Object?> json) {
   final candidates = json['candidates'];
   final text = StringBuffer();
+  final reasoning = StringBuffer();
   final calls = <ToolCall>[];
   var queries = const <String>[];
   var sources = const <GroundingSource>[];
@@ -388,7 +415,11 @@ GeminiTurnChunk parseGeminiResponse(Map<String, Object?> json) {
           for (final part in parts) {
             if (part is! Map) continue;
             final value = part['text'];
-            if (value is String) text.write(value);
+            // `thought: true` 标记这一片是思考而不是回答。判断要在写入之前 ——
+            // Gemini 把两者塞在同一个 parts 数组里，顺序上也交错。
+            if (value is String) {
+              (part['thought'] == true ? reasoning : text).write(value);
+            }
 
             final call = part['functionCall'];
             if (call is Map) {
@@ -417,6 +448,7 @@ GeminiTurnChunk parseGeminiResponse(Map<String, Object?> json) {
     usage: parseGeminiUsage(json['usageMetadata']),
     queries: queries,
     sources: sources,
+    reasoning: reasoning.toString(),
   );
 }
 
