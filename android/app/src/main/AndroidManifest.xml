@@ -43,5 +43,13 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- OAuth 回跳登录要把授权页交给外部浏览器。API 30 起，没有声明
+             这条的话 startActivity(ACTION_VIEW) 会因为包可见性限制找不到
+             任何浏览器 —— 表现是"点了登录什么都没发生"。 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <category android:name="android.intent.category.BROWSABLE"/>
+            <data android:scheme="https"/>
+        </intent>
     </queries>
 </manifest>

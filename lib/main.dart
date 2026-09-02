@@ -5,6 +5,7 @@
 /// （这里确实有一个 if：发行版装没装。那是环境事实，不是业务判断。）
 library;
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -265,6 +266,21 @@ Future<void> _boot({
   llm.chatGptAccountIdProvider = () async {
     final channel = channels.active;
     return channel == null ? null : accounts.credentialFor(channel)?.accountId;
+  };
+
+  // ChatGPT 的真实余量只出现在聊天响应头上，没有独立的查询接口。所以它是
+  // 反向推进来的：客户端读到头就回调，我们记到**当时那个渠道绑的账号**上。
+  //
+  // 现取 channels.active 而不是闭包里存一份：一次请求发出去到响应回来之间，
+  // 用户完全可能已经切了渠道，记到新渠道头上就是错的账。
+  llm.onRateLimit = (quota) {
+    final channel = channels.active;
+    if (channel == null || !channel.usesOAuth) return;
+    unawaited(accounts.noteQuota(
+      channel.oauthProviderId!,
+      channel.oauthAccountId!,
+      quota,
+    ));
   };
 
   // Skill 装在 rootfs 的 /opt/burrow-skills 里，索引留在 app 私有目录 ——

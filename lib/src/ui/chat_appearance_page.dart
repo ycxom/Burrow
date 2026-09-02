@@ -880,6 +880,17 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
             value: store.showMessageAvatars,
             onChanged: store.setShowMessageAvatars,
           ),
+          const Divider(height: 1),
+          SwitchListTile(
+            secondary: const Icon(Icons.data_usage_rounded),
+            title: const Text('显示 token 用量'),
+            subtitle: const Text(
+              '气泡里显示 ↑上下文 ↓生成。服务端没回报时，'
+              '自己发的那条显示 ~估算值',
+            ),
+            value: store.showTokenUsage,
+            onChanged: store.setShowTokenUsage,
+          ),
         ],
       ),
     );

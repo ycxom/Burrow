@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:burrow/src/agent/tools.dart';
 import 'package:burrow/src/context/overflow_manager.dart';
 import 'package:burrow/src/llm/llm_client.dart';
+import 'package:burrow/src/llm/model_catalog.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -265,5 +266,148 @@ void main() {
     final body = jsonDecode(captured.body) as Map<String, Object?>;
     expect(body['instructions'], '指令');
     expect((body['tools'] as List).first, containsPair('name', 'read_file'));
+  });
+
+  group('Gemini 地址拼装', () {
+    test('v1beta 是版本段 —— 不能再补 /v1', () {
+      // 只认 v+纯数字的话，.../v1beta 会被判成"没有版本段"，
+      // 于是拼出 .../v1beta/v1/models，404。
+      expect(endsWithVersionSegment('https://x.com/v1beta'), isTrue);
+      expect(endsWithVersionSegment('https://x.com/v2alpha'), isTrue);
+      expect(endsWithVersionSegment('https://x.com/v1'), isTrue);
+      expect(endsWithVersionSegment('https://x.com/v4'), isTrue);
+      // v 后面第一个字符必须是数字，否则 /video 这种会被误判。
+      expect(endsWithVersionSegment('https://x.com/video'), isFalse);
+      expect(endsWithVersionSegment('https://x.com/openai'), isFalse);
+    });
+
+    test('/openai 兼容层本身就是 API 根', () {
+      expect(looksLikeApiRoot(geminiOpenAiBaseUrl), isTrue);
+      expect(
+        resolveApiEndpoint(geminiOpenAiBaseUrl, '/chat/completions').toString(),
+        'https://generativelanguage.googleapis.com/v1beta/openai'
+        '/chat/completions',
+      );
+      expect(
+        buildModelsUrlCandidates(geminiOpenAiBaseUrl).first,
+        'https://generativelanguage.googleapis.com/v1beta/openai/models',
+      );
+    });
+
+    test('三种写错的 Gemini 地址都能被纠正', () {
+      // 每一种的失败方式都不一样，而 401 会把人引到"是不是密钥不对"上去 ——
+      // 那是条死路，密钥是好的。所以三种都要认出来。
+      const wrong = <String>[
+        // 从 Google 文档复制的原生端点 → 404
+        'https://generativelanguage.googleapis.com'
+            '/v1beta/models/gemini-flash-latest:generateContent',
+        // 裸主机名 → 拼成 /v1/models，原生列表端点不认 Bearer → 401
+        'https://generativelanguage.googleapis.com',
+        // 只到 v1beta → 同上，401
+        'https://generativelanguage.googleapis.com/v1beta',
+        // 末尾带斜杠也要认
+        'https://generativelanguage.googleapis.com/v1beta/',
+      ];
+      for (final url in wrong) {
+        expect(geminiBaseUrlFix(url), geminiOpenAiBaseUrl, reason: url);
+      }
+    });
+
+    test('已经对了的地址不再改', () {
+      expect(geminiBaseUrlFix(geminiOpenAiBaseUrl), isNull);
+      expect(geminiBaseUrlFix('$geminiOpenAiBaseUrl/'), isNull);
+    });
+
+    test('拉模型列表时直接说该填什么，不去猜路径', () {
+      expect(
+        () => buildModelsUrlCandidates(
+            'https://generativelanguage.googleapis.com'),
+        throwsA(
+          isA<ModelFetchException>().having(
+            (e) => e.toString(),
+            'message',
+            contains(geminiOpenAiBaseUrl),
+          ),
+        ),
+      );
+      // 地址对了就正常走，不该被拦。
+      expect(
+        buildModelsUrlCandidates(geminiOpenAiBaseUrl).first,
+        '$geminiOpenAiBaseUrl/models',
+      );
+    });
+
+    test('别家的地址不受影响', () {
+      expect(geminiBaseUrlFix('https://api.openai.com/v1'), isNull);
+      expect(geminiBaseUrlFix('http://192.168.1.2:3000'), isNull);
+      expect(
+        resolveApiEndpoint('https://api.deepseek.com', '/chat/completions')
+            .toString(),
+        'https://api.deepseek.com/v1/chat/completions',
+      );
+      expect(
+        resolveApiEndpoint('https://open.bigmodel.cn/api/paas/v4',
+                '/chat/completions')
+            .toString(),
+        'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      );
+    });
+
+    test('两层 Gemini 各有各的根，切协议时跟着换', () {
+      // 原生层：任何写法都收敛到 /v1beta。
+      for (final url in <String>[
+        'https://generativelanguage.googleapis.com',
+        'https://generativelanguage.googleapis.com/v1beta/openai',
+        'https://generativelanguage.googleapis.com'
+            '/v1beta/models/gemini-flash-latest:generateContent',
+      ]) {
+        expect(
+          geminiBaseUrlFix(url, apiFormat: 'geminiNative'),
+          geminiNativeBaseUrl,
+          reason: url,
+        );
+      }
+      expect(
+        geminiBaseUrlFix(geminiNativeBaseUrl, apiFormat: 'geminiNative'),
+        isNull,
+      );
+
+      // 反过来：原生层的地址配上兼容层协议，也要被拨回去。
+      expect(
+        geminiBaseUrlFix(geminiNativeBaseUrl, apiFormat: 'openAI'),
+        geminiOpenAiBaseUrl,
+      );
+    });
+
+    test('原生层的认证头不是 Bearer', () {
+      // 拿错头的表现是 401 —— 而 401 看起来就是"密钥不对"，会让人去换密钥。
+      expect(
+        geminiAuthHeaders('k', apiFormat: 'geminiNative'),
+        <String, String>{'x-goog-api-key': 'k'},
+      );
+      expect(
+        geminiAuthHeaders('k'),
+        <String, String>{'Authorization': 'Bearer k'},
+      );
+      expect(geminiAuthHeaders('', apiFormat: 'geminiNative'), isEmpty);
+    });
+
+    test('原生层的模型列表只有一个端点，不去猜第二个', () {
+      expect(
+        buildModelsUrlCandidates(geminiNativeBaseUrl,
+            apiFormat: 'geminiNative'),
+        <String>['$geminiNativeBaseUrl/models'],
+      );
+    });
+
+    test('原生层的模型 id 要去掉 models/ 前缀', () {
+      // 带着前缀发出去会拼成 /models/models/xxx:streamGenerateContent → 404。
+      final models = parseModelsResponse(
+        '{"models":[{"name":"models/gemini-2.5-pro"},'
+        '{"name":"models/gemini-flash-latest"}]}',
+      );
+      expect(models.map((m) => m.id).toList(),
+          <String>['gemini-2.5-pro', 'gemini-flash-latest']);
+    });
   });
 }

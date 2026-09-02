@@ -27,6 +27,8 @@ import '../agent/agent_loop.dart';
 import 'image_parts.dart';
 import 'system_prompt.dart';
 import '../agent/tools.dart';
+import 'gemini_protocol.dart';
+import 'oauth.dart';
 import '../context/overflow_manager.dart';
 
 class LlmConfig {
@@ -75,6 +77,14 @@ class LlmConfig {
   /// 系统提示词怎么送。不认 `role: system` 的服务改成拼进第一条用户消息。
   final SystemPromptStyle systemPromptStyle;
 
+  /// 让模型自己联网搜索（Gemini 的 `google_search` 内置工具）。
+  ///
+  /// **只有 Gemini 原生层有这个东西。** OpenAI 兼容层不提供 —— 在那边把
+  /// `{"google_search":{}}` 塞进 `tools` 会被当成函数声明去校验，直接
+  /// `Unknown name 'google_search'`。所以这个开关在别的协议上是死的，
+  /// 界面上也只在原生协议下才显示。
+  final bool webSearch;
+
   const LlmConfig({
     this.apiFormat = 'openAI',
     required this.baseUrl,
@@ -86,6 +96,7 @@ class LlmConfig {
     this.streamOutput = true,
     this.sendImagesInline = false,
     this.systemPromptStyle = SystemPromptStyle.systemRole,
+    this.webSearch = false,
   });
 
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
@@ -105,6 +116,7 @@ class LlmConfig {
     bool? streamOutput,
     bool? sendImagesInline,
     SystemPromptStyle? systemPromptStyle,
+    bool? webSearch,
   }) =>
       LlmConfig(
         apiFormat: apiFormat ?? this.apiFormat,
@@ -117,6 +129,7 @@ class LlmConfig {
         streamOutput: streamOutput ?? this.streamOutput,
         sendImagesInline: sendImagesInline ?? this.sendImagesInline,
         systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
+        webSearch: webSearch ?? this.webSearch,
       );
 }
 
@@ -291,6 +304,22 @@ class ConfigurableLlmClient
     // 放到各自的 body 拼装里就得把整条链路改成异步 map，很难看。
     final images = await _loadImages(prepared);
 
+    if (config.apiFormat == 'gemini') {
+      return _completeCodeAssist(
+        messages: prepared,
+        tools: tools,
+        onDelta: onDelta,
+        images: images,
+      );
+    }
+    if (config.apiFormat == 'geminiNative') {
+      return _completeGeminiNative(
+        messages: prepared,
+        tools: tools,
+        onDelta: onDelta,
+        images: images,
+      );
+    }
     if (config.apiFormat == 'anthropic') {
       return _completeAnthropic(
         messages: prepared,
@@ -395,7 +424,23 @@ class ConfigurableLlmClient
       throw http.ClientException(
           'LLM 返回 ${response.statusCode}: ${_brief(body)}');
     }
+    // ChatGPT 唯一能拿到**真实余量**的地方就是这里的响应头 —— 没有独立的
+    // 查询接口。所以余量是"聊过一句之后才知道"，而不是登录完就有。
+    _reportRateLimit(response.headers);
     return _readResponsesStream(response.stream, onDelta);
+  }
+
+  /// 从响应头里读到用量时回调出去。由 main.dart 接到 AccountStore 上。
+  ///
+  /// 用回调而不是让客户端直接写 AccountStore：这一层不该认识账号存储，
+  /// 它只知道"刚才那次请求的响应头长这样"。
+  void Function(AccountQuota quota)? onRateLimit;
+
+  void _reportRateLimit(Map<String, String> headers) {
+    final sink = onRateLimit;
+    if (sink == null) return;
+    final quota = parseCodexRateLimit(headers, plan: 'ChatGPT');
+    if (quota != null) sink(quota);
   }
 
   Future<LlmTurn> _readResponsesStream(
@@ -404,6 +449,7 @@ class ConfigurableLlmClient
   ) async {
     final text = StringBuffer();
     final calls = <String, _PartialToolCall>{};
+    TokenUsage? usage;
     await for (final line
         in stream.transform(utf8.decoder).transform(const LineSplitter())) {
       if (!line.startsWith('data:')) continue;
@@ -416,6 +462,12 @@ class ConfigurableLlmClient
         continue;
       }
       final type = event['type'];
+      if (type == 'response.completed' || type == 'response.incomplete') {
+        // 用量挂在 response 对象上，只有收尾事件里有。
+        final response = event['response'] as Map<String, Object?>?;
+        final reported = TokenUsage.fromResponses(response?['usage']);
+        if (reported != null) usage = reported;
+      }
       if (type == 'response.output_text.delta') {
         final delta = event['delta']?.toString() ?? '';
         if (delta.isNotEmpty) {
@@ -457,6 +509,7 @@ class ConfigurableLlmClient
                 args: repairAndDecode(call.args.toString()),
               ))
           .toList(),
+      usage: usage,
     );
   }
 
@@ -480,11 +533,38 @@ class ConfigurableLlmClient
         'temperature': config.temperature,
         'stream': config.streamOutput,
         'messages': messages.map((m) => _toWire(m, images)).toList(),
+        // 流式下服务端默认**不**回报用量，要显式要一次，它才会在最后补一个
+        // choices 为空、只带 usage 的块。非流式无条件返回，不用要。
+        //
+        // 少数严格的网关会因为不认识这个字段直接 400 —— 那种情况下面会
+        // 摘掉它重发一次（见 _retryWithoutStreamOptions）。
+        if (config.streamOutput && !_streamUsageUnsupported)
+          'stream_options': <String, Object?>{'include_usage': true},
         if (tools.isNotEmpty)
           'tools': tools.map((t) => t.toOpenAiJson()).toList(),
       });
 
-    final response = await _http.send(request);
+    var response = await _http.send(request);
+
+    // 只在"确实是因为 stream_options 被拒"时重试一次，然后记住这个渠道不支持，
+    // 之后不再带它。宽泛地对所有 400 重试会把真正的错误（模型名不对、
+    // 鉴权失败）也吞掉一次，让排查变慢一倍。
+    if (response.statusCode == 400 && !_streamUsageUnsupported) {
+      final body = await response.stream.bytesToString();
+      if (body.contains('stream_options')) {
+        _streamUsageUnsupported = true;
+        return _completeOpenAi(
+          messages: messages,
+          tools: tools,
+          onDelta: onDelta,
+          images: images,
+        );
+      }
+      if (_guard.isContextLimitError(400, body)) {
+        throw ContextOverflowException(400, body);
+      }
+      throw http.ClientException('LLM 返回 400: ${_brief(body)}');
+    }
 
     if (response.statusCode >= 400) {
       final body = await response.stream.bytesToString();
@@ -519,7 +599,300 @@ class ConfigurableLlmClient
         })
         .where((call) => call.name.isNotEmpty)
         .toList();
-    return LlmTurn(text: text, toolCalls: calls);
+    return LlmTurn(
+      text: text,
+      toolCalls: calls,
+      usage: TokenUsage.fromOpenAi(body['usage']),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Google Code Assist（Gemini 原生格式 + v1internal 包装）
+  // -------------------------------------------------------------------------
+
+  /// Code Assist 替这个账号托管的项目号。
+  ///
+  /// 不是用户填的，是登录后用 `:loadCodeAssist` 问出来的 —— 那正是这条路
+  /// "不需要 GCP 项目"的原因。问一次就缓存在这个客户端实例里：换渠道会新建
+  /// 客户端，而项目号是跟着账号走的。
+  String? _codeAssistProject;
+
+  Future<String> _ensureCodeAssistProject() async {
+    final cached = _codeAssistProject;
+    if (cached != null) return cached;
+
+    // 这个协议只认 Code Assist 的内部接口。指向别处时**立刻说清楚** ——
+    // 不拦的话会去打一个不存在的 `:loadCodeAssist`，拿到 404，而 404 只会让人
+    // 以为是地址少了一段，接着去试各种路径。真正的问题是协议选错了。
+    if (!config.baseUrl.contains('cloudcode-pa.googleapis.com')) {
+      throw http.ClientException(
+        '「Code Assist」协议只能连 cloudcode-pa.googleapis.com，'
+        '当前地址是 ${config.baseUrl}。\n\n'
+        '要用 Gemini API（API Key）的话，协议选「OpenAI 兼容」，'
+        'Base URL 填：$geminiOpenAiBaseUrl',
+      );
+    }
+
+    final auth = await _authValue();
+    Map<String, String> headers() => <String, String>{
+          'Content-Type': 'application/json',
+          if (auth.isNotEmpty) 'Authorization': 'Bearer $auth',
+        };
+
+    final loaded = await _http.send(
+      http.Request('POST', Uri.parse('${config.baseUrl}:loadCodeAssist'))
+        ..headers.addAll(headers())
+        ..body = jsonEncode(<String, Object?>{
+          'metadata': <String, Object?>{'pluginType': 'GEMINI'},
+        }),
+    );
+    final loadedBody = await loaded.stream.bytesToString();
+    if (loaded.statusCode >= 400) {
+      throw http.ClientException(
+        'Code Assist 初始化失败：HTTP ${loaded.statusCode} ${_brief(loadedBody)}\n'
+        '这个接口要求账号已经接受过 Gemini Code Assist 的条款。'
+        '可以先用 gemini-cli 或网页版登录一次再回来。',
+      );
+    }
+
+    final json = jsonDecode(loadedBody);
+    if (json is Map) {
+      final project = json['cloudaicompanionProject'];
+      if (project is String && project.isNotEmpty) {
+        _codeAssistProject = project;
+        return project;
+      }
+
+      // 免费额度被判为不可用时**不要再去 onboard**。
+      //
+      // 实测 Google 已经把 gemini-cli 这类客户端从"个人免费额度"里切掉了，
+      // 返回里 free-tier 带着 `UNSUPPORTED_CLIENT`。这种情况下 onboardUser
+      // 一定失败，而它的报错只说"参数无效"，看不出真正的原因 —— 而真正的
+      // 原因就写在这里，原样带出去。
+      final ineligible = json['ineligibleTiers'];
+      if (ineligible is List && ineligible.isNotEmpty) {
+        final first = ineligible.first;
+        final reason = first is Map
+            ? (first['reasonMessage'] ?? first['reasonCode'])?.toString()
+            : null;
+        throw http.ClientException(
+          'Google 拒绝了这个账号的 Code Assist 免费额度：\n'
+          '${reason ?? '未说明原因'}\n\n'
+          '可以改用「Vertex AI（自己的项目）」那种登录方式。',
+        );
+      }
+    }
+
+    // 没有项目号、也没说不可用 = 这个账号还没开通过。走一次 onboard。
+    return _onboardCodeAssist(headers);
+  }
+
+  /// 首次使用时的开通。返回 Google 分配的项目号。
+  ///
+  /// 它是个长时操作（LRO）：第一次调用多半返回 `done: false`，要隔几秒再问。
+  /// 不轮询的话表现是"第一次登录后必失败、第二次莫名其妙就好了"。
+  Future<String> _onboardCodeAssist(Map<String, String> Function() headers) async {
+    const maxAttempts = 10;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      final response = await _http.send(
+        http.Request('POST', Uri.parse('${config.baseUrl}:onboardUser'))
+          ..headers.addAll(headers())
+          ..body = jsonEncode(<String, Object?>{
+            'tierId': 'free-tier',
+            'metadata': <String, Object?>{'pluginType': 'GEMINI'},
+          }),
+      );
+      final body = await response.stream.bytesToString();
+      if (response.statusCode >= 400) {
+        throw http.ClientException(
+            '开通 Code Assist 失败：HTTP ${response.statusCode} ${_brief(body)}');
+      }
+      final json = jsonDecode(body);
+      if (json is Map) {
+        if (json['done'] == true) {
+          final inner = json['response'];
+          final project = inner is Map ? inner['cloudaicompanionProject'] : null;
+          final id = project is Map ? project['id'] : project;
+          if (id is String && id.isNotEmpty) {
+            _codeAssistProject = id;
+            return id;
+          }
+        }
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+    throw http.ClientException('开通 Code Assist 超时，请稍后重试');
+  }
+
+  /// Gemini 的请求体。原生层直接发它，Code Assist 再包一层。
+  Map<String, Object?> _geminiRequestBody({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required Map<String, InlineImage> images,
+  }) {
+    final wire = geminiTools(tools, webSearch: config.webSearch);
+    return <String, Object?>{
+      'contents': geminiContents(messages, images),
+      if (geminiSystemInstruction(messages) != null)
+        'systemInstruction': geminiSystemInstruction(messages),
+      if (wire.isNotEmpty) 'tools': wire,
+      'generationConfig': <String, Object?>{
+        'temperature': config.temperature,
+      },
+    };
+  }
+
+  /// Gemini 原生 REST（API Key）。
+  ///
+  /// 和 Code Assist 走的是同一套线格式，差别只有三处：请求体不包
+  /// `{model, project, request}`、认证头是 `x-goog-api-key` 而不是 Bearer、
+  /// 模型名在 URL 里而不在 body 里。
+  ///
+  /// **这条路存在的理由是联网搜索。** 兼容层（`openAI` 协议）连 Gemini 更省事，
+  /// 但它拿不到 `google_search` —— 见 [LlmConfig.webSearch]。
+  Future<LlmTurn> _completeGeminiNative({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required void Function(String delta) onDelta,
+    Map<String, InlineImage> images = const <String, InlineImage>{},
+  }) async {
+    final key = await _authValue();
+    var root = config.baseUrl.trim();
+    while (root.endsWith('/')) {
+      root = root.substring(0, root.length - 1);
+    }
+
+    final endpoint = Uri.parse(
+        '$root/models/${config.model}:streamGenerateContent?alt=sse');
+    final httpRequest = http.Request('POST', endpoint)
+      ..headers.addAll(<String, String>{
+        'Content-Type': 'application/json',
+        // 原生层**不认 Bearer**。用错的表现是 401，而 401 看起来就是密钥不对。
+        ...geminiAuthHeaders(key, apiFormat: 'geminiNative'),
+      })
+      ..body = jsonEncode(_geminiRequestBody(
+        messages: messages,
+        tools: tools,
+        images: images,
+      ));
+
+    final response = await _http.send(httpRequest);
+    if (response.statusCode >= 400) {
+      final body = await response.stream.bytesToString();
+      if (_guard.isContextLimitError(response.statusCode, body)) {
+        throw ContextOverflowException(response.statusCode, body);
+      }
+      if (config.webSearch && isGeminiToolMixError(body)) {
+        throw http.ClientException(
+          '这个模型不允许「联网搜索」和「工具调用」同时开。\n\n'
+          'Gemini 3 之前的模型（2.5 及更老）只能二选一。要么换成 Gemini 3 '
+          '系列，要么在渠道里关掉这个模型的联网搜索、或者关掉终端模式。',
+        );
+      }
+      // 配额说明放在**截断之前**。Google 把套话写在前面、把"哪个配额满了"
+      // 写在最后，照原样截断的话留下的全是套话。
+      final quota = describeGoogleQuota(body);
+      throw http.ClientException(
+        'LLM 返回 ${response.statusCode}: '
+        '${quota.isEmpty ? '' : '$quota\n\n'}${_brief(body)}',
+      );
+    }
+
+    return _readGeminiStream(response, onDelta: onDelta, codeAssist: false);
+  }
+
+  Future<LlmTurn> _completeCodeAssist({
+    required List<ChatMessage> messages,
+    required List<ToolSpec> tools,
+    required void Function(String delta) onDelta,
+    Map<String, InlineImage> images = const <String, InlineImage>{},
+  }) async {
+    final project = await _ensureCodeAssistProject();
+    final auth = await _authValue();
+
+    // 非流式也走 streamGenerateContent：这个内部接口的非流式端点行为和文档
+    // 对不上（有时返回数组、有时返回单对象），而流式那条是 gemini-cli 天天在
+    // 跑的路径。统一走它，非流式只是不往 onDelta 里喂增量。
+    final endpoint = Uri.parse('${config.baseUrl}:streamGenerateContent?alt=sse');
+    final httpRequest = http.Request('POST', endpoint)
+      ..headers.addAll(<String, String>{
+        'Content-Type': 'application/json',
+        if (auth.isNotEmpty) 'Authorization': 'Bearer $auth',
+      })
+      ..body = jsonEncode(wrapCodeAssistRequest(
+        model: config.model,
+        project: project,
+        request: _geminiRequestBody(
+          messages: messages,
+          tools: tools,
+          images: images,
+        ),
+      ));
+
+    final response = await _http.send(httpRequest);
+    if (response.statusCode >= 400) {
+      final body = await response.stream.bytesToString();
+      if (_guard.isContextLimitError(response.statusCode, body)) {
+        throw ContextOverflowException(response.statusCode, body);
+      }
+      throw http.ClientException(
+          'LLM 返回 ${response.statusCode}: ${_brief(body)}');
+    }
+
+    return _readGeminiStream(response, onDelta: onDelta, codeAssist: true);
+  }
+
+  /// 读一条 Gemini 的 SSE 流。两条路径唯一的差别是要不要剥 `response` 壳。
+  Future<LlmTurn> _readGeminiStream(
+    http.StreamedResponse response, {
+    required void Function(String delta) onDelta,
+    required bool codeAssist,
+  }) async {
+    final text = StringBuffer();
+    final calls = <ToolCall>[];
+    TokenUsage? usage;
+    final queries = <String>[];
+    final sources = <GroundingSource>[];
+
+    await for (final line in response.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())) {
+      final event = decodeSseData(line);
+      if (event == null) continue;
+      final chunk = parseGeminiResponse(
+          codeAssist ? unwrapCodeAssistResponse(event) : event);
+      if (chunk.text.isNotEmpty) {
+        text.write(chunk.text);
+        if (config.streamOutput) onDelta(chunk.text);
+      }
+      calls.addAll(chunk.calls);
+      // 用量是**累计值**（每个块报的都是到目前为止的总数），所以覆盖而不是累加。
+      if (chunk.usage != null) usage = chunk.usage;
+      // 来源在流里是**逐块累积**的，后面的块会把前面报过的再报一遍 —— 去重。
+      for (final q in chunk.queries) {
+        if (!queries.contains(q)) queries.add(q);
+      }
+      for (final source in chunk.sources) {
+        if (!sources.contains(source)) sources.add(source);
+      }
+    }
+
+    // 来源附在正文末尾，**只在流结束后追加一次**。边收边追加的话，后面的块
+    // 还会带来新的来源，界面上就会看到来源列表反复重画、越长越多。
+    final citations = formatGroundingSources(sources, queries);
+    if (citations.isNotEmpty) {
+      text.write(citations);
+      if (config.streamOutput) onDelta(citations);
+    }
+
+    // 非流式时一次性把正文喂过去，保持和另外几条路径一样的回调契约。
+    if (!config.streamOutput && text.isNotEmpty) onDelta(text.toString());
+
+    return LlmTurn(
+      text: text.toString(),
+      toolCalls: calls,
+      usage: usage,
+    );
   }
 
   Future<LlmTurn> _completeAnthropic({
@@ -604,7 +977,11 @@ class ConfigurableLlmClient
             ))
         .where((call) => call.name.isNotEmpty)
         .toList();
-    return LlmTurn(text: text, toolCalls: calls);
+    return LlmTurn(
+      text: text,
+      toolCalls: calls,
+      usage: TokenUsage.fromAnthropic(body['usage']),
+    );
   }
 
   Future<LlmTurn> _readAnthropicStream(
@@ -613,6 +990,9 @@ class ConfigurableLlmClient
   ) async {
     final text = StringBuffer();
     final partial = <int, _PartialToolCall>{};
+    // Anthropic 把用量拆成两半送：input 在 message_start，output 在
+    // message_delta。所以要边收边并，不能等某一个事件一次读全。
+    var usage = const TokenUsage();
     await for (final line
         in stream.transform(utf8.decoder).transform(const LineSplitter())) {
       if (!line.startsWith('data:')) continue;
@@ -626,7 +1006,14 @@ class ConfigurableLlmClient
       }
       final type = event['type'];
       final index = (event['index'] as num?)?.toInt() ?? 0;
-      if (type == 'content_block_start') {
+      if (type == 'message_start') {
+        final message = event['message'] as Map<String, Object?>?;
+        final reported = TokenUsage.fromAnthropic(message?['usage']);
+        if (reported != null) usage = usage + reported;
+      } else if (type == 'message_delta') {
+        final reported = TokenUsage.fromAnthropic(event['usage']);
+        if (reported != null) usage = usage + reported;
+      } else if (type == 'content_block_start') {
         final block = event['content_block'] as Map<String, Object?>?;
         if (block?['type'] == 'tool_use') {
           final slot = partial.putIfAbsent(index, _PartialToolCall.new);
@@ -662,6 +1049,7 @@ class ConfigurableLlmClient
                 args: repairAndDecode(entry.value.args.toString()),
               ))
           .toList(),
+      usage: usage.isEmpty ? null : usage,
     );
   }
 
@@ -670,11 +1058,18 @@ class ConfigurableLlmClient
   /// 所以不会分裂。
   final _guard = _ErrorSniffer();
 
+  /// 这个接入点不认 `stream_options`。撞过一次就记住，别每轮都去撞。
+  ///
+  /// 只活在本实例内：换渠道会新建客户端，而"这个网关支不支持"是接入点的属性，
+  /// 持久化下来在用户换了后端之后反而是错的。
+  bool _streamUsageUnsupported = false;
+
   Future<LlmTurn> _readStream(
     http.ByteStream stream,
     void Function(String) onDelta,
   ) async {
     final text = StringBuffer();
+    TokenUsage? usage;
 
     // 工具调用是**分片到达**的：id 和 name 在第一片，arguments 逐字符累加。
     // 必须按 index 攒起来，不能收到一片就当一次调用。
@@ -692,6 +1087,11 @@ class ConfigurableLlmClient
       } catch (_) {
         continue; // 心跳或注释行，跳过
       }
+
+      // 用量在**最后一个块**里，而那个块的 choices 是空的 —— 先读它，
+      // 否则下面那句 continue 会把它整个跳过。
+      final reported = TokenUsage.fromOpenAi(chunk['usage']);
+      if (reported != null) usage = reported;
 
       final choices = chunk['choices'] as List?;
       if (choices == null || choices.isEmpty) continue;
@@ -728,7 +1128,11 @@ class ConfigurableLlmClient
       ));
     }
 
-    return LlmTurn(text: text.toString(), toolCalls: toolCalls);
+    return LlmTurn(
+      text: text.toString(),
+      toolCalls: toolCalls,
+      usage: usage,
+    );
   }
 
   /// 让**这个客户端配的模型**描述几张图，返回一段纯文本。

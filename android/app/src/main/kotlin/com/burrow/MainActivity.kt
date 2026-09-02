@@ -28,6 +28,35 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
+            SYSTEM_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                // OAuth 回跳登录要把授权页交给**外部浏览器**。不能用 WebView：
+                // Google 会以 disallowed_useragent 直接拒绝，理由是 WebView 里
+                // 宿主 app 能读到用户输入的密码。
+                "openUrl" -> {
+                    val url = call.argument<String>("url")
+                    if (url.isNullOrBlank()) {
+                        result.error("bad_url", "缺少 url", null)
+                    } else {
+                        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        try {
+                            startActivity(intent)
+                            result.success(true)
+                        } catch (_: ActivityNotFoundException) {
+                            // 没浏览器不是错误：登录页会退回"手动复制这个网址"。
+                            result.success(false)
+                        }
+                    }
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
             MEDIA_PICKER_CHANNEL,
         ).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -237,6 +266,7 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val MEDIA_PICKER_CHANNEL = "com.burrow/media_picker"
+        private const val SYSTEM_CHANNEL = "com.burrow/system"
         private const val REQUEST_PICK_IMAGE = 0xB012
         private const val REQUEST_PICK_SKIN = 0xB013
         private const val MAX_IMAGE_BYTES = 30L * 1024L * 1024L

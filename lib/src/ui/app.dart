@@ -10,6 +10,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:xterm/xterm.dart';
 
@@ -197,25 +198,50 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
   Widget _buildInstalling() => Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
+          Icon(Icons.downloading_rounded, size: 48, color: context.chat.brand),
+          const SizedBox(height: 24),
           Text('正在安装 ${_installing!.displayName}',
-              style: Theme.of(context).textTheme.titleMedium),
+              style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 8),
           if (_sourceFor(_installing!) case final source?)
             Text('下载源：${_sourceLabel(source)}',
-                style: const TextStyle(fontSize: 11)),
-          const SizedBox(height: 20),
-          Text(_progress.stage, style: const TextStyle(fontSize: 12)),
-          const SizedBox(height: 12),
-          LinearProgressIndicator(
-            value: _progress.fraction < 0 ? null : _progress.fraction,
+                style: TextStyle(fontSize: 12, color: context.chat.tintSecondary)),
+          const SizedBox(height: 40),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(_progress.stage,
+                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+                    if (_progress.fraction >= 0)
+                      Text('${(_progress.fraction * 100).toInt()}%',
+                          style: TextStyle(fontSize: 12, color: context.chat.brand)),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: LinearProgressIndicator(
+                    value: _progress.fraction < 0 ? null : _progress.fraction,
+                    minHeight: 8,
+                    backgroundColor: context.chat.bgTertiary,
+                    valueColor: AlwaysStoppedAnimation<Color>(context.chat.brand),
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 40),
           const Text('首次安装需要联网下载 rootfs，之后不再需要。',
               style: TextStyle(fontSize: 11)),
         ],
       );
 
   Widget _buildPicker(List<Distro> available) => ListView(
+        physics: const BouncingScrollPhysics(),
         children: [
           const SizedBox(height: 20),
           Text('选择沙箱基座', style: Theme.of(context).textTheme.headlineSmall),
@@ -249,8 +275,16 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
             ),
           for (final d in available)
             Card(
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: BorderSide(
+                  color: Theme.of(context).dividerColor.withValues(alpha: 0.1),
+                ),
+              ),
               child: Column(children: [
                 ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                   enabled: d.isAvailableOn(widget.abi),
                   title: Row(children: [
                     Text(d.displayName),
@@ -697,6 +731,17 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       _agent.sourceLabel = widget.settings.sourceLabel;
       // 换到不认图的渠道之后，下一条带图的消息要自动改走前置多模态。
       _agent.sendImagesInline = widget.settings.sendImagesInline;
+      _agent.supportsTools = widget.settings.supportsTools;
+      // 换到一个不支持工具的模型时，把已经开着的终端模式关掉。
+      //
+      // 不关的话下一次发送就会带着 tools 打过去，然后收到一个只说"参数错误"
+      // 的 400 —— 而真正的原因（刚才换了个模型）在两步操作之前，没人会
+      // 联想到那里。
+      if (_agent.terminalMode && !widget.settings.supportsTools) {
+        _agent.terminalMode = false;
+        _setStatus('已退出终端模式：'
+            '「${widget.channels.active?.model ?? '当前模型'}」不支持工具调用');
+      }
       // 改了全局提示词、而这个会话没有自己那份时，要当场跟上。
       _agent.userSystemPrompt = _effectiveSystemPrompt;
       _agent.overflow
@@ -722,6 +767,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     _agent = widget.buildAgent(this, _runtime);
     _agent.sourceLabel = widget.settings.sourceLabel;
     _agent.sendImagesInline = widget.settings.sendImagesInline;
+    _agent.supportsTools = widget.settings.supportsTools;
     _agent.userSystemPrompt = _effectiveSystemPrompt;
     await _restoreTerminalMode();
     await _loadHistory();
@@ -1067,6 +1113,25 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 模型以为有工具，回来时工具没了。等这轮结束再说。
     if (_busy || _installingDistro) return;
 
+    // 当前模型不支持工具调用时不让开：终端模式的全部内容就是给模型一堆
+    // tools，不支持的模型收到之后要么直接 400，要么把 tools 当没看见然后
+    // 用自然语言描述"我打算执行 ls" —— 后者尤其糟，看起来像在干活，
+    // 实际上一条命令都没跑。
+    if (on && !widget.settings.supportsTools) {
+      final model = widget.channels.active?.model ?? '当前模型';
+      _setStatus('「$model」被标记为不支持工具调用，终端模式用不了');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('「$model」不支持工具调用。如果它其实支持，'
+                '可以在渠道管理里改这个模型的能力标记。'),
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+      return;
+    }
+
     if (on && _distro == null) {
       final installed = await _pushInstaller();
       if (installed == null) return; // 放弃安装 → 开关保持关着
@@ -1232,6 +1297,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     final images = List<String>.from(_attachments);
     // 只有图、没有文字也能发 —— 「你看这个」本来就是一种完整的表达。
     if ((text.isEmpty && images.isEmpty) || _busy || _loadingHistory) return;
+
+    HapticFeedback.mediumImpact();
     var id = _threadId;
     if (id == null) {
       id = await widget.chats.createThread(
@@ -1285,6 +1352,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             content: _streaming.toString(),
             at: DateTime.now(),
             source: widget.settings.sourceLabel,
+            // 用量取整轮的。这条气泡是这里现造的，AgentLoop 挂在 history 上的
+            // 那份取不到 —— 不接这一条，token 要等到重新载入会话才显示出来。
+            usage: _agent.lastTurnUsage,
           ));
           _streaming.clear();
         }
@@ -1323,7 +1393,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   void _onScroll() {
     if (!_scroll.hasClients) return;
-    final away = _scroll.offset > 12;
+    // 往下滚一段距离后再显示“回到最底”按钮。12px 是用来触发 AppBar 投影的，
+    // 对按钮来说太小了，会一直跳。
+    final away = _scroll.offset > 300;
     if (away != _scrolledAway && mounted) setState(() => _scrolledAway = away);
   }
 
@@ -1447,31 +1519,61 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             // 设置 / 技能 / 账号都在抽屉里；终端模式和审批档位在输入框里。
           ],
         ),
-        body: IndexedStack(
-          index: _tab,
-          children: [
-            _buildChat(),
-            Column(children: [
-              if (_distro == null)
-                Container(
-                  width: double.infinity,
-                  color: context.chat.tintWarning.withValues(alpha: 0.16),
-                  padding: const EdgeInsets.all(8),
-                  child: Text(
-                    '降级模式：未安装发行版基座，当前是 Android 自带的 '
-                    '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
-                    style: TextStyle(
-                        fontSize: 11, color: context.chat.tintPrimary),
-                  ),
-                ),
-              Expanded(child: TerminalView(_terminal)),
-            ]),
-            _CheckpointTimeline(
-              snapshots: _runtime.snapshots,
-              prefixGens: widget.prefixGens,
-              onRolledBack: _setStatus,
-            ),
-          ],
+        body: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          transitionBuilder: (child, animation) {
+            return FadeTransition(
+              opacity: animation,
+              child: child,
+            );
+          },
+          child: _tab == 0
+              ? _buildChat()
+              : _tab == 1
+                  ? Column(
+                      key: const ValueKey(1),
+                      children: [
+                        if (_distro == null)
+                          Container(
+                            width: double.infinity,
+                            color:
+                                context.chat.tintWarning.withOpacity(0.16),
+                            padding: const EdgeInsets.all(8),
+                            child: Text(
+                              '降级模式：未安装发行版基座，当前是 Android 自带的 '
+                              '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
+                              style: TextStyle(
+                                  fontSize: 11, color: context.chat.tintPrimary),
+                            ),
+                          ),
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: context.chat.bgSecondary,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: context.chat.borderPrimary,
+                                  width: 0.5,
+                                ),
+                              ),
+                              clipBehavior: Clip.antiAlias,
+                              child: TerminalView(
+                                _terminal,
+                                backgroundOpacity: 0,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : _CheckpointTimeline(
+                      key: const ValueKey(2),
+                      snapshots: _runtime.snapshots,
+                      prefixGens: widget.prefixGens,
+                      onRolledBack: _setStatus,
+                    ),
         ),
       ),
     );
@@ -1493,6 +1595,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             dim: widget.settings.chatWallpaperDim,
             child: ListView.builder(
               controller: _scroll,
+              physics: const BouncingScrollPhysics(
+                parent: AlwaysScrollableScrollPhysics(),
+              ),
               // 输入区悬浮在列表上面；给最后一条消息留下同等空间，
               // 否则它会停在玻璃下面，看得见却点不到。
               padding: context.parts.list.padded(
@@ -1503,6 +1608,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             ),
           ),
         ),
+        if (_scrolledAway)
+          Positioned(
+            right: 16,
+            bottom: 100 + bottomInset,
+            child: FloatingActionButton.small(
+              heroTag: 'scroll_to_bottom',
+              onPressed: () {
+                _scrollToEnd(animated: true);
+                HapticFeedback.lightImpact();
+              },
+              backgroundColor: context.chat.bgPrimary.withOpacity(0.9),
+              foregroundColor: context.chat.brand,
+              shape: const CircleBorder(),
+              child: const Icon(Icons.arrow_downward_rounded),
+            ),
+          ),
         Positioned(
           left: 0,
           right: 0,
@@ -1606,6 +1727,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       // 全部改署成新渠道的话，恰好会在用户回头查"刚才那次是谁花的额度"时
       // 给出错误答案。老消息没有这个记录，那就不署名。
       meta: _displayMessageSource(message.source),
+      usage: message.usage,
+      showTokens: widget.settings.showTokenUsage,
       isError: isError,
       lastInGroup: row.lastInGroup,
       firstInGroup: row.firstInGroup,
@@ -1654,17 +1777,28 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       text = model.isEmpty ? '未配置模型' : model;
     }
 
-    return Text(
-      text,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-      // 危险态的红色不让皮肤改：它是"沙箱关了"的唯一提示，
-      // 被一个皮肤调成灰色就等于没有这个提示。
-      style: danger
-          ? TextStyle(fontSize: 12.5, height: 1.2, color: t.tintError)
-          : context.parts.headerSubtitle.styled(
-              TextStyle(fontSize: 12.5, height: 1.2, color: t.tintTertiary),
-            ),
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 200),
+      layoutBuilder: (currentChild, previousChildren) => Stack(
+        alignment: Alignment.centerLeft,
+        children: <Widget>[
+          ...previousChildren,
+          if (currentChild != null) currentChild,
+        ],
+      ),
+      child: Text(
+        text,
+        key: ValueKey(text),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        // 危险态的红色不让皮肤改：它是"沙箱关了"的唯一提示，
+        // 被一个皮肤调成灰色就等于没有这个提示。
+        style: danger
+            ? TextStyle(fontSize: 12.5, height: 1.2, color: t.tintError)
+            : context.parts.headerSubtitle.styled(
+                TextStyle(fontSize: 12.5, height: 1.2, color: t.tintTertiary),
+              ),
+      ),
     );
   }
 
@@ -1672,13 +1806,20 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   /// 图标既是"去"也是"回"，省掉一个返回键。
   Widget _tabAction(int tab, IconData icon, String tooltip) {
     final active = _tab == tab;
-    return IconButton(
-      tooltip: active ? '返回对话' : tooltip,
-      onPressed: () => setState(() => _tab = active ? 0 : tab),
-      icon: Icon(icon, size: context.parts.headerAction.iconSizeOr(24)),
-      color: active
-          ? context.chat.brand
-          : context.parts.headerAction.icon?.color,
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 200),
+      child: IconButton(
+        key: ValueKey(active),
+        tooltip: active ? '返回对话' : tooltip,
+        onPressed: () {
+          if (!active) HapticFeedback.selectionClick();
+          setState(() => _tab = active ? 0 : tab);
+        },
+        icon: Icon(icon, size: context.parts.headerAction.iconSizeOr(24)),
+        color: active
+            ? context.chat.brand
+            : context.parts.headerAction.icon?.color,
+      ),
     );
   }
 
@@ -1706,6 +1847,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           : await fetchModels(
               baseUrl: channel.baseUrl,
               apiKey: auth,
+              apiFormat: channel.apiFormat,
               client: client,
             );
     } finally {
@@ -1725,6 +1867,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             host: c.host,
             models: widget.settings.modelsOf(c.id),
             configuredModel: c.model,
+            capabilityOf: c.capabilityOf,
           ),
       ];
 
@@ -1885,14 +2028,18 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           Positioned(
             right: 6,
             top: 8,
-            child: Container(
-              width: 7,
-              height: 7,
-              decoration: BoxDecoration(
-                color: t.tintWarning,
-                shape: BoxShape.circle,
-                // 描一圈底色，免得小点落在图标上时糊成一团。
-                border: Border.all(color: t.composerField, width: 1),
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 300),
+              child: Container(
+                key: const ValueKey('warning_dot'),
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  color: t.tintWarning,
+                  shape: BoxShape.circle,
+                  // 描一圈底色，免得小点落在图标上时糊成一团。
+                  border: Border.all(color: t.composerField, width: 1),
+                ),
               ),
             ),
           ),
@@ -2031,9 +2178,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                     subtitle: Text(
                       _agent.terminalMode
                           ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
-                          : _distro == null
-                              ? '开启后会先装一个 Linux 基座（约 3–30MB）'
-                              : '普通聊天，模型没有任何工具',
+                          : !widget.settings.supportsTools
+                              // 说清是"哪个模型"而不是只说不支持：用户随时在
+                              // 换模型，不点名的话他不知道该去改哪一条。
+                              ? '「${widget.channels.active?.model ?? '当前模型'}」'
+                                  '被标记为不支持工具调用'
+                              : _distro == null
+                                  ? '开启后会先装一个 Linux 基座（约 3–30MB）'
+                                  : '普通聊天，模型没有任何工具',
                       style: const TextStyle(fontSize: 11),
                     ),
                     value: _agent.terminalMode,
@@ -2142,6 +2294,7 @@ class _CheckpointTimeline extends StatefulWidget {
   final void Function(String message) onRolledBack;
 
   const _CheckpointTimeline({
+    super.key,
     required this.snapshots,
     required this.prefixGens,
     required this.onRolledBack,

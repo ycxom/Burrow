@@ -98,14 +98,107 @@ const _compatSuffixes = <String>[
   '/claude',
 ];
 
-/// baseUrl 是不是以 `/v{数字}` 结尾。
+/// baseUrl 是不是以版本段结尾（`/v1`、`/v4`、`/v1beta`…）。
+///
+/// **必须认带后缀的版本号。** Google 的 Gemini 用的是 `v1beta`，只认
+/// `v` + 纯数字的话，`.../v1beta` 会被判成"没有版本段"，于是再补一个 `/v1`，
+/// 拼出 `.../v1beta/v1/models` —— 404。
+///
+/// 后缀只允许字母：`v1beta` / `v2alpha` 认，`video` 不认（`v` 后面第一个
+/// 字符必须是数字），`v1.2` 也不认（点号不是字母）。
+final _versionSegment = RegExp(r'^v\d+[a-z]*$');
+
 bool endsWithVersionSegment(String url) {
   final idx = url.lastIndexOf('/');
   if (idx < 0 || idx == url.length - 1) return false;
-  final last = url.substring(idx + 1);
-  if (last.length < 2 || last[0] != 'v') return false;
-  return int.tryParse(last.substring(1)) != null;
+  return _versionSegment.hasMatch(url.substring(idx + 1));
 }
+
+/// 这些子路径本身**就是**一个完整的 API 根，后面直接接 `/chat/completions`。
+///
+/// Gemini 的 OpenAI 兼容层挂在 `.../v1beta/openai` 上 —— 它以 `openai` 结尾，
+/// 不是版本段，但再补一个 `/v1` 就错了。
+const _apiRootSuffixes = <String>['/openai'];
+
+/// baseUrl 已经是一个可以直接接接口路径的根。
+bool looksLikeApiRoot(String url) {
+  if (endsWithVersionSegment(url)) return true;
+  final lower = url.toLowerCase();
+  return _apiRootSuffixes.any(lower.endsWith);
+}
+
+/// Gemini 原生 REST 层的根地址（`geminiNative` 协议）。
+///
+/// 这一层认 `x-goog-api-key`，请求打到
+/// `{root}/models/{model}:streamGenerateContent`。
+const geminiNativeBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+
+/// Gemini 的 OpenAI 兼容层（`openAI` 协议）。
+///
+/// 这一层认 `Authorization: Bearer`，接口路径和 OpenAI 一模一样，所以接进来
+/// 不用写任何新协议代码。
+///
+/// **代价是拿不到联网搜索。** grounding 在兼容层只对图片端点开放，
+/// chat/completions 里塞 `{"google_search":{}}` 会被当成 OpenAI 的函数声明去
+/// 校验，直接 `Unknown name 'google_search' at 'tools[0]'`。要搜索就得走
+/// [geminiNativeBaseUrl]。
+const geminiOpenAiBaseUrl = '$geminiNativeBaseUrl/openai';
+
+const _geminiHost = 'generativelanguage.googleapis.com';
+
+/// 这个 baseUrl 指向 Gemini，但**不是** [apiFormat] 这条协议该用的那个根。
+///
+/// 返回该改成什么；已经对了、或者根本不是 Gemini，就返回 null。
+///
+/// ## 为什么值得单独做一个函数
+///
+/// 这个主机上有几种写法会让人踩坑，而且它们的失败方式各不相同：
+///
+///   - `.../v1beta/models/<model>:generateContent`（从 Google 文档复制的完整
+///     端点）→ 后面再拼任何路径都不存在 → **404**
+///   - 裸主机名 `https://generativelanguage.googleapis.com` → 补成
+///     `/v1/models`；`v1` 下没有这些模型，而且**兼容层的 Bearer 头原生层不认**
+///     （原生层要 `x-goog-api-key`）→ **401**
+///   - 协议选了原生却填着 `/v1beta/openai`（或反过来）→ 同样是 401 / 404
+///
+/// 症状（404 / 401）指向的直觉方向完全不同 —— 401 会让人去查密钥，而密钥是
+/// 好的。实测有人在这个主机上连撞两次。**给定协议之后这个主机只有一个正确
+/// 答案**，所以与其报错让人猜，不如直接说出该填什么。
+String? geminiBaseUrlFix(String raw, {String apiFormat = 'openAI'}) {
+  var trimmed = raw.trim();
+  while (trimmed.endsWith('/')) {
+    trimmed = trimmed.substring(0, trimmed.length - 1);
+  }
+  if (trimmed.isEmpty) return null;
+  final host = Uri.tryParse(trimmed)?.host.toLowerCase() ?? '';
+  if (host != _geminiHost) return null;
+  // Code Assist（`gemini`）在另一个主机上，走不到这里。
+  final want = apiFormat == 'geminiNative'
+      ? geminiNativeBaseUrl
+      : geminiOpenAiBaseUrl;
+  if (trimmed.toLowerCase() == want) return null;
+  return want;
+}
+
+/// 认证头。**原生层和兼容层不是同一个头。**
+///
+/// 原生层要 `x-goog-api-key`，兼容层要 `Authorization: Bearer`。拿错了返回
+/// 401，而 401 看起来就是"密钥不对" —— 于是人会去换密钥，换多少个都没用。
+Map<String, String> geminiAuthHeaders(String apiKey, {String apiFormat = 'openAI'}) {
+  if (apiKey.isEmpty) return <String, String>{};
+  if (apiFormat == 'geminiNative') {
+    return <String, String>{'x-goog-api-key': apiKey};
+  }
+  return <String, String>{'Authorization': 'Bearer $apiKey'};
+}
+
+/// 协议在界面上的名字。报错信息要跟界面上的按钮对得上，否则用户不知道该点哪。
+String geminiProtocolLabel(String apiFormat) => switch (apiFormat) {
+      'geminiNative' => 'Gemini 原生',
+      'gemini' => 'Code Assist',
+      'anthropic' => 'Anthropic',
+      _ => 'OpenAI 兼容',
+    };
 
 /// 把 baseUrl 和一个**不带版本段**的接口路径拼成完整地址。
 ///
@@ -131,8 +224,9 @@ Uri resolveApiEndpoint(String baseUrl, String suffix) {
   // 用户粘的就是完整接口地址。
   if (base.endsWith(suffix)) return Uri.parse(base);
 
-  // 已经有版本段（/v1、/v4 …）就直接拼，不再补 /v1。
-  if (endsWithVersionSegment(base)) return Uri.parse('$base$suffix');
+  // 已经是完整的 API 根（有版本段，或是 /openai 这种兼容层）就直接拼，
+  // 不再补 /v1。
+  if (looksLikeApiRoot(base)) return Uri.parse('$base$suffix');
 
   return Uri.parse('$base/v1$suffix');
 }
@@ -151,7 +245,11 @@ String? _stripCompatSuffix(String url) {
 ///
 /// 抽成纯函数是为了能单测 —— 这段逻辑全是各家服务商的历史包袱，
 /// 靠"改一下、连一次真站点看看"来验证太慢，而且改坏了不会立刻发现。
-List<String> buildModelsUrlCandidates(String baseUrl, {String? override}) {
+List<String> buildModelsUrlCandidates(
+  String baseUrl, {
+  String? override,
+  String apiFormat = 'openAI',
+}) {
   final overridden = override?.trim() ?? '';
   if (overridden.isNotEmpty) return [overridden];
 
@@ -163,8 +261,21 @@ List<String> buildModelsUrlCandidates(String baseUrl, {String? override}) {
     throw const ModelFetchException('baseUrl 是空的');
   }
 
+  // Gemini 主机上猜路径没有意义 —— 猜错的表现是 404 或 401，而 401 会把人
+  // 引到"是不是密钥不对"上去，那是条死路。直接给出正确答案。
+  final geminiFix = geminiBaseUrlFix(trimmed, apiFormat: apiFormat);
+  if (geminiFix != null) {
+    throw ModelFetchException(
+      '这个 Base URL 和「${geminiProtocolLabel(apiFormat)}」协议对不上。\n'
+      '请改成：$geminiFix',
+    );
+  }
+
+  // 原生层只有一个列表端点，没有第二个可猜。
+  if (apiFormat == 'geminiNative') return <String>['$trimmed/models'];
+
   final candidates = <String>[];
-  if (endsWithVersionSegment(trimmed)) {
+  if (looksLikeApiRoot(trimmed)) {
     candidates.add('$trimmed/models');
     // 版本段不是 /v1 时（智谱的 /v4 之类），把 /v1/models 留作兜底 ——
     // 少数站点确实两个都通，正确的那个已经排在前面了。
@@ -241,6 +352,10 @@ List<FetchedModel> parseModelsResponse(String body) {
       if (owner is String && owner.isNotEmpty) ownedBy = owner;
     }
     if (id == null || id.isEmpty) continue;
+    // 原生层的列表把 id 写成 `models/gemini-2.5-pro`，而请求里要填的是去掉
+    // 前缀的那个。带着前缀发出去会拼成 `/models/models/xxx:streamGenerate…`
+    // —— 又是一个 404。
+    if (id.startsWith('models/')) id = id.substring('models/'.length);
     if (!seen.add(id)) continue;
     out.add(FetchedModel(id, ownedBy: ownedBy));
   }
@@ -257,10 +372,15 @@ Future<List<FetchedModel>> fetchModels({
   required String baseUrl,
   required String apiKey,
   String? override,
+  String apiFormat = 'openAI',
   http.Client? client,
   Duration timeout = const Duration(seconds: 15),
 }) async {
-  final candidates = buildModelsUrlCandidates(baseUrl, override: override);
+  final candidates = buildModelsUrlCandidates(
+    baseUrl,
+    override: override,
+    apiFormat: apiFormat,
+  );
   final httpClient = client ?? http.Client();
   final failures = <String>[];
 
@@ -273,10 +393,8 @@ Future<List<FetchedModel>> fetchModels({
     try {
       final response = await httpClient.get(
         Uri.parse(url),
-        headers: {
-          if (apiKey.isNotEmpty) 'Authorization': 'Bearer $apiKey',
-          'Accept': 'application/json',
-        },
+        headers: geminiAuthHeaders(apiKey, apiFormat: apiFormat)
+          ..['Accept'] = 'application/json',
       ).timeout(timeout);
 
       if (response.statusCode == 200) {

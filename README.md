@@ -40,10 +40,24 @@ Burrow 支持配置多个 AI 服务渠道，并可以在对话中快速切换提
 - Kimi
 - 硅基流动
 - xAI
+- Google Gemini（API Key，或用 Google 账号登录走 Vertex AI）
 - Ollama 与本地模型
 - 其他 OpenAI 兼容 API
 
 部分服务可以使用 OAuth 登录，也可以通过 API Key 连接。每个渠道都可以单独配置模型、代理和生成参数。
+
+ChatGPT 和 Grok 走设备码登录（在任意设备的浏览器里输一串码）；Google 走浏览器回跳登录，
+必须在本机浏览器里完成。Google 默认使用随 gemini-cli 公开分发的 OAuth 客户端凭据，
+也可以在渠道管理里换成自己在 Google Cloud Console 建的客户端。
+
+> **Gemini 怎么接**：最省事的是 API Key —— 新建渠道时选预设「Google Gemini（API Key）」，
+> 地址会自动填成 `https://generativelanguage.googleapis.com/v1beta/openai`。
+> 从 Google 文档里复制的 `.../v1beta/models/<模型>:generateContent` 是**原生 REST 端点**，
+> 填进来会 404。
+>
+> Google 账号登录里的「Code Assist」那一项，2026-09 实测已被 Google 从个人免费额度里
+> 切掉（返回 `UNSUPPORTED_CLIENT`），登了多半用不了；要用 Google 账号请走 Vertex AI，
+> 需要自己的 GCP 项目并开通计费。
 
 每个渠道还可以单独设置：对话模型能否直接看图、用哪个模型做图片识别，
 以及系统提示词的发送方式（少数服务不接受 system 消息，可改为并入首条用户消息）。

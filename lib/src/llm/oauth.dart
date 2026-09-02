@@ -120,26 +120,168 @@ class OAuthException implements Exception {
   String toString() => message;
 }
 
-/// 一家服务商的设备码登录。
-abstract class DeviceFlowProvider {
+/// 一个账号的套餐和余量。
+///
+/// ## 为什么字段这么松
+///
+/// 各家能查到的东西**完全不在一个层级上**，硬套一个统一的数值模型只会逼着
+/// 实现方编数字：
+///
+///   - ChatGPT 的套餐名写在 access_token 的声明里，一次网络请求都不用发；
+///     真正的"剩多少"只在**聊天响应头**里，要发过一次请求才知道。
+///   - Google Code Assist 能问出档位（免费版 / Pro），但问不出余量。
+///   - Vertex 是按量计费，根本没有"余量"这个概念。
+///   - xAI 没有可查的额度接口。
+///
+/// 所以这里只有 [plan] 是必填的，余下的能拿到就填。UI 对 null 显示"未知"，
+/// **不显示 0** —— "不知道"和"用完了"是两件不能混的事。
+class AccountQuota {
+  const AccountQuota({
+    required this.plan,
+    this.detail,
+    this.usedPercent,
+    this.resetsAt,
+    this.fetchedAt,
+  });
+
+  /// 套餐名。"Plus" / "免费版" / "按量计费"。
+  final String plan;
+
+  /// 补充说明。查不到余量时用它讲清楚为什么。
+  final String? detail;
+
+  /// 已用比例，0~1。null = 查不到。
+  final double? usedPercent;
+
+  /// 配额窗口重置时间。
+  final DateTime? resetsAt;
+
+  /// 这份数据是什么时候拿到的。缓存展示时要说清新鲜度 ——
+  /// 一个三天前的余量显示得像实时的，比不显示更误导。
+  final DateTime? fetchedAt;
+
+  AccountQuota withFetchedAt(DateTime at) => AccountQuota(
+        plan: plan,
+        detail: detail,
+        usedPercent: usedPercent,
+        resetsAt: resetsAt,
+        fetchedAt: at,
+      );
+
+  /// 一行摘要，给渠道列表用。
+  String get summary {
+    final bits = <String>[plan];
+    if (usedPercent != null) {
+      final left = ((1 - usedPercent!) * 100).clamp(0, 100).round();
+      bits.add('剩 $left%');
+    }
+    return bits.join(' · ');
+  }
+
+  Map<String, Object?> toJson() => {
+        'plan': plan,
+        'detail': detail,
+        'used_percent': usedPercent,
+        'resets_at': resetsAt?.toIso8601String(),
+        'fetched_at': fetchedAt?.toIso8601String(),
+      };
+
+  static AccountQuota? fromJson(Map<String, Object?> j) {
+    final plan = j['plan'] as String?;
+    if (plan == null || plan.isEmpty) return null;
+    DateTime? at(Object? raw) =>
+        raw is String ? DateTime.tryParse(raw) : null;
+    return AccountQuota(
+      plan: plan,
+      detail: j['detail'] as String?,
+      usedPercent: (j['used_percent'] as num?)?.toDouble(),
+      resetsAt: at(j['resets_at']),
+      fetchedAt: at(j['fetched_at']),
+    );
+  }
+}
+
+/// 一家可登录的服务商。
+///
+/// 拆出这个父类是因为**不是所有服务商都能走设备码**：Google 的设备码流程把
+/// scope 锁死在 email/openid/profile + Drive/YouTube，登录得了但调不了模型
+/// （见 google_oauth.dart 的说明）。它必须走回跳，而账号存储、刷新、绑定渠道
+/// 这些事对两种流程是一样的 —— 一样的部分放这里，不一样的放子类。
+abstract class OAuthProvider {
   /// 存储用的稳定标识。
   String get id;
 
   String get displayName;
 
   /// 登录成功后应该用哪个 baseUrl 调模型接口。
+  ///
+  /// 有些服务商这个地址依赖登录后才知道的东西（Vertex 要项目和区域），
+  /// 那种情况下这里给一个模板或空串，由渠道设置补齐。
   String get apiBaseUrl;
 
   /// 这家用的接口协议（对齐 LlmConfig.apiFormat）。
   String get apiFormat;
 
-  Future<DeviceCodeGrant> start();
+  /// 一句话说清这家登录之后能用什么、需要什么。显示在登录入口下面。
+  String get hint => '';
 
-  Future<PollResult> poll(DeviceCodeGrant grant);
+  /// 分组标识。同一个 family 的 provider 在界面上收成一行。
+  ///
+  /// Google 有两种登录模式（免费额度 / 自己的 Vertex 项目），它们是两个
+  /// provider —— apiBaseUrl 和 apiFormat 都不一样。但对用户来说那是**一家**，
+  /// 在登录列表里并排摆两条"Google 账号"只会让人以为要登两次。
+  String get family => id;
+
+  /// 这一家的显示名。同 family 的 provider 要给同一个值。
+  String get familyName => displayName;
+
+  /// 这个模式在家族里的名字。单模式家族用不上。
+  String get modeName => displayName;
+
+  /// 查这个账号的套餐和余量。
+  ///
+  /// 返回 null = 这家没有可查的接口。**不要为了让界面好看而编一个** ——
+  /// 用户看到"剩 100%"会据此决定要不要开始一个长任务。
+  Future<AccountQuota?> fetchQuota(OAuthCredential credential) async => null;
 
   /// 用 refresh_token 换新的 access_token。
   /// 抛 [OAuthException] 表示 refresh_token 也废了，要重新登录。
   Future<OAuthCredential> refresh(OAuthCredential expired);
+}
+
+/// 一家服务商的设备码登录。
+abstract class DeviceFlowProvider implements OAuthProvider {
+  Future<DeviceCodeGrant> start();
+
+  Future<PollResult> poll(DeviceCodeGrant grant);
+}
+
+/// 一次回跳登录的进行中会话。
+///
+/// 和设备码不同，回跳流程没有"轮询"这一步：本地回环服务器一直挂着，
+/// 浏览器带着 `?code=` 回来的那一刻就结束了。所以它暴露的是一个 Future，
+/// 而不是一个要 UI 自己驱动的轮询循环。
+class RedirectAuthSession {
+  /// 要在浏览器里打开的授权地址。
+  final String authorizationUrl;
+
+  /// 授权完成（或失败）时结束。
+  final Future<OAuthCredential> result;
+
+  /// 放弃登录：关掉本地服务器，让 [result] 以 [OAuthException] 结束。
+  final Future<void> Function() cancel;
+
+  const RedirectAuthSession({
+    required this.authorizationUrl,
+    required this.result,
+    required this.cancel,
+  });
+}
+
+/// 一家服务商的浏览器回跳登录（授权码 + PKCE）。
+abstract class RedirectFlowProvider implements OAuthProvider {
+  /// 起一个本地回环服务器并算出授权地址。调用方负责把地址交给浏览器。
+  Future<RedirectAuthSession> start();
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +366,67 @@ class OpenAiDeviceFlow implements DeviceFlowProvider {
 
   @override
   String get displayName => 'ChatGPT（OpenAI 订阅）';
+
+  @override
+  String get hint => '用 ChatGPT 订阅额度，不需要 API key';
+
+  // 单模式家族：自成一家，三个名字都用同一个。
+  @override
+  String get family => id;
+
+  @override
+  String get familyName => displayName;
+
+  @override
+  String get modeName => displayName;
+
+  /// 套餐名直接从 access_token 的声明里读 —— 一次网络请求都不用发。
+  ///
+  /// **余量不在这里。** ChatGPT 的用量只出现在聊天响应头上（见
+  /// [parseCodexRateLimit]），也就是说必须先发过一次请求才知道。所以刚登录
+  /// 完的账号只有套餐名，聊过一句之后才会有百分比。
+  @override
+  Future<AccountQuota?> fetchQuota(OAuthCredential credential) async {
+    for (final jwt in <String?>[credential.accessToken]) {
+      if (jwt == null) continue;
+      final claims = decodeJwtClaims(jwt);
+      if (claims == null) continue;
+      final plan = _findPlan(claims);
+      if (plan != null) {
+        return AccountQuota(
+          plan: _planLabel(plan),
+          detail: '余量要发过一次请求之后才能读到',
+        );
+      }
+    }
+    return const AccountQuota(
+      plan: 'ChatGPT 账号',
+      detail: '令牌里没有套餐信息，余量要发过一次请求之后才能读到',
+    );
+  }
+
+  /// `chatgpt_plan_type` 可能在顶层，也可能嵌在带命名空间的那一层里 ——
+  /// 和 `chatgpt_account_id` 是同一个毛病。
+  static String? _findPlan(Map<String, Object?> claims) {
+    final direct = _firstString(claims, ['chatgpt_plan_type']);
+    if (direct != null) return direct;
+    for (final value in claims.values) {
+      if (value is Map<String, Object?>) {
+        final nested = _firstString(value, ['chatgpt_plan_type']);
+        if (nested != null) return nested;
+      }
+    }
+    return null;
+  }
+
+  static String _planLabel(String raw) => switch (raw.toLowerCase()) {
+        'free' => '免费版',
+        'plus' => 'ChatGPT Plus',
+        'pro' => 'ChatGPT Pro',
+        'team' => 'ChatGPT Team',
+        'enterprise' => 'ChatGPT Enterprise',
+        _ => raw,
+      };
 
   /// 订阅登录走的是 Codex 后端，不是 `api.openai.com`。
   @override
@@ -419,6 +622,31 @@ class XaiDeviceFlow implements DeviceFlowProvider {
   String get displayName => 'Grok（xAI 订阅）';
 
   @override
+  String get hint => '用 xAI 订阅额度，不需要 API key';
+
+  // 单模式家族：自成一家，三个名字都用同一个。
+  @override
+  String get family => id;
+
+  @override
+  String get familyName => displayName;
+
+  @override
+  String get modeName => displayName;
+
+  /// xAI 没有公开的额度查询接口。
+  ///
+  /// 返回一个只有套餐名、明说余量查不到的结果，而不是 null —— null 在界面上
+  /// 是"这一家不支持"，而这里的真相是"支持，但对面没提供接口"。两者对用户
+  /// 该不该继续等一个数字是不同的答案。
+  @override
+  Future<AccountQuota?> fetchQuota(OAuthCredential credential) async =>
+      const AccountQuota(
+        plan: 'xAI 订阅',
+        detail: 'xAI 没有公开的额度查询接口，余量只能去官网看',
+      );
+
+  @override
   String get apiBaseUrl => 'https://api.x.ai/v1';
 
   @override
@@ -562,6 +790,53 @@ class XaiDeviceFlow implements DeviceFlowProvider {
       email: email,
     );
   }
+}
+
+/// 从 Codex 后端的响应头里读出用量。
+///
+/// 这是 ChatGPT 唯一能拿到**真实余量**的地方 —— 没有独立的查询接口，
+/// 数字只挂在聊天响应上。所以它是"聊过一句之后才知道"。
+///
+/// 头的名字是照 Codex CLI 的行为写的，不在任何公开文档里。所以这里**只读不
+/// 校验**：认识哪个用哪个，一个都不认识就返回 null。名字将来变了，后果是
+/// 余量不再显示，而不是登录或聊天出问题。
+AccountQuota? parseCodexRateLimit(
+  Map<String, String> headers, {
+  required String plan,
+}) {
+  double? percent;
+  for (final key in const <String>[
+    'x-codex-primary-used-percent',
+    'x-codex-used-percent',
+  ]) {
+    final raw = headers[key];
+    final value = raw == null ? null : double.tryParse(raw);
+    if (value != null) {
+      percent = (value / 100).clamp(0.0, 1.0);
+      break;
+    }
+  }
+  if (percent == null) return null;
+
+  DateTime? resetsAt;
+  for (final key in const <String>[
+    'x-codex-primary-reset-after-seconds',
+    'x-codex-reset-after-seconds',
+  ]) {
+    final raw = headers[key];
+    final seconds = raw == null ? null : int.tryParse(raw);
+    if (seconds != null) {
+      resetsAt = DateTime.now().add(Duration(seconds: seconds));
+      break;
+    }
+  }
+
+  return AccountQuota(
+    plan: plan,
+    usedPercent: percent,
+    resetsAt: resetsAt,
+    fetchedAt: DateTime.now(),
+  );
 }
 
 // ---------------------------------------------------------------------------

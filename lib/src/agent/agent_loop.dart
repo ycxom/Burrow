@@ -86,7 +86,104 @@ class AgentCancelledException implements Exception {
 class LlmTurn {
   final String text;
   final List<ToolCall> toolCalls;
-  const LlmTurn({required this.text, this.toolCalls = const []});
+
+  /// 服务端回报的本次调用用量。null = 这个服务没回报。
+  final TokenUsage? usage;
+
+  const LlmTurn({required this.text, this.toolCalls = const [], this.usage});
+}
+
+/// 一次 LLM 调用的 token 用量，**服务端口径**。
+///
+/// 和 [TokenCounter] 的估算分开表示：估算是给裁剪历史用的，可以差 30%；
+/// 这个是给用户看"这一轮花了多少"的，差一个 token 都不该编。所以拿不到就是
+/// 拿不到（null），UI 自己决定要不要退回估算并标上 `~`。
+class TokenUsage {
+  /// 提示词 token。注意它是**整个上下文**的量，不是最后那条用户消息的量 ——
+  /// 长对话里这个数会一直涨，那正是它值得显示的原因。
+  final int input;
+
+  /// 生成的 token。
+  final int output;
+
+  /// 命中提示词缓存的部分（OpenAI 的 cached_tokens / Anthropic 的
+  /// cache_read_input_tokens）。已经含在 [input] 里，单独列出来是因为
+  /// 它的计费价格不一样。拿不到就是 0。
+  final int cached;
+
+  /// 这是本地估算，不是服务端口径。
+  ///
+  /// 很多网关在流式下压根不回报用量（实测某些 new-api 部署就是这样），
+  /// 那时退回 [TokenCounter] 的估算，但**必须标出来** —— 一个能拿去和账单
+  /// 对账的数字里混进估算值，比不显示更糟。UI 见到它会加个 `~`。
+  final bool estimated;
+
+  const TokenUsage({
+    this.input = 0,
+    this.output = 0,
+    this.cached = 0,
+    this.estimated = false,
+  });
+
+  int get total => input + output;
+  bool get isEmpty => input == 0 && output == 0;
+
+  /// 工具循环里一个回合会打多次请求，用量要累加成"这一轮花了多少"。
+  ///
+  /// **只要有一次是估算的，合出来的就是估算的。** 一轮里有真有估时，
+  /// 总数已经不能拿去对账了，标成精确值是在骗人。
+  TokenUsage operator +(TokenUsage? other) => other == null
+      ? this
+      : TokenUsage(
+          input: input + other.input,
+          output: output + other.output,
+          cached: cached + other.cached,
+          estimated: estimated || other.estimated,
+        );
+
+  /// 从 OpenAI 兼容的 `usage` 对象读。
+  static TokenUsage? fromOpenAi(Object? raw) {
+    if (raw is! Map) return null;
+    final details = raw['prompt_tokens_details'];
+    final usage = TokenUsage(
+      input: _int(raw['prompt_tokens']),
+      output: _int(raw['completion_tokens']),
+      cached: details is Map ? _int(details['cached_tokens']) : 0,
+    );
+    return usage.isEmpty ? null : usage;
+  }
+
+  /// 从 Anthropic 的 `usage` 对象读。流式下它分两次到（message_start 给
+  /// input，message_delta 给 output），所以这里允许只有一半有值。
+  static TokenUsage? fromAnthropic(Object? raw) {
+    if (raw is! Map) return null;
+    final usage = TokenUsage(
+      input: _int(raw['input_tokens']),
+      output: _int(raw['output_tokens']),
+      cached: _int(raw['cache_read_input_tokens']),
+    );
+    return usage.isEmpty ? null : usage;
+  }
+
+  /// 从 Responses API 的 `usage` 对象读。
+  static TokenUsage? fromResponses(Object? raw) {
+    if (raw is! Map) return null;
+    final details = raw['input_tokens_details'];
+    final usage = TokenUsage(
+      input: _int(raw['input_tokens']),
+      output: _int(raw['output_tokens']),
+      cached: details is Map ? _int(details['cached_tokens']) : 0,
+    );
+    return usage.isEmpty ? null : usage;
+  }
+
+  static int _int(Object? value) =>
+      value is num ? value.toInt() : int.tryParse('$value') ?? 0;
+
+  @override
+  String toString() =>
+      'TokenUsage(in: $input, out: $output, cached: $cached'
+      '${estimated ? ', 估算' : ''})';
 }
 
 /// [AgentLoop.rewindTo] 的结果。
@@ -170,6 +267,10 @@ class AgentLoop {
   /// Android 自带的 mksh 上，那里面没有包管理器也没有路径隔离，
   /// 模型会对着一堆「command not found」原地打转。UI 负责挡这一步。
   bool terminalMode;
+
+  /// 当前模型认不认工具。由外部按渠道 + 模型算好后塞进来 ——
+  /// AgentLoop 不认识 Channel，也不该认识。
+  bool supportsTools = true;
 
   /// 当前来源的署名，形如 `渠道名 · 模型名`。写进每条助手消息里。
   ///
@@ -317,9 +418,23 @@ class AgentLoop {
       }
     }
 
+    // 整轮累加。工具循环里一个回合会打好几次请求，用户要看的是这一问一答的
+    // 总账 —— 只记最后一次的话，一个跑了八轮工具的任务会显示成"几乎没花钱"。
+    var spent = const TokenUsage();
+
+    // 挂给 UI 的那份是**整轮**的，不随中间写出的助手消息清零。
+    var turnTotal = const TokenUsage();
+    lastTurnUsage = null;
+
     for (var round = 0; round < maxToolRounds; round++) {
       final turn = await _completeWithRetry();
       if (epoch != _cancelEpoch) throw const AgentCancelledException();
+      // 服务端回报了就用真值；没回报（不少网关流式下就是不给）退回估算，
+      // 并且标记成估算 —— 不标的话用户会拿一个估出来的数去对账单。
+      final measured = turn.usage ?? _estimateUsage(turn.text);
+      spent = spent + measured;
+      turnTotal = turnTotal + measured;
+      lastTurnUsage = turnTotal.isEmpty ? null : turnTotal;
 
       // 一次请求既没有文本也没有工具调用 —— 这不是"模型没话说"，
       // 是这一轮什么都没发生。**必须报出来。**
@@ -339,7 +454,12 @@ class AgentLoop {
           content: turn.text,
           at: DateTime.now(),
           source: sourceLabel,
+          // 挂在**这一条**上而不是等回合结束再回填：中间轮次也可能产出正文
+          // （模型边说边调工具），那些消息同样是这一轮的一部分。累加值挂在
+          // 最后写出的那条上，前面几条各自带自己那一段。
+          usage: spent.isEmpty ? null : spent,
         ));
+        spent = const TokenUsage();
       }
       if (turn.toolCalls.isEmpty) break;
 
@@ -433,6 +553,26 @@ class AgentLoop {
   /// 只重试一次。裁完还超说明 ContextLimitGuard 学到的 ratio 仍然不准，
   /// 无限重试只会烧掉配额；报错让用户看见、让 guard 记下 hits+1，
   /// 下一轮的收紧系数会更狠。
+  /// 最近一轮 [send] 的总用量。
+  ///
+  /// 单独暴露一个出口，是因为 UI 在流式结束时会把这一轮所有的助手文本**合成
+  /// 一条**气泡显示（工具循环里模型可能分几段说话）。那条气泡是 UI 现造的，
+  /// 拿不到 history 里逐条挂着的用量；靠文本比对去找又会在分段时对不上。
+  TokenUsage? lastTurnUsage;
+
+  /// 上一次实际发出去的那批消息估算出的 token 数。
+  ///
+  /// 在 [_completeWithRetry] 里现算而不是事后重建：重建要复现人格提示、摘要、
+  /// 检索注入和窗口裁剪的全部结果，任何一处对不上，估出来的就是另一次请求的量。
+  int _lastPromptEstimate = 0;
+
+  /// 服务端没回报用量时的兜底。
+  TokenUsage _estimateUsage(String reply) => TokenUsage(
+        input: _lastPromptEstimate,
+        output: TokenCounter.estimate(reply),
+        estimated: true,
+      );
+
   Future<LlmTurn> _completeWithRetry() async {
     // 人格提示每次现拼，不进 history —— 进了就会被一起持久化，
     // 于是每次开线程都多出一条旧的、可能还是另一个模式下写的提示。
@@ -440,7 +580,14 @@ class AgentLoop {
       ChatMessage(role: 'system', content: _persona(), at: DateTime.now()),
       ...overflow.buildWindow(history),
     ];
-    final tools = terminalMode ? allToolSpecs : const <ToolSpec>[];
+    _lastPromptEstimate = TokenCounter.estimateMessages(
+      messages.map((m) => (role: m.role, content: m.content)),
+    );
+    // `supportsTools` 是最后一道闸。UI 那边已经拦过一次了，这里再拦是因为
+    // 「终端模式开着」和「当前模型认工具」是两个独立变化的状态，中间任何一次
+    // 时序意外（换模型和发送撞在一起）都会让 tools 发到一个不认它的模型手上。
+    final tools =
+        terminalMode && supportsTools ? allToolSpecs : const <ToolSpec>[];
 
     for (var attempt = 0; attempt < 2; attempt++) {
       final budget = limitGuard.budgetFor(llm.limitKey);

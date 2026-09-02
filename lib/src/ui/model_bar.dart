@@ -17,6 +17,7 @@ library;
 
 import 'package:flutter/material.dart';
 
+import '../settings/channel_store.dart';
 import 'chat_theme.dart';
 
 /// 一个可选的模型来源，对应一个渠道。
@@ -37,12 +38,20 @@ class ModelSource {
   /// 渠道"这件事就只能绕到渠道管理里去做，而用户是在这里想起来要换的。
   final String configuredModel;
 
+  /// 查一个模型在这个来源上的能力。
+  ///
+  /// 摆在选择器里而不是只留在渠道设置里：能力标错的后果（图被当没看见、
+  /// 终端模式静默失效）是在**换模型的那一刻**埋下的，而这里就是那一刻。
+  /// 在别处解释一百遍，不如在这里显示两个图标。
+  final ModelCapability Function(String model)? capabilityOf;
+
   const ModelSource({
     required this.id,
     required this.name,
     required this.host,
     this.models = const <String>[],
     this.configuredModel = '',
+    this.capabilityOf,
   });
 }
 
@@ -441,6 +450,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
   }) {
     final t = context.chat;
     final id = _sourceId;
+    // 「不启用」那一条没有模型可言，不显示能力。
+    final capability =
+        value.isEmpty ? null : _source?.capabilityOf?.call(value);
     return ListTile(
       dense: true,
       leading: Icon(
@@ -460,6 +472,29 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
           ? null
           : Text(subtitle,
               style: TextStyle(fontSize: 11, color: t.tintTertiary)),
+      // 只显示**有**的能力，不显示没有的。两个灰图标并排的信息量还不如没有，
+      // 而"这个模型能看图"是用户挑模型时真正在找的东西。
+      trailing: capability == null
+          ? null
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                if (capability.vision)
+                  Tooltip(
+                    message: '能直接看图',
+                    child: Icon(Icons.visibility_outlined,
+                        size: 16, color: t.tintTertiary),
+                  ),
+                if (capability.vision && capability.tools)
+                  const SizedBox(width: 6),
+                if (capability.tools)
+                  Tooltip(
+                    message: '支持工具调用（终端模式）',
+                    child: Icon(Icons.build_outlined,
+                        size: 16, color: t.tintTertiary),
+                  ),
+              ],
+            ),
       onTap: id == null
           ? null
           : () => Navigator.pop(context, ModelChoice(id, value)),

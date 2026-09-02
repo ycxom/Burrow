@@ -19,6 +19,7 @@
 /// 这是滚动摘要唯一的安全网：摘要一定会丢细节，丢掉的细节必须能找回来。
 library;
 
+import '../agent/agent_loop.dart' show TokenUsage;
 import 'token_counter.dart';
 
 class ChatMessage {
@@ -53,6 +54,16 @@ class ChatMessage {
   /// 等于每轮重写几 MB。落在会话自己的目录里，删会话时一起没。
   final List<String> images;
 
+  /// 这条助手消息花掉的 token，**服务端口径**。
+  ///
+  /// 只有助手消息有，而且只有服务端回报了才有。用户消息不存 —— 它的开销
+  /// 已经含在下一条助手消息的 input 里，单独再记一份等于把同一笔账算两遍。
+  /// UI 想给用户消息显示体量时用本地估算，并且会标成估算值。
+  ///
+  /// 一个回合可能打多次请求（工具循环），存的是**整轮累加**后的量：用户问
+  /// 「这一句花了多少」，想知道的是这一问一答的总账，不是其中某一次请求。
+  final TokenUsage? usage;
+
   const ChatMessage({
     required this.role,
     required this.content,
@@ -61,11 +72,17 @@ class ChatMessage {
     this.checkpoint,
     this.source,
     this.images = const <String>[],
+    this.usage,
   });
 
   bool get hasImages => images.isNotEmpty;
 
-  ChatMessage copyWith({String? content, int? checkpoint}) => ChatMessage(
+  ChatMessage copyWith({
+    String? content,
+    int? checkpoint,
+    TokenUsage? usage,
+  }) =>
+      ChatMessage(
         role: role,
         content: content ?? this.content,
         at: at,
@@ -73,6 +90,7 @@ class ChatMessage {
         checkpoint: checkpoint ?? this.checkpoint,
         source: source,
         images: images,
+        usage: usage ?? this.usage,
       );
 }
 

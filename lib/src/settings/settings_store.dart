@@ -38,6 +38,18 @@ const providerPresets = <ProviderPreset>[
     models: <String>['claude-sonnet-4-6', 'claude-opus-4-6'],
   ),
   ProviderPreset(
+    // 走 OpenAI 兼容层而不是 Gemini 原生 REST：兼容层的请求体、流式解析和
+    // 工具调用全都能复用现成的那条路径。
+    //
+    // 地址必须到 `/v1beta/openai` 为止 —— 从 Google 文档里复制来的
+    // `.../v1beta/models/<model>:generateContent` 是原生端点，填进来必 404。
+    name: 'Google Gemini（API Key）',
+    // 原生层而不是 OpenAI 兼容层：兼容层接进来省事，但**拿不到联网搜索**。
+    apiFormat: 'geminiNative',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    models: <String>['gemini-flash-latest', 'gemini-2.5-pro'],
+  ),
+  ProviderPreset(
     name: 'DeepSeek',
     baseUrl: 'https://api.deepseek.com',
     models: <String>['deepseek-chat', 'deepseek-reasoner'],
@@ -118,6 +130,7 @@ class SettingsStore extends ChangeNotifier {
     this._assistantAvatarPath,
     this._userAvatarPath,
     this._showMessageAvatars,
+    this._showTokenUsage,
     this._chatComposerEffect,
     this._chatComposerBlur,
     this._chatComposerOpacity,
@@ -146,6 +159,7 @@ class SettingsStore extends ChangeNotifier {
       'burrow.appearance.assistantAvatarPath';
   static const _keyUserAvatarPath = 'burrow.appearance.userAvatarPath';
   static const _keyShowMessageAvatars = 'burrow.appearance.showMessageAvatars';
+  static const _keyShowTokenUsage = 'burrow.appearance.showTokenUsage';
   static const _keyChatComposerEffect = 'burrow.appearance.composerEffect';
   static const _keyChatComposerBlur = 'burrow.appearance.composerBlur';
   static const _keyChatComposerOpacity = 'burrow.appearance.composerOpacity';
@@ -193,6 +207,7 @@ class SettingsStore extends ChangeNotifier {
   String _assistantAvatarPath;
   String _userAvatarPath;
   bool _showMessageAvatars;
+  bool _showTokenUsage;
   ChatComposerEffect _chatComposerEffect;
   double _chatComposerBlur;
   double _chatComposerOpacity;
@@ -304,14 +319,23 @@ class SettingsStore extends ChangeNotifier {
 
   /// 这一刻要不要把图直接塞进请求。
   ///
-  /// 两件事共用一个开关：模型认不认图（渠道上勾的），以及用户有没有强制
-  /// 走前置（省钱）。**强制前置时即使模型认图也不直发** —— 那正是这个
-  /// 选项存在的意义，不然它和 auto 就没区别了。
+  /// 两件事共用一个开关：模型认不认图（按**当前模型**查的，不是渠道），
+  /// 以及用户有没有强制走前置（省钱）。**强制前置时即使模型认图也不直发**
+  /// —— 那正是这个选项存在的意义，不然它和 auto 就没区别了。
   bool get sendImagesInline => switch (_imageMode) {
         ImageMode.native => true,
         ImageMode.preprocess => false,
-        ImageMode.auto => _channels?.active?.visionCapable ?? false,
+        ImageMode.auto => activeCapability.vision,
       };
+
+  /// 当前渠道 + 当前模型的能力。没有渠道时给一份保守的默认值：不认图
+  /// （图会走前置多模态，最坏是多花一次调用），但认工具（否则终端模式在
+  /// 还没配渠道时就显示成不可用，那是个会让人以为功能坏了的假象）。
+  ModelCapability get activeCapability =>
+      _channels?.active?.activeCapability ?? const ModelCapability();
+
+  /// 当前模型支持工具调用。终端模式靠它决定能不能开。
+  bool get supportsTools => activeCapability.tools;
 
   Future<void> setImageMode(ImageMode mode) async {
     if (_imageMode == mode) return;
@@ -376,6 +400,12 @@ class SettingsStore extends ChangeNotifier {
   String get assistantAvatarPath => _assistantAvatarPath;
   String get userAvatarPath => _userAvatarPath;
   bool get showMessageAvatars => _showMessageAvatars;
+
+  /// 在气泡里显示 token 用量。
+  ///
+  /// 默认开：用的是自己的 API key，「这一句花了多少」是每次发送都该看得见
+  /// 的信息，而不是要翻账单才知道的事。
+  bool get showTokenUsage => _showTokenUsage;
   ChatComposerEffect get chatComposerEffect => _chatComposerEffect;
   double get chatComposerBlur => _chatComposerBlur;
   double get chatComposerOpacity => _chatComposerOpacity;
@@ -423,6 +453,7 @@ class SettingsStore extends ChangeNotifier {
       prefs.getString(_keyAssistantAvatarPath) ?? '',
       prefs.getString(_keyUserAvatarPath) ?? '',
       prefs.getBool(_keyShowMessageAvatars) ?? true,
+      prefs.getBool(_keyShowTokenUsage) ?? true,
       _byName(
         ChatComposerEffect.values,
         prefs.getString(_keyChatComposerEffect),
@@ -562,6 +593,13 @@ class SettingsStore extends ChangeNotifier {
     await _prefs?.setBool(_keyChatSkinSuspended, value);
   }
 
+  Future<void> setShowTokenUsage(bool value) async {
+    if (_showTokenUsage == value) return;
+    _showTokenUsage = value;
+    notifyListeners();
+    await _prefs?.setBool(_keyShowTokenUsage, value);
+  }
+
   Future<void> setChatWallpaperPreset(ChatWallpaperPreset preset) async {
     if (_chatWallpaperPreset == preset && _chatWallpaperPath.isEmpty) return;
     _chatWallpaperPreset = preset;
@@ -657,6 +695,7 @@ class SettingsStore extends ChangeNotifier {
     _assistantAvatarPath = '';
     _userAvatarPath = '';
     _showMessageAvatars = true;
+    _showTokenUsage = true;
     _chatComposerEffect = ChatComposerEffect.liquid;
     _chatComposerBlur = 20;
     _chatComposerOpacity = 0.68;
@@ -674,6 +713,7 @@ class SettingsStore extends ChangeNotifier {
       prefs.remove(_keyAssistantAvatarPath),
       prefs.remove(_keyUserAvatarPath),
       prefs.remove(_keyShowMessageAvatars),
+      prefs.remove(_keyShowTokenUsage),
       prefs.remove(_keyChatComposerEffect),
       prefs.remove(_keyChatComposerBlur),
       prefs.remove(_keyChatComposerOpacity),

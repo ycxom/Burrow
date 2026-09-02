@@ -24,6 +24,73 @@ import '../llm/llm_client.dart';
 import '../llm/system_prompt.dart';
 
 @immutable
+/// 一个**具体模型**的能力。
+///
+/// ## 为什么挂在模型上而不是渠道上
+///
+/// 一个渠道（一个接入点 + 一个 key）下面往往有几十个模型：聚合网关尤其如此，
+/// 同一个 key 后面既有能看图能调工具的旗舰，也有纯文本的小模型。而
+/// [SettingsStore.setModel] 换模型改的就是 `channel.model` —— 能力标记留在渠道上
+/// 的话，换一个模型之后标记不跟着换，于是：
+///
+///   - 视觉标记错了 → 图直接塞进请求体，模型要么 400，要么**收下当没看见**，
+///     照常答一段，用户以为它看过了；
+///   - 工具标记错了 → 终端模式下发过去一堆 tools，不支持的模型直接 400，
+///     而错误信息通常只说"参数不对"，看不出是哪个参数。
+///
+/// 所以能力是模型的属性，不是渠道的属性。
+///
+/// ## 为什么是手动勾，不自动探测
+///
+/// 和视觉标记原本的理由一样：聚合网关返回的模型 id 五花八门（`gpt-4o` 的
+/// 转售名可能叫 `azure-4o-0806-hk`），靠名字猜必然会猜错，而猜错的代价上面
+/// 已经列过了。真要探测只能发一次真实请求去试，那要花用户的钱。
+class ModelCapability {
+  /// 能直接接收图片。
+  final bool vision;
+
+  /// 支持 function calling / tool use。**默认 true** —— 现在绝大多数模型都支持，
+  /// 默认 false 会让所有人一装上就发现终端模式用不了，而那才是需要解释的意外。
+  final bool tools;
+
+  /// 让模型自己联网搜索。**只有 Gemini 原生协议有这个东西**，别的协议上它是
+  /// 死的（界面上也不显示）。默认 false —— 搜索是要额外计费的，而且 Gemini 3
+  /// 之前的模型开了它就不能再用工具调用。
+  final bool search;
+
+  const ModelCapability({
+    this.vision = false,
+    this.tools = true,
+    this.search = false,
+  });
+
+  ModelCapability copyWith({bool? vision, bool? tools, bool? search}) =>
+      ModelCapability(
+        vision: vision ?? this.vision,
+        tools: tools ?? this.tools,
+        search: search ?? this.search,
+      );
+
+  Map<String, Object?> toJson() =>
+      {'vision': vision, 'tools': tools, 'search': search};
+
+  static ModelCapability fromJson(Map<String, Object?> j) => ModelCapability(
+        vision: j['vision'] as bool? ?? false,
+        tools: j['tools'] as bool? ?? true,
+        search: j['search'] as bool? ?? false,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is ModelCapability &&
+      other.vision == vision &&
+      other.tools == tools &&
+      other.search == search;
+
+  @override
+  int get hashCode => Object.hash(vision, tools, search);
+}
+
 class Channel {
   /// 稳定 id。改名字不影响它，所以「当前渠道」的指向不会因为改名而丢。
   final String id;
@@ -35,12 +102,24 @@ class Channel {
   final String model;
   final String? summaryModel;
 
-  /// 这个渠道的**对话模型本身能不能看图**。
+  /// 渠道级的视觉默认值。
   ///
-  /// 手动勾，不自动探测：聚合网关返回的模型 id 五花八门，靠名字猜"是不是
-  /// 视觉模型"猜错的代价是一次 400 或者更糟 —— 模型收到图却当没看见，
-  /// 照常答一段，而用户以为它看过了。
+  /// 新模型（还没在 [modelCapabilities] 里单独标过的）继承它。留着这个字段而不是
+  /// 全面改成按模型：一个渠道下所有模型都能看图是很常见的情况，让用户为每个
+  /// 模型各勾一次是没必要的重复劳动。
   final bool visionCapable;
+
+  /// 渠道级的工具默认值。同上。
+  final bool toolsCapable;
+
+  /// 渠道级的联网搜索默认值。同上。只对 Gemini 原生协议有意义。
+  final bool searchCapable;
+
+  /// 模型 id → 能力。只放**被单独标过**的那些，没标的走上面两个默认值。
+  ///
+  /// 稀疏存而不是把拉回来的模型列表全存一遍：模型列表动辄几十上百条，全存下来
+  /// 之后网关下架一个模型，这里就永远留着一条指向不存在模型的记录。
+  final Map<String, ModelCapability> modelCapabilities;
 
   /// 前置多模态用的视觉模型（可选）。
   ///
@@ -55,6 +134,14 @@ class Channel {
   /// user/assistant 交替，收到 system 直接 400；更糟的一类是收下但完全
   /// 无视 —— 用户看到的是"提示词写了没用"，没有任何错误可查。
   final SystemPromptStyle systemPromptStyle;
+
+  /// Vertex AI 的 GCP 项目 ID 和区域。
+  ///
+  /// 只有绑了 Google Vertex 账号的渠道用得上。**存下来而不是只存拼好的
+  /// baseUrl**：地址是这两个值拼出来的，只存结果的话用户下次进来想改区域，
+  /// 就得从一条长 URL 里把它抠出来 —— 而抠错一个字的表现是 404。
+  final String? googleProject;
+  final String? googleLocation;
 
   /// `host:port`。空 = 直连。
   final String? proxy;
@@ -71,8 +158,13 @@ class Channel {
     this.apiFormat = 'openAI',
     this.summaryModel,
     this.visionCapable = false,
+    this.searchCapable = false,
+    this.toolsCapable = true,
+    this.modelCapabilities = const <String, ModelCapability>{},
     this.visionModel,
     this.systemPromptStyle = SystemPromptStyle.systemRole,
+    this.googleProject,
+    this.googleLocation,
     this.proxy,
     this.oauthProviderId,
     this.oauthAccountId,
@@ -89,7 +181,32 @@ class Channel {
     return uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
   }
 
+  /// 渠道默认能力。没被单独标过的模型用它。
+  ModelCapability get defaultCapability =>
+      ModelCapability(
+        vision: visionCapable,
+        tools: toolsCapable,
+        search: searchCapable,
+      );
+
+  /// 某个模型的能力。没单独标过就返回渠道默认值。
+  ModelCapability capabilityOf(String? model) {
+    final key = model?.trim() ?? '';
+    if (key.isEmpty) return defaultCapability;
+    return modelCapabilities[key] ?? defaultCapability;
+  }
+
+  /// 当前选中的那个模型的能力。绝大多数调用方要的是这个。
+  ModelCapability get activeCapability => capabilityOf(model);
+
+  /// 这个模型被单独标过（而不是在吃渠道默认值）。UI 用它区分显示。
+  bool hasExplicitCapability(String model) =>
+      modelCapabilities.containsKey(model.trim());
+
   /// 能不能拿来做前置多模态。
+  ///
+  /// 看的是 [visionModel] 而不是对话模型的能力：这个渠道是被**别的**渠道借去
+  /// 描述图片的，用的是这里指定的那个专用视觉模型。
   bool get canDescribeImages => (visionModel?.trim().isNotEmpty ?? false);
 
   bool get usesOAuth =>
@@ -138,9 +255,14 @@ class Channel {
     String? model,
     String? summaryModel,
     bool? visionCapable,
+    bool? searchCapable,
+    bool? toolsCapable,
+    Map<String, ModelCapability>? modelCapabilities,
     String? visionModel,
     bool clearVisionModel = false,
     SystemPromptStyle? systemPromptStyle,
+    String? googleProject,
+    String? googleLocation,
     String? proxy,
     String? oauthProviderId,
     String? oauthAccountId,
@@ -154,9 +276,14 @@ class Channel {
         model: model ?? this.model,
         summaryModel: summaryModel ?? this.summaryModel,
         visionCapable: visionCapable ?? this.visionCapable,
+        searchCapable: searchCapable ?? this.searchCapable,
+        toolsCapable: toolsCapable ?? this.toolsCapable,
+        modelCapabilities: modelCapabilities ?? this.modelCapabilities,
         visionModel:
             clearVisionModel ? null : (visionModel ?? this.visionModel),
         systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
+        googleProject: googleProject ?? this.googleProject,
+        googleLocation: googleLocation ?? this.googleLocation,
         proxy: proxy ?? this.proxy,
         oauthProviderId:
             clearOAuth ? null : (oauthProviderId ?? this.oauthProviderId),
@@ -172,8 +299,16 @@ class Channel {
         'model': model,
         'summary_model': summaryModel,
         'vision_capable': visionCapable,
+        'search_capable': searchCapable,
+        'tools_capable': toolsCapable,
+        'model_capabilities': <String, Object?>{
+          for (final entry in modelCapabilities.entries)
+            entry.key: entry.value.toJson(),
+        },
         'vision_model': visionModel,
         'system_prompt_style': systemPromptStyle.name,
+        'google_project': googleProject,
+        'google_location': googleLocation,
         'proxy': proxy,
         'oauth_provider': oauthProviderId,
         'oauth_account': oauthAccountId,
@@ -187,15 +322,34 @@ class Channel {
         model: (j['model'] as String?) ?? '',
         summaryModel: j['summary_model'] as String?,
         visionCapable: j['vision_capable'] as bool? ?? false,
+        searchCapable: j['search_capable'] as bool? ?? false,
+        // 老配置没有这个字段。默认 true 而不是 false —— 升级上来的用户
+        // 的终端模式本来是能用的，不该因为加了个开关就集体失效。
+        toolsCapable: j['tools_capable'] as bool? ?? true,
+        modelCapabilities: _capabilitiesFromJson(j['model_capabilities']),
         visionModel: j['vision_model'] as String?,
         systemPromptStyle: SystemPromptStyle.values
                 .where((v) => v.name == j['system_prompt_style'])
                 .firstOrNull ??
             SystemPromptStyle.systemRole,
+        googleProject: j['google_project'] as String?,
+        googleLocation: j['google_location'] as String?,
         proxy: j['proxy'] as String?,
         oauthProviderId: j['oauth_provider'] as String?,
         oauthAccountId: j['oauth_account'] as String?,
       );
+
+  static Map<String, ModelCapability> _capabilitiesFromJson(Object? raw) {
+    if (raw is! Map) return const <String, ModelCapability>{};
+    final result = <String, ModelCapability>{};
+    for (final entry in raw.entries) {
+      final value = entry.value;
+      if (value is! Map) continue;
+      result[entry.key.toString()] =
+          ModelCapability.fromJson(value.cast<String, Object?>());
+    }
+    return result;
+  }
 }
 
 class ChannelStore extends ChangeNotifier {
@@ -402,6 +556,10 @@ class ChannelStore extends ChangeNotifier {
       temperature: temperature,
       streamOutput: streamOutput,
       sendImagesInline: sendImagesInline,
+      // 只在原生协议下打开。别的协议上服务端会把 `google_search` 当成一个
+      // 未知的函数声明，整轮请求 400 —— 一个开着没用的开关不算无害。
+      webSearch: channel.apiFormat == 'geminiNative' &&
+          channel.capabilityOf(channel.model).search,
     );
   }
 }

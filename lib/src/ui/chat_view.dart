@@ -25,6 +25,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
+import '../agent/agent_loop.dart' show TokenUsage;
+import '../context/token_counter.dart';
 import '../settings/settings_store.dart';
 import 'chat_theme.dart';
 import 'image_attachments.dart';
@@ -651,6 +653,12 @@ class ChatBubble extends StatelessWidget {
   /// 时间前面的一小段附加信息，目前是模型名。
   final String? meta;
 
+  /// 这条助手消息的服务端 token 用量。null = 服务端没回报，或这是用户消息。
+  final TokenUsage? usage;
+
+  /// 显示 token 用量。关掉时连估算也不显示。
+  final bool showTokens;
+
   /// 随这条消息发出去的图片，绝对路径。
   final List<String> images;
 
@@ -685,6 +693,8 @@ class ChatBubble extends StatelessWidget {
     required this.text,
     this.time,
     this.meta,
+    this.usage,
+    this.showTokens = true,
     this.images = const <String>[],
     this.isError = false,
     this.generating = false,
@@ -772,6 +782,7 @@ class ChatBubble extends StatelessWidget {
             time: time!,
             color: timeColor,
             style: parts.bubbleTime,
+            tokens: showTokens ? _tokenLabel() : null,
           )
         : null;
 
@@ -882,6 +893,38 @@ class ChatBubble extends StatelessWidget {
         ],
       ),
     ));
+  }
+
+  /// 气泡上那一小撮 token 数。
+  ///
+  /// 助手消息用**服务端回报的真实值**：`↑` 是这次请求的整个上下文，`↓` 是生成
+  /// 的部分。上行数会随对话变长一直涨 —— 那正是它值得显示的原因，用户能直接
+  /// 看到"这一句为什么突然变贵了"。
+  ///
+  /// 用户消息没有服务端口径可言（它的开销含在下一条助手消息的上行里），显示的
+  /// 是本地估算。服务端不回报用量的网关（实测不少）下，助手消息也会是估算值。
+  /// 两种情况都用 `~` 打头 —— **不把估算和真值混成一个看起来一样的数**，
+  /// 一个能拿来对账的数字里混进估算，比不显示更糟。
+  String? _tokenLabel() {
+    final real = usage;
+    if (real != null && !real.isEmpty) {
+      final mark = real.estimated ? '~' : '';
+      return '$mark↑${_compact(real.input)} ↓${_compact(real.output)}';
+    }
+    if (_outgoing && text.isNotEmpty) {
+      return '~${_compact(TokenCounter.estimate(text))}';
+    }
+    return null;
+  }
+
+  /// 一万以下给准确值，以上折成 `12.8k`。
+  ///
+  /// 长对话的上行动辄六位数，全写出来会把气泡的一行挤没；而一万以下的数正是
+  /// 用户会拿去和账单核对的那些，不能糊。
+  static String _compact(int value) {
+    if (value < 10000) return '$value';
+    final k = value / 1000;
+    return k < 100 ? '${k.toStringAsFixed(1)}k' : '${k.round()}k';
   }
 
   PartStyle _avatarStyle(ChatSkinParts parts) =>
@@ -1111,22 +1154,33 @@ class _BubbleFooter extends StatelessWidget {
   final Color color;
   final PartStyle style;
 
+  /// 已经排好版的 token 串，例如 `↑1.2k ↓340`。null = 不显示。
+  final String? tokens;
+
   const _BubbleFooter({
     this.meta,
     required this.time,
     required this.color,
     this.style = PartStyle.empty,
+    this.tokens,
   });
 
   @override
   Widget build(BuildContext context) {
     final hhmm = '${time.hour.toString().padLeft(2, '0')}:'
         '${time.minute.toString().padLeft(2, '0')}';
+    // 顺序是「模型 · 用量　时间」：时间永远在最右，位置固定；用量插在它左边，
+    // 因为它和模型名是一组（都在说"这一句是怎么来的"）。
+    final label = <String>[
+      if (meta != null && meta!.isNotEmpty) meta!,
+      if (tokens != null) tokens!,
+    ].join(' · ');
+
     return Padding(
       // 左边留一点，免得贴着正文最后一个字。
       padding: style.padded(const EdgeInsets.only(left: 8, top: 2)),
       child: Text(
-        meta == null || meta!.isEmpty ? hhmm : '$meta  $hhmm',
+        label.isEmpty ? hhmm : '$label  $hhmm',
         style: style.styled(TextStyle(fontSize: 11.5, height: 1, color: color)),
       ),
     );
@@ -1300,7 +1354,12 @@ class _ChatComposerState extends State<ChatComposer> {
   }
 
   void _onFocusChanged() {
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {});
+      if (_focus.hasFocus) {
+        HapticFeedback.selectionClick();
+      }
+    }
   }
 
   @override
@@ -1321,6 +1380,7 @@ class _ChatComposerState extends State<ChatComposer> {
       ),
       child: _ComposerDock(
         docked: docked,
+        focused: _focus.hasFocus,
         child: Padding(
           padding: const EdgeInsets.all(5),
           child: Row(
@@ -1332,6 +1392,7 @@ class _ChatComposerState extends State<ChatComposer> {
                   blur: widget.blur,
                   opacity: widget.opacity,
                   style: field,
+                  focused: _focus.hasFocus,
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(minHeight: 42),
                     child: Padding(
@@ -1405,10 +1466,15 @@ class _ChatComposerState extends State<ChatComposer> {
 /// 把输入药丸和发送键收进同一个立体底座。底座只负责层次和对齐，玻璃材质
 /// 仍由 [_ComposerSurface] 负责，两层的职责不会在未来皮肤包里互相覆盖。
 class _ComposerDock extends StatelessWidget {
-  const _ComposerDock({required this.child, this.docked = false});
+  const _ComposerDock({
+    required this.child,
+    this.docked = false,
+    this.focused = false,
+  });
 
   final Widget child;
   final bool docked;
+  final bool focused;
 
   @override
   Widget build(BuildContext context) {
@@ -1418,7 +1484,25 @@ class _ComposerDock extends StatelessWidget {
       docked ? BorderRadius.zero : BorderRadius.circular(29),
     );
     final gradient = style.gradient;
-    return DecoratedBox(
+
+    final defaultShadows = <BoxShadow>[
+      BoxShadow(
+        color: t.composerDockShadow,
+        blurRadius: 20,
+        spreadRadius: -2,
+        offset: const Offset(0, 9),
+      ),
+      BoxShadow(
+        color: t.brand.withValues(alpha: focused ? 0.24 : 0.12),
+        blurRadius: focused ? 20 : 16,
+        spreadRadius: focused ? -2 : -5,
+        offset: const Offset(0, 2),
+      ),
+    ];
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOutCubic,
       decoration: BoxDecoration(
         borderRadius: radius,
         color: gradient == null ? style.fillColor() : null,
@@ -1431,22 +1515,14 @@ class _ComposerDock extends StatelessWidget {
                     colors: <Color>[t.composerDockTop, t.composerDockBottom],
                   )),
         border: style.borderOr(
-          Border.all(color: t.composerDockRim, width: 0.8),
+          Border.all(
+            color: focused
+                ? t.brand.withValues(alpha: 0.6)
+                : t.composerDockRim,
+            width: focused ? 1.2 : 0.8,
+          ),
         ),
-        boxShadow: style.shadowsOr(<BoxShadow>[
-          BoxShadow(
-            color: t.composerDockShadow,
-            blurRadius: 20,
-            spreadRadius: -2,
-            offset: const Offset(0, 9),
-          ),
-          BoxShadow(
-            color: t.brand.withValues(alpha: 0.12),
-            blurRadius: 16,
-            spreadRadius: -5,
-            offset: const Offset(0, 2),
-          ),
-        ]),
+        boxShadow: style.shadowsOr(defaultShadows),
       ),
       child: ClipRRect(
         borderRadius: radius,
@@ -1483,6 +1559,7 @@ class _ComposerSurface extends StatelessWidget {
     required this.opacity,
     required this.style,
     required this.child,
+    this.focused = false,
   });
 
   final ChatComposerEffect effect;
@@ -1493,6 +1570,7 @@ class _ComposerSurface extends StatelessWidget {
   /// 在这里查 context.parts —— 焦点只有它知道。
   final PartStyle style;
   final Widget child;
+  final bool focused;
 
   @override
   Widget build(BuildContext context) {
@@ -1591,13 +1669,13 @@ class _ComposerSurface extends StatelessWidget {
         ];
     }
 
-    // 皮肤给了底色或渐变就压过材质枚举 —— 用户在外观页选的"液态玻璃"是
-    // 一个内置材质，皮肤明确画了自己的填充时以皮肤为准。没给就沿用材质。
     final skinGradient = style.gradient;
     final skinColor = style.fillColor();
     final skinBlur = style.blur;
 
-    return DecoratedBox(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOutCubic,
       decoration: BoxDecoration(
         borderRadius: radius,
         boxShadow: style.shadowsOr(shadows),
@@ -1609,11 +1687,20 @@ class _ComposerSurface extends StatelessWidget {
             sigmaX: skinBlur ?? sigma,
             sigmaY: skinBlur ?? sigma,
           ),
-          child: DecoratedBox(
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOutCubic,
             decoration: BoxDecoration(
               color: skinGradient != null ? null : (skinColor ?? color),
               gradient: skinGradient ?? (skinColor != null ? null : gradient),
-              border: style.borderOr(border),
+              border: style.borderOr(
+                Border.all(
+                  color: focused
+                      ? Colors.white.withValues(alpha: dark ? 0.45 : 0.95)
+                      : border.top.color,
+                  width: focused ? 1.4 : border.top.width,
+                ),
+              ),
               borderRadius: radius,
             ),
             child: Stack(
@@ -1685,54 +1772,58 @@ class _SendButton extends StatelessWidget {
     // 写了 background 之后还看到高光渐变，会以为自己的值没生效。
     final flat = style.background?.color != null;
 
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        borderRadius: corners,
-        color: flat ? bg : null,
-        gradient: style.gradient ??
-            (flat
-                ? null
-                : LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: <Color>[top, bg, bottom],
-                  )),
-        border: style.borderOr(Border.all(
-          color: Colors.white.withValues(alpha: canSend ? 0.26 : 0.1),
-          width: 0.8,
-        )),
-        boxShadow: style.shadowsOr(<BoxShadow>[
-          const BoxShadow(
-            color: Color(0x52000000),
-            blurRadius: 7,
-            offset: Offset(0, 4),
-          ),
-          if (canSend)
-            BoxShadow(
-              color: bg.withValues(alpha: 0.32),
-              blurRadius: 10,
-              spreadRadius: -2,
-            ),
-        ]),
-      ),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: corners,
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
+    return AnimatedScale(
+      duration: const Duration(milliseconds: 200),
+      scale: canSend ? 1.0 : 0.85,
+      curve: Curves.easeOutBack,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        decoration: BoxDecoration(
           borderRadius: corners,
-          onTap: generating ? onStop : (canSend ? onSend : null),
-          child: SizedBox(
-            width: dimension,
-            height: dimension,
-            child: Icon(
-              // 停止键的图标不让皮肤改：生成中和可发送是两个必须一眼分开的
-              // 状态，皮肤把两个都换成同一个图标就分不出来了。
-              generating
-                  ? Icons.stop_rounded
-                  : style.iconOr(Icons.send_rounded),
-              size: style.iconSizeOr(21),
-              color: style.iconColorOr(Colors.white),
+          color: flat ? bg : null,
+          gradient: style.gradient ??
+              (flat
+                  ? null
+                  : LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: <Color>[top, bg, bottom],
+                    )),
+          border: style.borderOr(Border.all(
+            color: Colors.white.withValues(alpha: canSend ? 0.26 : 0.1),
+            width: 0.8,
+          )),
+          boxShadow: style.shadowsOr(<BoxShadow>[
+            const BoxShadow(
+              color: Color(0x52000000),
+              blurRadius: 7,
+              offset: Offset(0, 4),
+            ),
+            if (canSend)
+              BoxShadow(
+                color: bg.withValues(alpha: 0.32),
+                blurRadius: 10,
+                spreadRadius: -2,
+              ),
+          ]),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          borderRadius: corners,
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            borderRadius: corners,
+            onTap: generating ? onStop : (canSend ? onSend : null),
+            child: SizedBox(
+              width: dimension,
+              height: dimension,
+              child: Icon(
+                generating
+                    ? Icons.stop_rounded
+                    : style.iconOr(Icons.send_rounded),
+                size: style.iconSizeOr(21),
+                color: style.iconColorOr(Colors.white),
+              ),
             ),
           ),
         ),

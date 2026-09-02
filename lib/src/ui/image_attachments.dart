@@ -87,23 +87,35 @@ class AttachmentTray extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (paths.isEmpty) return const SizedBox.shrink();
     final t = context.chat;
-    return Container(
-      color: t.composerBg,
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      child: SizedBox(
-        height: 62,
-        child: ListView.separated(
-          scrollDirection: Axis.horizontal,
-          itemCount: paths.length,
-          separatorBuilder: (_, __) => const SizedBox(width: 8),
-          itemBuilder: (_, i) => _Thumb(
-            path: paths[i],
-            onRemove: () => onRemove(paths[i]),
-          ),
-        ),
-      ),
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 200),
+      transitionBuilder: (child, animation) {
+        return SizeTransition(
+          sizeFactor: animation,
+          axisAlignment: -1,
+          child: FadeTransition(opacity: animation, child: child),
+        );
+      },
+      child: paths.isEmpty
+          ? const SizedBox.shrink()
+          : Container(
+              key: const ValueKey('attachment_tray'),
+              color: t.composerBg,
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: SizedBox(
+                height: 62,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: paths.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                  itemBuilder: (_, i) => _Thumb(
+                    path: paths[i],
+                    onRemove: () => onRemove(paths[i]),
+                  ),
+                ),
+              ),
+            ),
     );
   }
 }

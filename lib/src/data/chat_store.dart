@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import '../agent/agent_loop.dart' show TokenUsage;
 import '../context/overflow_manager.dart';
 
 class ChatThread {
@@ -42,7 +43,7 @@ class ChatStore {
     final path = p.join(await getDatabasesPath(), 'burrow.db');
     final db = await openDatabase(
       path,
-      version: 6,
+      version: 8,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -69,6 +70,24 @@ class ChatStore {
           // 会话级系统提示词。NULL = 没设过，用全局那份。
           await db.execute('ALTER TABLE threads ADD COLUMN system_prompt TEXT');
         }
+        if (from < 7) {
+          // token 用量。老消息没有，UI 对 NULL 不显示 —— 补一个估算值会让
+          // 一个"服务端口径"的数字里混进估算，而这个字段的价值就在于它是真的。
+          await db.execute('ALTER TABLE messages ADD COLUMN tokens_in INTEGER');
+          await db
+              .execute('ALTER TABLE messages ADD COLUMN tokens_out INTEGER');
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN tokens_cached INTEGER');
+        }
+        if (from < 8) {
+          // 这一条是不是估算值。1 = 估算。
+          //
+          // 单独一档而不是并进上面那三列：v7 已经装到设备上跑过了，把四列
+          // 合成一个 `from < 8` 的话，那些设备会再执行一次前三条 ALTER，
+          // 然后挂在 "duplicate column name" 上 —— 而且是在 app 启动时挂。
+          await db.execute(
+              'ALTER TABLE messages ADD COLUMN tokens_estimated INTEGER');
+        }
       },
       onCreate: (db, _) async {
         await db.execute('''
@@ -91,7 +110,11 @@ class ChatStore {
             output_ref TEXT,
             checkpoint INTEGER,
             source TEXT,
-            images TEXT
+            images TEXT,
+            tokens_in INTEGER,
+            tokens_out INTEGER,
+            tokens_cached INTEGER,
+            tokens_estimated INTEGER
           )
         ''');
         await db.execute(
@@ -245,8 +268,23 @@ class ChatStore {
               checkpoint: row['checkpoint'] as int?,
               source: row['source'] as String?,
               images: _decodeImages(row['images'] as String?),
+              usage: _decodeUsage(row),
             ))
         .toList();
+  }
+
+  /// 三列合成一个 [TokenUsage]。全为 NULL（老消息、或服务端没回报）时返回
+  /// null —— 补一个 0 会在界面上显示成"这一轮没花 token"，那是错的。
+  static TokenUsage? _decodeUsage(Map<String, Object?> row) {
+    final input = row['tokens_in'] as int?;
+    final output = row['tokens_out'] as int?;
+    if (input == null && output == null) return null;
+    return TokenUsage(
+      input: input ?? 0,
+      output: output ?? 0,
+      cached: row['tokens_cached'] as int? ?? 0,
+      estimated: (row['tokens_estimated'] as int? ?? 0) == 1,
+    );
   }
 
   Future<void> append(String threadId, ChatMessage message) async {
@@ -259,6 +297,10 @@ class ChatStore {
       'checkpoint': message.checkpoint,
       'source': message.source,
       'images': _encodeImages(message.images),
+      'tokens_in': message.usage?.input,
+      'tokens_out': message.usage?.output,
+      'tokens_cached': message.usage?.cached,
+      'tokens_estimated': (message.usage?.estimated ?? false) ? 1 : 0,
     });
     await _db.update(
       'threads',
@@ -291,6 +333,10 @@ class ChatStore {
           'checkpoint': message.checkpoint,
           'source': message.source,
           'images': _encodeImages(message.images),
+          'tokens_in': message.usage?.input,
+          'tokens_out': message.usage?.output,
+          'tokens_cached': message.usage?.cached,
+          'tokens_estimated': (message.usage?.estimated ?? false) ? 1 : 0,
         });
       }
     });
