@@ -91,6 +91,10 @@ enum ChatComposerEffect {
 }
 
 class SettingsStore extends ChangeNotifier {
+  /// 内置皮肤和未来外部皮肤共同使用的稳定 ID。皮肤 catalog 只认 ID，
+  /// SharedPreferences 不保存显示名，避免改名后用户的选择失效。
+  static const defaultChatSkinId = 'nekogram';
+
   SettingsStore._(
     this._temperature,
     this._streamOutput,
@@ -106,6 +110,8 @@ class SettingsStore extends ChangeNotifier {
     this._messageThreshold,
     this._tokenThreshold,
     this._chatColorStyle,
+    this._chatSkinId,
+    this._chatSkinSuspended,
     this._chatWallpaperPreset,
     this._chatWallpaperPath,
     this._chatWallpaperDim,
@@ -131,6 +137,8 @@ class SettingsStore extends ChangeNotifier {
   static const _keyMessageThreshold = 'burrow.context.messageThreshold';
   static const _keyTokenThreshold = 'burrow.context.tokenThreshold';
   static const _keyChatColorStyle = 'burrow.appearance.colorStyle';
+  static const _keyChatSkinId = 'burrow.appearance.skinId';
+  static const _keyChatSkinSuspended = 'burrow.appearance.skinSuspended';
   static const _keyChatWallpaperPreset = 'burrow.appearance.wallpaperPreset';
   static const _keyChatWallpaperPath = 'burrow.appearance.wallpaperPath';
   static const _keyChatWallpaperDim = 'burrow.appearance.wallpaperDim';
@@ -177,6 +185,8 @@ class SettingsStore extends ChangeNotifier {
   int _messageThreshold;
   int _tokenThreshold;
   ChatColorStyle _chatColorStyle;
+  String _chatSkinId;
+  bool _chatSkinSuspended;
   ChatWallpaperPreset _chatWallpaperPreset;
   String _chatWallpaperPath;
   double _chatWallpaperDim;
@@ -352,6 +362,14 @@ class SettingsStore extends ChangeNotifier {
   int get tokenThreshold => _tokenThreshold;
 
   ChatColorStyle get chatColorStyle => _chatColorStyle;
+  String get chatSkinId => _chatSkinId;
+
+  /// 逃生舱：为真时忽略当前皮肤，整个界面回到内置外观。
+  ///
+  /// 持久化而不是只存在内存里 —— 一个把界面搞坏的皮肤，重启后要是又
+  /// 生效了，用户就得在看不见按钮的情况下再摸一次同样的操作。
+  bool get chatSkinSuspended => _chatSkinSuspended;
+
   ChatWallpaperPreset get chatWallpaperPreset => _chatWallpaperPreset;
   String get chatWallpaperPath => _chatWallpaperPath;
   double get chatWallpaperDim => _chatWallpaperDim;
@@ -393,6 +411,8 @@ class SettingsStore extends ChangeNotifier {
         prefs.getString(_keyChatColorStyle),
         ChatColorStyle.nekogramNight,
       ),
+      prefs.getString(_keyChatSkinId) ?? defaultChatSkinId,
+      prefs.getBool(_keyChatSkinSuspended) ?? false,
       _byName(
         ChatWallpaperPreset.values,
         prefs.getString(_keyChatWallpaperPreset),
@@ -527,6 +547,21 @@ class SettingsStore extends ChangeNotifier {
     await _prefs?.setString(_keyChatColorStyle, value.name);
   }
 
+  Future<void> setChatSkinId(String value) async {
+    final next = value.trim();
+    if (next.isEmpty || _chatSkinId == next) return;
+    _chatSkinId = next;
+    notifyListeners();
+    await _prefs?.setString(_keyChatSkinId, next);
+  }
+
+  Future<void> setChatSkinSuspended(bool value) async {
+    if (_chatSkinSuspended == value) return;
+    _chatSkinSuspended = value;
+    notifyListeners();
+    await _prefs?.setBool(_keyChatSkinSuspended, value);
+  }
+
   Future<void> setChatWallpaperPreset(ChatWallpaperPreset preset) async {
     if (_chatWallpaperPreset == preset && _chatWallpaperPath.isEmpty) return;
     _chatWallpaperPreset = preset;
@@ -614,6 +649,8 @@ class SettingsStore extends ChangeNotifier {
   /// 只重置视觉项，不碰渠道、模型或沙箱配置。
   Future<void> resetChatAppearance() async {
     _chatColorStyle = ChatColorStyle.nekogramNight;
+    _chatSkinId = defaultChatSkinId;
+    _chatSkinSuspended = false;
     _chatWallpaperPreset = ChatWallpaperPreset.classic;
     _chatWallpaperPath = '';
     _chatWallpaperDim = 0;
@@ -629,6 +666,8 @@ class SettingsStore extends ChangeNotifier {
     if (prefs == null) return;
     await Future.wait(<Future<bool>>[
       prefs.remove(_keyChatColorStyle),
+      prefs.remove(_keyChatSkinId),
+      prefs.remove(_keyChatSkinSuspended),
       prefs.remove(_keyChatWallpaperPreset),
       prefs.remove(_keyChatWallpaperPath),
       prefs.remove(_keyChatWallpaperDim),

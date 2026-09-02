@@ -1,16 +1,27 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../settings/settings_store.dart';
+import 'chat_skin.dart';
 import 'chat_theme.dart';
 import 'chat_view.dart';
+import 'skin_manifest.dart';
+import 'skin_store.dart';
 
 /// Nekogram 风格的聊天外观设置：先给一块会实时变化的对话预览，再把壁纸、
 /// 暗度和头像分组放在下面。视觉设置的结果无需退出页面猜测。
 class ChatAppearancePage extends StatefulWidget {
-  const ChatAppearancePage({required this.store, super.key});
+  const ChatAppearancePage({
+    required this.store,
+    required this.skins,
+    super.key,
+  });
 
   final SettingsStore store;
+  final ChatSkinStore skins;
 
   @override
   State<ChatAppearancePage> createState() => _ChatAppearancePageState();
@@ -24,6 +35,7 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
   late double _previewComposerOpacity = widget.store.chatComposerOpacity;
   final _previewComposerController = TextEditingController();
   String? _pickingSlot;
+  bool _importing = false;
 
   static const _presetLabels = <ChatWallpaperPreset, String>{
     ChatWallpaperPreset.classic: '经典',
@@ -126,9 +138,30 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: widget.store,
-      builder: (context, _) => Scaffold(
+    // **这一页永远用内置主题渲染，不受当前皮肤影响。**
+    //
+    // 这是三条逃生舱里最重要的一条：一个把文字和背景写成同色的皮肤会让所有
+    // 页面都读不了，而"换回别的皮肤"的唯一入口就在这一页。让它跟着坏掉的
+    // 皮肤走，等于把用户锁在里面。
+    //
+    // 代价是它和 app 其余部分长得不一样。预览区是例外 —— 那里必须显示皮肤
+    // 真实的样子，否则用户没法判断自己选的是什么。
+    final safe = buildSkinTheme(
+      Theme.of(context).brightness,
+      ChatSkinCatalog.fallback,
+    );
+    return Theme(
+      data: safe,
+      child: AnimatedBuilder(
+        animation: Listenable.merge(<Listenable>[widget.store, widget.skins]),
+        builder: (context, _) => _buildScaffold(context),
+      ),
+    );
+  }
+
+  Widget _buildScaffold(BuildContext context) {
+    return Builder(
+      builder: (context) => Scaffold(
         appBar: AppBar(
           title: const Text('聊天外观'),
           actions: <Widget>[
@@ -148,6 +181,14 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
             ),
             const SizedBox(height: 10),
             _buildColorStyleCard(),
+            const SizedBox(height: 24),
+            const _SectionTitle(
+              icon: Icons.palette_outlined,
+              title: '皮肤包',
+              subtitle: '颜色与材质通过独立皮肤包切换，个性化设置继续保留',
+            ),
+            const SizedBox(height: 10),
+            _buildSkinPackCard(),
             const SizedBox(height: 24),
             const _SectionTitle(
               icon: Icons.wallpaper_rounded,
@@ -178,6 +219,290 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
             _buildAvatarCard(),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 预览区要显示**当前皮肤真实的样子**，所以在这一小块里把主题换回去 ——
+  /// 页面其余部分仍然是内置外观，见 [build] 的说明。
+  Widget _withActiveSkin(Widget child) {
+    final skin = widget.store.chatSkinSuspended
+        ? ChatSkinCatalog.fallback
+        : ChatSkinCatalog.resolve(
+            widget.store.chatSkinId,
+            installed: widget.skins.packs,
+          );
+    return Theme(
+      data: buildSkinTheme(Theme.of(context).brightness, skin),
+      child: child,
+    );
+  }
+
+  Widget _buildSkinPackCard() {
+    final skins = ChatSkinCatalog.available(installed: widget.skins.packs);
+    final suspended = widget.store.chatSkinSuspended;
+    final broken = widget.skins.broken;
+
+    return Card(
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: <Widget>[
+          if (suspended)
+            Container(
+              width: double.infinity,
+              color: context.chat.tintWarning.withValues(alpha: 0.16),
+              padding: const EdgeInsets.all(10),
+              child: Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(
+                      '皮肤已临时停用，界面正在使用内置外观。',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: context.chat.tintPrimary,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => widget.store.setChatSkinSuspended(false),
+                    child: const Text('恢复'),
+                  ),
+                ],
+              ),
+            ),
+          for (var i = 0; i < skins.length; i++) ...<Widget>[
+            ListTile(
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+              leading: _SkinSwatch(colors: skins[i].previewColors),
+              title: Text(skins[i].name),
+              subtitle: Text(
+                <String>[
+                  if (skins[i].description.isNotEmpty) skins[i].description,
+                  if (skins[i].author.isNotEmpty) '作者：${skins[i].author}',
+                  if (skins[i].warnings.isNotEmpty)
+                    '${skins[i].warnings.length} 处已自动修正',
+                ].join(' · '),
+              ),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  if (!skins[i].builtIn)
+                    IconButton(
+                      tooltip: '卸载',
+                      icon: const Icon(Icons.delete_outline, size: 20),
+                      onPressed: () => _uninstall(skins[i]),
+                    ),
+                  if (widget.store.chatSkinId == skins[i].id && !suspended)
+                    Icon(Icons.check_circle_rounded,
+                        color: context.chat.brand)
+                  else
+                    const Icon(Icons.radio_button_unchecked_rounded),
+                ],
+              ),
+              onTap: () async {
+                await widget.store.setChatSkinId(skins[i].id);
+                // 选一个皮肤的意图就是要看到它。停用中还留着停用状态的话，
+                // 用户会以为这个皮肤坏了。
+                await widget.store.setChatSkinSuspended(false);
+                if (skins[i].warnings.isNotEmpty) _showWarnings(skins[i]);
+              },
+            ),
+            const Divider(height: 1),
+          ],
+          for (final entry in broken)
+            ListTile(
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+              leading: Icon(Icons.broken_image_outlined,
+                  color: context.chat.tintError),
+              title: Text(entry.directory),
+              subtitle: Text(
+                entry.reasons.join('\n'),
+                style: TextStyle(color: context.chat.tintError, fontSize: 12),
+              ),
+              trailing: IconButton(
+                tooltip: '删除',
+                icon: const Icon(Icons.delete_outline, size: 20),
+                onPressed: () => widget.skins.removeBroken(entry.directory),
+              ),
+            ),
+          ListTile(
+            leading: _importing
+                ? const SizedBox.square(
+                    dimension: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.add_box_outlined),
+            title: const Text('导入皮肤包'),
+            subtitle: const Text('.json 或 .zip 文件；也可以从剪贴板粘贴'),
+            onTap: _importing ? null : _showImportSheet,
+          ),
+          const Divider(height: 1),
+          ListTile(
+            leading: const Icon(Icons.ios_share_rounded),
+            title: const Text('导出当前配色'),
+            subtitle: const Text('复制成一份皮肤包 JSON，可以直接发给别人'),
+            onTap: _exportCurrent,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showImportSheet() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            ListTile(
+              leading: const Icon(Icons.folder_open_rounded),
+              title: const Text('从文件选择'),
+              subtitle: const Text('.json 或 .zip'),
+              onTap: () => Navigator.of(sheet).pop('file'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.content_paste_rounded),
+              title: const Text('从剪贴板粘贴'),
+              subtitle: const Text('一段皮肤包 JSON'),
+              onTap: () => Navigator.of(sheet).pop('clipboard'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || choice == null) return;
+    if (choice == 'file') {
+      await _importFromFile();
+    } else {
+      await _importFromClipboard();
+    }
+  }
+
+  Future<void> _importFromFile() async {
+    setState(() => _importing = true);
+    try {
+      final path = await _mediaPicker.invokeMethod<String>('pickSkinPack');
+      if (path == null || path.isEmpty) return;
+      await _applyImported(
+        () => widget.skins.installFromFile(File(path)),
+      );
+    } on PlatformException catch (error) {
+      _showError(error.message ?? '无法读取这个文件');
+    } on MissingPluginException {
+      _showError('当前平台不支持选择文件，可以改用剪贴板导入');
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  Future<void> _importFromClipboard() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text ?? '';
+    if (text.trim().isEmpty) {
+      _showError('剪贴板里没有文本');
+      return;
+    }
+    setState(() => _importing = true);
+    try {
+      await _applyImported(() => widget.skins.installFromJson(text));
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  /// 装完立刻应用。「装一个东西的意图就是要用它」—— 和 SkillStore.install
+  /// 是同一条理由。
+  Future<void> _applyImported(
+    Future<ChatSkinPack> Function() install,
+  ) async {
+    try {
+      final pack = await install();
+      await widget.store.setChatSkinId(pack.id);
+      await widget.store.setChatSkinSuspended(false);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已应用「${pack.name}」')),
+      );
+      if (pack.warnings.isNotEmpty) _showWarnings(pack);
+    } on SkinInstallException catch (error) {
+      _showError(error.message);
+    }
+  }
+
+  Future<void> _uninstall(ChatSkinPack pack) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: Text('卸载「${pack.name}」？'),
+        content: const Text('皮肤包文件会被删除。当前正在使用它的话会回到默认皮肤。'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialog).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialog).pop(true),
+            child: const Text('卸载'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.skins.uninstall(pack.id);
+    // 卸的正好是当前那个：ChatSkinCatalog.resolve 本来就会回落默认皮肤，
+    // 但设置里还留着一个指向空气的 ID，下次装回同名皮肤会莫名其妙地生效。
+    if (widget.store.chatSkinId == pack.id) {
+      await widget.store.setChatSkinId(SettingsStore.defaultChatSkinId);
+    }
+  }
+
+  /// 把当前配色导出成一份可以直接发出去的皮肤包 JSON。
+  ///
+  /// 走剪贴板而不是存文件：分享一段文本不需要任何权限和文件管理器，而这个
+  /// 功能的意义就在于"发给别人"。
+  Future<void> _exportCurrent() async {
+    final skin = ChatSkinCatalog.resolve(
+      widget.store.chatSkinId,
+      installed: widget.skins.packs,
+    );
+    final manifest = <String, Object?>{
+      'schema': SkinManifest.currentSchema,
+      'id': 'my.${skin.id.split(RegExp(r'[./]')).last}-copy',
+      'name': '${skin.name} 副本',
+      'description': skin.description,
+      'tokens': <String, Object?>{
+        'light': SkinManifest.exportTokens(skin.lightTokens),
+        'dark': SkinManifest.exportTokens(skin.darkTokens),
+      },
+    };
+    final text = const JsonEncoder.withIndent('  ').convert(manifest);
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('皮肤包 JSON 已复制到剪贴板')),
+    );
+  }
+
+  /// 被自动修正掉的问题要说出来。静默修正会让作者反复怀疑是自己写的值
+  /// 没生效，而那是最难自证的一类问题。
+  void _showWarnings(ChatSkinPack pack) {
+    showDialog<void>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: Text('「${pack.name}」有 ${pack.warnings.length} 处已自动修正'),
+        content: SingleChildScrollView(
+          child: Text(pack.warnings.join('\n\n')),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialog).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
       ),
     );
   }
@@ -247,7 +572,7 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
       ),
       clipBehavior: Clip.antiAlias,
       child: IgnorePointer(
-        child: ChatWallpaper(
+        child: _withActiveSkin(ChatWallpaper(
           preset: store.chatWallpaperPreset,
           imagePath: store.chatWallpaperPath,
           dim: _previewDim,
@@ -327,10 +652,17 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
                 blur: _previewComposerBlur,
                 opacity: _previewComposerOpacity,
                 safeAreaBottom: false,
+                leading: <Widget>[
+                  ComposerIconButton(
+                    icon: Icons.add_rounded,
+                    tooltip: '更多',
+                    onTap: () {},
+                  ),
+                ],
               ),
             ],
           ),
-        ),
+        )),
       ),
     );
   }
@@ -552,6 +884,33 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
       ),
     );
   }
+}
+
+class _SkinSwatch extends StatelessWidget {
+  const _SkinSwatch({required this.colors});
+
+  final List<Color> colors;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: 48,
+        height: 48,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: SweepGradient(colors: colors),
+          border: Border.all(
+            color: Colors.white.withValues(alpha: 0.35),
+            width: 1.2,
+          ),
+          boxShadow: const <BoxShadow>[
+            BoxShadow(
+              color: Color(0x38000000),
+              blurRadius: 8,
+              offset: Offset(0, 3),
+            ),
+          ],
+        ),
+      );
 }
 
 class _WallpaperPresetTile extends StatelessWidget {

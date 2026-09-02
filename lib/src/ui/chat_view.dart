@@ -28,6 +28,8 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import '../settings/settings_store.dart';
 import 'chat_theme.dart';
 import 'image_attachments.dart';
+import 'skin_parts.dart';
+import 'skin_style.dart';
 
 // ---------------------------------------------------------------------------
 // 壁纸
@@ -98,34 +100,57 @@ class ChatWallpaper extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
+    final style = context.parts.shellBackground;
     final brightness = Theme.of(context).brightness;
     final palette = colors(preset, t, brightness);
     final customFile = imagePath.isEmpty ? null : File(imagePath);
     final hasCustomImage = customFile?.existsSync() ?? false;
     final overlay = dim.clamp(0.0, 0.6).toDouble();
 
+    // **用户的选择压皮肤。** 自己选过图或换过预设的人，装一个新皮肤时不该
+    // 发现背景被悄悄换掉了 —— 那是他明确设过的东西。皮肤只接管"还没人动过"
+    // 的那种情况（classic 预设 + 没有自定义图）。
+    final skinOwns = preset == ChatWallpaperPreset.classic && !hasCustomImage;
+    final skinGradient = skinOwns ? style.gradient : null;
+    final skinImage = skinOwns ? style.image : null;
+    final skinFile = skinImage == null ? null : File(skinImage);
+    final hasSkinImage = skinFile?.existsSync() ?? false;
+
     return Stack(
       fit: StackFit.expand,
       children: <Widget>[
         DecoratedBox(
           decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: palette,
-            ),
+            color: skinGradient == null ? style.fillColor() : null,
+            gradient: skinGradient ??
+                LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: palette,
+                ),
           ),
         ),
-        IgnorePointer(
-          child: CustomPaint(
-            painter: _WallpaperPatternPainter(
-              color: (brightness == Brightness.dark
-                      ? Colors.white
-                      : const Color(0xFF436579))
-                  .withValues(alpha: 0.055),
+        // 涂鸦纹理是内置壁纸的一部分。皮肤自己铺了渐变或图片时就不叠 ——
+        // 叠上去会在一张精心挑过的背景图上糊一层不属于它的花纹。
+        if (skinGradient == null && !hasSkinImage)
+          IgnorePointer(
+            child: CustomPaint(
+              painter: _WallpaperPatternPainter(
+                color: (brightness == Brightness.dark
+                        ? Colors.white
+                        : const Color(0xFF436579))
+                    .withValues(alpha: 0.055),
+              ),
             ),
           ),
-        ),
+        if (hasSkinImage)
+          Image.file(
+            skinFile!,
+            fit: style.background?.fit ?? BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.medium,
+            errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+          ),
         if (hasCustomImage)
           Image.file(
             customFile!,
@@ -302,7 +327,19 @@ class BubbleShape extends ShapeBorder {
   /// 画不画尾巴。一组消息里只有最后一条画。
   final bool tail;
 
-  const BubbleShape({required this.outgoing, required this.tail});
+  /// 圆角。皮肤可以改，但只有一个值 —— 带尾巴的形状分四角没有意义，
+  /// 尾巴那个角本来就是被尾巴占掉的。
+  final double radius;
+
+  /// 尾巴伸出去的宽度。
+  final double tailWidth;
+
+  const BubbleShape({
+    required this.outgoing,
+    required this.tail,
+    this.radius = ChatShape.bubbleRadius,
+    this.tailWidth = ChatShape.tailWidth,
+  });
 
   @override
   EdgeInsetsGeometry get dimensions => EdgeInsets.zero;
@@ -328,8 +365,10 @@ class BubbleShape extends ShapeBorder {
   }
 
   Path _outgoingPath(Rect rect) {
-    const r = ChatShape.bubbleRadius;
-    const tw = ChatShape.tailWidth;
+    // 圆角不能超过气泡高度的一半，否则 arcToPoint 画出来的路径会自交，
+    // 表现是气泡边缘出现一个尖角 —— 皮肤把 radius 写成 999 时就会这样。
+    final r = radius.clamp(0.0, rect.shortestSide / 2);
+    final tw = tailWidth;
     const corner = ChatShape.bubbleTailCorner;
 
     // 气泡本体。带尾巴时右边留出尾巴的宽度。
@@ -343,7 +382,7 @@ class BubbleShape extends ShapeBorder {
     final p = Path()..moveTo(body.left + r, body.top);
     p.lineTo(body.right - r, body.top);
     p.arcToPoint(Offset(body.right, body.top + r),
-        radius: const Radius.circular(r));
+        radius: Radius.circular(r));
 
     if (tail) {
       p.lineTo(body.right, body.bottom - corner);
@@ -369,15 +408,15 @@ class BubbleShape extends ShapeBorder {
     } else {
       p.lineTo(body.right, body.bottom - r);
       p.arcToPoint(Offset(body.right - r, body.bottom),
-          radius: const Radius.circular(r));
+          radius: Radius.circular(r));
     }
 
     p.lineTo(body.left + r, body.bottom);
     p.arcToPoint(Offset(body.left, body.bottom - r),
-        radius: const Radius.circular(r));
+        radius: Radius.circular(r));
     p.lineTo(body.left, body.top + r);
     p.arcToPoint(Offset(body.left + r, body.top),
-        radius: const Radius.circular(r));
+        radius: Radius.circular(r));
     return p..close();
   }
 
@@ -386,10 +425,14 @@ class BubbleShape extends ShapeBorder {
 
   @override
   bool operator ==(Object other) =>
-      other is BubbleShape && other.outgoing == outgoing && other.tail == tail;
+      other is BubbleShape &&
+      other.outgoing == outgoing &&
+      other.tail == tail &&
+      other.radius == radius &&
+      other.tailWidth == tailWidth;
 
   @override
-  int get hashCode => Object.hash(outgoing, tail);
+  int get hashCode => Object.hash(outgoing, tail, radius, tailWidth);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,11 +445,16 @@ class ChatAvatar extends StatelessWidget {
   final String imagePath;
   final double diameter;
 
+  /// 皮肤给的样式。形状、描边、投影走它 —— 尺寸由 [diameter] 决定，
+  /// 因为调用方（气泡的占位列）需要先知道宽度才能布局。
+  final PartStyle style;
+
   const ChatAvatar({
     super.key,
     required this.role,
     this.imagePath = '',
     this.diameter = size,
+    this.style = PartStyle.empty,
   });
 
   static const double size = 32;
@@ -433,17 +481,30 @@ class ChatAvatar extends StatelessWidget {
         ),
     };
 
+    // 皮肤给了底色或渐变就用它，否则还是按角色分色 —— 角色配色是"这是谁说的"
+    // 的次要线索，皮肤没表态时不该丢掉。
+    final skinGradient = style.gradient;
+    final skinColor = style.fillColor();
+    final corners = style.rounded(BorderRadius.circular(diameter / 2));
     final fallback = DecoratedBox(
       decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: colors,
-        ),
+        borderRadius: corners,
+        color: skinGradient == null ? skinColor : null,
+        gradient: skinGradient ??
+            (skinColor != null
+                ? null
+                : LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: colors,
+                  )),
       ),
       child: Center(
-        child: Icon(icon, size: diameter * 0.53, color: Colors.white),
+        child: Icon(
+          style.iconOr(icon),
+          size: style.iconSizeOr(diameter * 0.53),
+          color: style.iconColorOr(Colors.white),
+        ),
       ),
     );
     final file = imagePath.isEmpty ? null : File(imagePath);
@@ -457,20 +518,21 @@ class ChatAvatar extends StatelessWidget {
           )
         : fallback;
 
-    return Container(
+    return style.decorate(Container(
       width: diameter,
       height: diameter,
-      padding: const EdgeInsets.all(1.5),
+      padding: style.padded(const EdgeInsets.all(1.5)),
       decoration: BoxDecoration(
-        shape: BoxShape.circle,
+        borderRadius: corners,
         color: t.headerBg,
-        boxShadow: const <BoxShadow>[
+        border: style.borderOr(null),
+        boxShadow: style.shadowsOr(const <BoxShadow>[
           BoxShadow(
               color: Color(0x22000000), blurRadius: 3, offset: Offset(0, 1)),
-        ],
+        ]),
       ),
-      child: ClipOval(child: content),
-    );
+      child: ClipRRect(borderRadius: corners, child: content),
+    ));
   }
 }
 
@@ -507,20 +569,37 @@ class _ServicePillState extends State<ServicePill> {
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
+    final style = context.parts.datePill;
     final collapsible = widget.text.length > ServicePill._collapseAbove;
-    final color = widget.isError ? t.tintError : t.tintOnService;
+    final color = style.text?.color ??
+        (widget.isError ? t.tintError : t.tintOnService);
     final showFull = _expanded || !collapsible;
 
+    // 报错胶囊不让皮肤隐藏。日期分隔藏了只是少个提示，报错藏了就是
+    // "模型没反应"而用户看不到原因。
+    if (style.hidden && !widget.isError) return const SizedBox.shrink();
+
+    final corners = style.rounded(BorderRadius.circular(14));
     return Center(
       child: GestureDetector(
         onTap:
             collapsible ? () => setState(() => _expanded = !_expanded) : null,
         child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 32),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+          margin: style.margined(
+            const EdgeInsets.symmetric(vertical: 8, horizontal: 32),
+          ),
+          padding: style.padded(
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+          ),
           decoration: BoxDecoration(
-            color: widget.isError ? t.bgErrorSecondary : t.servicePill,
-            borderRadius: BorderRadius.circular(14),
+            color: style.gradient == null
+                ? style.fillColor(
+                    widget.isError ? t.bgErrorSecondary : t.servicePill)
+                : null,
+            gradient: style.gradient,
+            border: style.borderOr(null),
+            borderRadius: corners,
+            boxShadow: style.shadowsOr(null),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -530,12 +609,12 @@ class _ServicePillState extends State<ServicePill> {
                 textAlign: showFull ? TextAlign.start : TextAlign.center,
                 maxLines: showFull ? null : 2,
                 overflow: showFull ? null : TextOverflow.ellipsis,
-                style: TextStyle(
+                style: style.styled(TextStyle(
                   fontSize: 12,
                   height: 1.4,
                   fontWeight: FontWeight.w500,
                   color: color,
-                ),
+                )),
               ),
               if (collapsible)
                 Padding(
@@ -585,6 +664,10 @@ class ChatBubble extends StatelessWidget {
   /// 这条是一组连续消息里的最后一条：画尾巴、显示头像。
   final bool lastInGroup;
 
+  /// 这条是一组连续消息里的第一条。只用于皮肤的 `:first` 状态 ——
+  /// 内置外观不区分它，但"组内第一条的上圆角大一点"是很常见的皮肤做法。
+  final bool firstInGroup;
+
   /// 当前说话者的自定义头像。空字符串使用角色默认图标。
   final String avatarPath;
 
@@ -606,6 +689,7 @@ class ChatBubble extends StatelessWidget {
     this.isError = false,
     this.generating = false,
     this.lastInGroup = true,
+    this.firstInGroup = true,
     this.avatarPath = '',
     this.showAvatar = true,
     this.onRetry,
@@ -616,75 +700,167 @@ class ChatBubble extends StatelessWidget {
 
   bool get _outgoing => role == 'user';
 
+  /// 当前这条消息该用哪一份样式。
+  ///
+  /// 优先级：流式中 > 组内末条 > 组内首条 > 无条件。generating 排最前是因为
+  /// 它是**临时**状态，用户看到的应该是"这条正在写"，而不是"这条在组里的
+  /// 位置"。
+  PartStyle _pick(PartStyle base) {
+    if (generating) {
+      final style = base.on(SkinState.generating);
+      if (style != null) return style;
+    }
+    if (lastInGroup) {
+      final style = base.on(SkinState.last);
+      if (style != null) return style;
+    }
+    if (firstInGroup) {
+      final style = base.on(SkinState.first);
+      if (style != null) return style;
+    }
+    return base;
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
-    final bg = isError
+    final parts = context.parts;
+    final layout = parts.bubbleLayout;
+    final style = _pick(parts.bubbleFor(outgoing: _outgoing, isError: isError));
+
+    final bg = style.fillColor(isError
         ? t.bgErrorSecondary
         : _outgoing
             ? t.bubbleOut
-            : t.bubbleIn;
-    final fg = isError
-        ? t.tintPrimary
-        : _outgoing
-            ? t.tintOnOut
-            : t.tintOnIn;
-    final timeColor = _outgoing ? t.timeOut : t.timeIn;
+            : t.bubbleIn)!;
+    final fg = style.text?.color ??
+        (isError
+            ? t.tintPrimary
+            : _outgoing
+                ? t.tintOnOut
+                : t.tintOnIn);
+    final timeColor =
+        parts.bubbleTime.text?.color ?? (_outgoing ? t.timeOut : t.timeIn);
 
-    final maxWidth =
-        MediaQuery.of(context).size.width * (showAvatar ? 0.76 : 0.84);
+    // 头像位置是版式开关，但用户在外观页关掉头像的优先级更高 ——
+    // 那是他显式关的。
+    final withAvatar =
+        showAvatar && parts.avatarPosition == SkinAvatarPosition.side;
 
-    final footer = time == null
-        ? null
-        : _BubbleFooter(
+    // 尾巴只在 tail 版式下存在。plain/card 本来就是"没有尾巴"的意思，
+    // 这时再读 bubble.tail 会让两个开关互相打架。
+    final withTail = layout == SkinBubbleLayout.tail &&
+        lastInGroup &&
+        !parts.bubbleTail.hidden;
+    final tailWidth =
+        withTail ? (parts.bubbleTail.size ?? ChatShape.tailWidth) : 0.0;
+
+    final maxFactor = style.maxWidthFactor ??
+        (layout == SkinBubbleLayout.card
+            ? 0.92
+            : withAvatar
+                ? 0.76
+                : 0.84);
+    final maxWidth = MediaQuery.of(context).size.width * maxFactor;
+
+    final showTime =
+        time != null && parts.timePosition != SkinTimePosition.hidden;
+    final inline = showTime && parts.timePosition == SkinTimePosition.inside;
+    final footer = showTime
+        ? _BubbleFooter(
             meta: meta,
             time: time!,
             color: timeColor,
+            style: parts.bubbleTime,
+          )
+        : null;
+
+    final defaultRadius = BorderRadius.circular(
+      layout == SkinBubbleLayout.card ? 10 : ChatShape.bubbleRadius,
+    );
+    final border = style.borderOr(null);
+    // 带尾巴的气泡是一条自定义路径，描边要沿着尾巴走 —— 那需要 BubbleShape
+    // 自己会画边框。它不会，所以 tail 版式下忽略 border，而不是画一个和尾巴
+    // 对不上的矩形框。
+    final ShapeBorder shape = layout == SkinBubbleLayout.tail
+        ? BubbleShape(
+            outgoing: _outgoing,
+            tail: withTail,
+            radius: style.radius?.maxRadius ?? ChatShape.bubbleRadius,
+            tailWidth: tailWidth,
+          )
+        : RoundedRectangleBorder(
+            borderRadius: style.rounded(defaultRadius),
+            side: border?.top ?? BorderSide.none,
           );
 
     final bubble = Container(
       constraints: BoxConstraints(maxWidth: maxWidth),
       decoration: ShapeDecoration(
-        color: bg,
-        shape: BubbleShape(outgoing: _outgoing, tail: lastInGroup),
-        shadows: const [
-          BoxShadow(
-            color: Color(0x14000000),
-            blurRadius: 1,
-            offset: Offset(0, 1),
-          ),
-        ],
+        color: style.gradient == null ? bg : null,
+        gradient: style.gradient,
+        shape: shape,
+        shadows: style.shadowsOr(
+          layout == SkinBubbleLayout.card
+              ? const <BoxShadow>[
+                  BoxShadow(
+                    color: Color(0x1F000000),
+                    blurRadius: 8,
+                    offset: Offset(0, 3),
+                  ),
+                ]
+              : const <BoxShadow>[
+                  BoxShadow(
+                    color: Color(0x14000000),
+                    blurRadius: 1,
+                    offset: Offset(0, 1),
+                  ),
+                ],
+        ),
       ),
-      padding: EdgeInsets.fromLTRB(
+      padding: style.padded(EdgeInsets.fromLTRB(
         // 带尾巴那侧要多让出尾巴的宽度，否则正文会压到钩子上。
-        _outgoing || !lastInGroup ? 11 : 11 + ChatShape.tailWidth,
+        _outgoing || !withTail ? 11 : 11 + tailWidth,
         6,
-        _outgoing && lastInGroup ? 11 + ChatShape.tailWidth : 11,
+        _outgoing && withTail ? 11 + tailWidth : 11,
         6,
-      ),
-      child: _buildBody(context, fg, footer),
+      )),
+      child: _buildBody(context, fg, inline ? footer : null, style),
     );
 
-    return Padding(
+    final Widget body = footer != null && !inline
+        ? Column(
+            crossAxisAlignment:
+                _outgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              bubble,
+              Padding(
+                padding: const EdgeInsets.only(top: 2, left: 6, right: 6),
+                child: footer,
+              ),
+            ],
+          )
+        : bubble;
+
+    return style.decorate(Padding(
       // 组内 2px、组间 8px。这个节奏是 Telegram 最直观的部分。
-      padding: EdgeInsets.only(
+      padding: style.margined(EdgeInsets.only(
         left: 8,
         right: 8,
         top: 1,
         bottom: lastInGroup ? 7 : 1,
-      ),
+      )),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         mainAxisAlignment:
             _outgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
         children: <Widget>[
-          if (!_outgoing && showAvatar) ...<Widget>[
+          if (!_outgoing && withAvatar) ...<Widget>[
             // 组内非末条也要占住头像的位置，否则气泡会左右跳。
             SizedBox(
-              width: ChatAvatar.size,
-              child: lastInGroup
-                  ? ChatAvatar(role: role, imagePath: avatarPath)
-                  : null,
+              width: _avatarSize(parts),
+              child: lastInGroup ? _avatar(parts) : null,
             ),
             const SizedBox(width: 6),
           ],
@@ -693,34 +869,50 @@ class ChatBubble extends StatelessWidget {
               onLongPressStart: generating
                   ? null
                   : (d) => _showMenu(context, d.globalPosition),
-              child: bubble,
+              child: body,
             ),
           ),
-          if (_outgoing && showAvatar) ...<Widget>[
+          if (_outgoing && withAvatar) ...<Widget>[
             const SizedBox(width: 6),
             SizedBox(
-              width: ChatAvatar.size,
-              child: lastInGroup
-                  ? ChatAvatar(role: role, imagePath: avatarPath)
-                  : null,
+              width: _avatarSize(parts),
+              child: lastInGroup ? _avatar(parts) : null,
             ),
           ],
         ],
       ),
-    );
+    ));
   }
 
-  Widget _buildBody(BuildContext context, Color fg, Widget? footer) {
+  PartStyle _avatarStyle(ChatSkinParts parts) =>
+      _outgoing ? parts.avatarUser : parts.avatarAssistant;
+
+  double _avatarSize(ChatSkinParts parts) =>
+      _avatarStyle(parts).size ?? ChatAvatar.size;
+
+  Widget _avatar(ChatSkinParts parts) => ChatAvatar(
+        role: role,
+        imagePath: avatarPath,
+        diameter: _avatarSize(parts),
+        style: _avatarStyle(parts),
+      );
+
+  Widget _buildBody(
+    BuildContext context,
+    Color fg,
+    Widget? footer,
+    PartStyle style,
+  ) {
     // 带图时先画图。图和文字之间不留边距是刻意的 —— Telegram 的图是
     // "贴着气泡内沿"的，留白会让它看起来像一张插在文字里的附件。
     final gallery = images.isEmpty
         ? null
         : BubbleImages(
             paths: images,
-            maxWidth:
-                MediaQuery.of(context).size.width * (showAvatar ? 0.76 : 0.84) -
-                    // 减掉气泡自己的左右内边距，否则图会顶出圆角。
-                    (22 + ChatShape.tailWidth),
+            maxWidth: MediaQuery.of(context).size.width *
+                    (style.maxWidthFactor ?? (showAvatar ? 0.76 : 0.84)) -
+                // 减掉气泡自己的左右内边距，否则图会顶出圆角。
+                (22 + ChatShape.tailWidth),
           );
 
     // 用户消息是纯文本，走内联时间戳那条路 —— 短消息的时间跟在同一行，
@@ -728,7 +920,7 @@ class ChatBubble extends StatelessWidget {
     if (_outgoing) {
       final body = _InlineTimeText(
         text: text,
-        style: TextStyle(fontSize: 15.5, height: 1.35, color: fg),
+        style: style.styled(TextStyle(fontSize: 15.5, height: 1.35, color: fg)),
         footer: footer,
       );
       if (gallery == null) return body;
@@ -756,13 +948,13 @@ class ChatBubble extends StatelessWidget {
       // 结果是错误内容被悄悄改写 —— 这恰恰是最不该被改写的一类文本。
       body = Text(
         text,
-        style: TextStyle(fontSize: 14.5, height: 1.45, color: fg),
+        style: style.styled(TextStyle(fontSize: 14.5, height: 1.45, color: fg)),
       );
     } else {
       body = MarkdownBody(
         data: text,
         selectable: false,
-        styleSheet: _markdownStyle(context, fg),
+        styleSheet: _markdownStyle(context, fg, style),
       );
     }
 
@@ -870,22 +1062,33 @@ class ChatBubble extends StatelessWidget {
     }
   }
 
-  MarkdownStyleSheet _markdownStyle(BuildContext context, Color fg) {
+  MarkdownStyleSheet _markdownStyle(
+    BuildContext context,
+    Color fg,
+    PartStyle style,
+  ) {
     final t = context.chat;
     final base = MarkdownStyleSheet.fromTheme(Theme.of(context));
     final codeBg = t.tintPrimary.withValues(alpha: 0.06);
+    // 正文字号跟着皮肤走，标题按比例缩放 —— 皮肤把正文调到 18 之后，
+    // 标题还停在 20 会让层级看起来是平的。
+    final body = style.styled(TextStyle(fontSize: 15.5, height: 1.45, color: fg));
+    final scale = (body.fontSize ?? 15.5) / 15.5;
     return base.copyWith(
-      p: TextStyle(fontSize: 15.5, height: 1.45, color: fg),
-      listBullet: TextStyle(fontSize: 15.5, height: 1.45, color: fg),
+      p: body,
+      listBullet: body,
       a: TextStyle(color: t.brand),
       strong: TextStyle(fontWeight: FontWeight.w600, color: fg),
       em: TextStyle(fontStyle: FontStyle.italic, color: fg),
-      h1: TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: fg),
-      h2: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: fg),
-      h3: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: fg),
+      h1: TextStyle(
+          fontSize: 20 * scale, fontWeight: FontWeight.w600, color: fg),
+      h2: TextStyle(
+          fontSize: 18 * scale, fontWeight: FontWeight.w600, color: fg),
+      h3: TextStyle(
+          fontSize: 16 * scale, fontWeight: FontWeight.w600, color: fg),
       code: TextStyle(
         fontFamily: 'monospace',
-        fontSize: 13,
+        fontSize: 13 * scale,
         backgroundColor: codeBg,
         color: fg,
       ),
@@ -906,8 +1109,14 @@ class _BubbleFooter extends StatelessWidget {
   final String? meta;
   final DateTime time;
   final Color color;
+  final PartStyle style;
 
-  const _BubbleFooter({this.meta, required this.time, required this.color});
+  const _BubbleFooter({
+    this.meta,
+    required this.time,
+    required this.color,
+    this.style = PartStyle.empty,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -915,10 +1124,10 @@ class _BubbleFooter extends StatelessWidget {
         '${time.minute.toString().padLeft(2, '0')}';
     return Padding(
       // 左边留一点，免得贴着正文最后一个字。
-      padding: const EdgeInsets.only(left: 8, top: 2),
+      padding: style.padded(const EdgeInsets.only(left: 8, top: 2)),
       child: Text(
         meta == null || meta!.isEmpty ? hhmm : '$meta  $hhmm',
-        style: TextStyle(fontSize: 11.5, height: 1, color: color),
+        style: style.styled(TextStyle(fontSize: 11.5, height: 1, color: color)),
       ),
     );
   }
@@ -999,16 +1208,28 @@ class ComposerIconButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
+    final style = context.parts.composerIcon;
     final fg = !enabled
         ? t.tintTertiary.withValues(alpha: 0.5)
-        : color ?? (active ? t.brand : t.tintTertiary);
+        : color ??
+            (active ? t.brand : style.icon?.color ?? t.tintTertiary);
+    final dimension = style.size ?? 40;
 
-    final child = InkResponse(
-      onTap: enabled ? onTap : null,
-      radius: 22,
-      child: Padding(
-        padding: const EdgeInsets.all(8),
-        child: Icon(icon, size: 22, color: fg),
+    final child = SizedBox.square(
+      dimension: dimension,
+      child: Material(
+        color: active
+            ? t.brand.withValues(alpha: 0.12)
+            : style.fillColor(Colors.transparent),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: enabled ? onTap : null,
+          child: Center(
+            child: Icon(icon, size: style.iconSizeOr(21), color: fg),
+          ),
+        ),
       ),
     );
     return tooltip == null ? child : Tooltip(message: tooltip!, child: child);
@@ -1020,7 +1241,7 @@ class ComposerIconButton extends StatelessWidget {
 /// ```
 /// [ ( 图标 [ 多行输入框 ] 图标 ) ( ● ) ]
 /// ```
-class ChatComposer extends StatelessWidget {
+class ChatComposer extends StatefulWidget {
   final TextEditingController controller;
   final bool generating;
   final bool enabled;
@@ -1055,68 +1276,201 @@ class ChatComposer extends StatelessWidget {
   });
 
   @override
+  State<ChatComposer> createState() => _ChatComposerState();
+}
+
+/// 有状态只为了一件事：把焦点变化告诉皮肤的 `:focused`。
+///
+/// 用 FocusNode 而不是 `Focus` 包一层：输入框本来就要一个 node，包一层的话
+/// 焦点会先落到外层再传进去，中间那一帧样式是错的。
+class _ChatComposerState extends State<ChatComposer> {
+  final _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _focus.addListener(_onFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focus.removeListener(_onFocusChanged);
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _onFocusChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
   Widget build(BuildContext context) {
     final t = context.chat;
+    final parts = context.parts;
+    final field = (_focus.hasFocus
+            ? parts.composerField.on(SkinState.focused)
+            : null) ??
+        parts.composerField;
+    final docked = parts.composerMode == SkinComposerMode.docked;
     final content = Padding(
-      padding: const EdgeInsets.fromLTRB(10, 5, 10, 9),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: <Widget>[
-          Expanded(
-            child: _ComposerSurface(
-              effect: effect,
-              blur: blur,
-              opacity: opacity,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: <Widget>[
-                    ...leading,
-                    Expanded(
-                      child: TextField(
-                        controller: controller,
-                        enabled: enabled,
-                        minLines: 1,
-                        maxLines: 6,
-                        style: TextStyle(fontSize: 16, color: t.tintPrimary),
-                        cursorColor: t.brand,
-                        decoration: InputDecoration(
-                          hintText: hintText,
-                          hintStyle:
-                              TextStyle(fontSize: 16, color: t.tintTertiary),
-                          // 药丸本身就是输入框的边界。
-                          border: InputBorder.none,
-                          enabledBorder: InputBorder.none,
-                          focusedBorder: InputBorder.none,
-                          disabledBorder: InputBorder.none,
-                          isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 6,
-                            vertical: 12,
+      // 贴底模式去掉外边距，输入区就从"浮在壁纸上的一滴"变成"钉在底边的一条"。
+      padding: parts.composerDock.margined(
+        docked
+            ? EdgeInsets.zero
+            : const EdgeInsets.fromLTRB(10, 5, 10, 9),
+      ),
+      child: _ComposerDock(
+        docked: docked,
+        child: Padding(
+          padding: const EdgeInsets.all(5),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              Expanded(
+                child: _ComposerSurface(
+                  effect: widget.effect,
+                  blur: widget.blur,
+                  opacity: widget.opacity,
+                  style: field,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minHeight: 42),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 3),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: <Widget>[
+                          ...widget.leading,
+                          Expanded(
+                            child: TextField(
+                              controller: widget.controller,
+                              focusNode: _focus,
+                              enabled: widget.enabled,
+                              minLines: 1,
+                              maxLines: 6,
+                              // 输入框是**必留部件**：皮肤能改字号和颜色，
+                              // 但这里从不读它的 visible —— 一个没有输入框的
+                              // 聊天页不是皮肤，是坏了。
+                              style: field.styled(
+                                TextStyle(fontSize: 16, color: t.tintPrimary),
+                              ),
+                              cursorColor: t.brand,
+                              decoration: InputDecoration(
+                                hintText: widget.hintText,
+                                hintStyle: field.styled(
+                                  TextStyle(
+                                    fontSize: 16,
+                                    color: t.tintTertiary,
+                                  ),
+                                ).copyWith(color: t.tintTertiary),
+                                // 药丸本身就是输入框的边界。
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                                disabledBorder: InputBorder.none,
+                                isDense: true,
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 5,
+                                  vertical: 10,
+                                ),
+                              ),
+                              textInputAction: TextInputAction.newline,
+                              keyboardType: TextInputType.multiline,
+                            ),
                           ),
-                        ),
-                        textInputAction: TextInputAction.newline,
-                        keyboardType: TextInputType.multiline,
+                          ...widget.trailing,
+                        ],
                       ),
                     ),
-                    ...trailing,
-                  ],
+                  ),
                 ),
               ),
-            ),
+              const SizedBox(width: 6),
+              _SendButton(
+                generating: widget.generating,
+                enabled: widget.enabled,
+                onSend: widget.onSend,
+                onStop: widget.onStop,
+              ),
+            ],
           ),
-          const SizedBox(width: 7),
-          _SendButton(
-            generating: generating,
-            enabled: enabled,
-            onSend: onSend,
-            onStop: onStop,
-          ),
-        ],
+        ),
       ),
     );
-    return safeAreaBottom ? SafeArea(top: false, child: content) : content;
+    return widget.safeAreaBottom
+        ? SafeArea(top: false, child: content)
+        : content;
+  }
+}
+
+/// 把输入药丸和发送键收进同一个立体底座。底座只负责层次和对齐，玻璃材质
+/// 仍由 [_ComposerSurface] 负责，两层的职责不会在未来皮肤包里互相覆盖。
+class _ComposerDock extends StatelessWidget {
+  const _ComposerDock({required this.child, this.docked = false});
+
+  final Widget child;
+  final bool docked;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.chat;
+    final style = context.parts.composerDock;
+    final radius = style.rounded(
+      docked ? BorderRadius.zero : BorderRadius.circular(29),
+    );
+    final gradient = style.gradient;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: radius,
+        color: gradient == null ? style.fillColor() : null,
+        gradient: gradient ??
+            (style.fillColor() != null
+                ? null
+                : LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: <Color>[t.composerDockTop, t.composerDockBottom],
+                  )),
+        border: style.borderOr(
+          Border.all(color: t.composerDockRim, width: 0.8),
+        ),
+        boxShadow: style.shadowsOr(<BoxShadow>[
+          BoxShadow(
+            color: t.composerDockShadow,
+            blurRadius: 20,
+            spreadRadius: -2,
+            offset: const Offset(0, 9),
+          ),
+          BoxShadow(
+            color: t.brand.withValues(alpha: 0.12),
+            blurRadius: 16,
+            spreadRadius: -5,
+            offset: const Offset(0, 2),
+          ),
+        ]),
+      ),
+      child: ClipRRect(
+        borderRadius: radius,
+        child: Stack(
+          children: <Widget>[
+            child,
+            // 顶边那道高光只属于立体底座。皮肤把底座改成扁平（去掉阴影）之后
+            // 还留着它，会变成一条没有来由的白线。
+            if (style.shadows == null)
+              Positioned(
+                left: 18,
+                right: 18,
+                top: 1,
+                child: IgnorePointer(
+                  child: Container(
+                    height: 1,
+                    color: Colors.white.withValues(alpha: 0.28),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -1127,12 +1481,17 @@ class _ComposerSurface extends StatelessWidget {
     required this.effect,
     required this.blur,
     required this.opacity,
+    required this.style,
     required this.child,
   });
 
   final ChatComposerEffect effect;
   final double blur;
   final double opacity;
+
+  /// 已经按焦点状态解析过的 `composer.field` 样式。由 ChatComposer 传进来而不是
+  /// 在这里查 context.parts —— 焦点只有它知道。
+  final PartStyle style;
   final Widget child;
 
   @override
@@ -1141,7 +1500,8 @@ class _ComposerSurface extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final alpha = opacity.clamp(0.25, 1.0).toDouble();
     final requestedBlur = blur.clamp(0.0, 30.0).toDouble();
-    final radius = BorderRadius.circular(ChatShape.composerRadius + 2);
+    final radius =
+        style.rounded(BorderRadius.circular(ChatShape.composerRadius + 2));
 
     final Color? color;
     final Gradient? gradient;
@@ -1231,23 +1591,37 @@ class _ComposerSurface extends StatelessWidget {
         ];
     }
 
+    // 皮肤给了底色或渐变就压过材质枚举 —— 用户在外观页选的"液态玻璃"是
+    // 一个内置材质，皮肤明确画了自己的填充时以皮肤为准。没给就沿用材质。
+    final skinGradient = style.gradient;
+    final skinColor = style.fillColor();
+    final skinBlur = style.blur;
+
     return DecoratedBox(
-      decoration: BoxDecoration(borderRadius: radius, boxShadow: shadows),
+      decoration: BoxDecoration(
+        borderRadius: radius,
+        boxShadow: style.shadowsOr(shadows),
+      ),
       child: ClipRRect(
         borderRadius: radius,
         child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+          filter: ImageFilter.blur(
+            sigmaX: skinBlur ?? sigma,
+            sigmaY: skinBlur ?? sigma,
+          ),
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: color,
-              gradient: gradient,
-              border: border,
+              color: skinGradient != null ? null : (skinColor ?? color),
+              gradient: skinGradient ?? (skinColor != null ? null : gradient),
+              border: style.borderOr(border),
               borderRadius: radius,
             ),
             child: Stack(
               children: <Widget>[
                 child,
-                if (effect == ChatComposerEffect.liquid)
+                if (effect == ChatComposerEffect.liquid &&
+                    skinGradient == null &&
+                    skinColor == null)
                   Positioned(
                     left: 22,
                     right: 22,
@@ -1291,30 +1665,74 @@ class _SendButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
+    final style = context.parts.composerSend;
     final canSend = enabled || generating;
     final bg = generating
         ? t.tintSecondary
         : canSend
-            ? t.brand
+            ? style.fillColor(t.brand)!
             // 禁用时用一个实心的弱色而不是降透明度：降透明度的话，
             // 按钮在深色下会糊进底色里，看不出这里还有个按钮。
             : t.tintTertiary.withValues(alpha: 0.35);
 
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 2),
+    final top = Color.lerp(bg, Colors.white, 0.18)!;
+    final bottom = Color.lerp(bg, Colors.black, 0.18)!;
+    final dimension = style.size ?? 42;
+    final corners = style.shape == SkinShape.rounded
+        ? style.rounded(BorderRadius.circular(12))
+        : BorderRadius.circular(dimension / 2);
+    // 皮肤给了纯色就用纯色，不再套那层上下渐变 —— 一个想做扁平发送键的皮肤
+    // 写了 background 之后还看到高光渐变，会以为自己的值没生效。
+    final flat = style.background?.color != null;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: corners,
+        color: flat ? bg : null,
+        gradient: style.gradient ??
+            (flat
+                ? null
+                : LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: <Color>[top, bg, bottom],
+                  )),
+        border: style.borderOr(Border.all(
+          color: Colors.white.withValues(alpha: canSend ? 0.26 : 0.1),
+          width: 0.8,
+        )),
+        boxShadow: style.shadowsOr(<BoxShadow>[
+          const BoxShadow(
+            color: Color(0x52000000),
+            blurRadius: 7,
+            offset: Offset(0, 4),
+          ),
+          if (canSend)
+            BoxShadow(
+              color: bg.withValues(alpha: 0.32),
+              blurRadius: 10,
+              spreadRadius: -2,
+            ),
+        ]),
+      ),
       child: Material(
-        color: bg,
-        shape: const CircleBorder(),
+        color: Colors.transparent,
+        borderRadius: corners,
+        clipBehavior: Clip.antiAlias,
         child: InkWell(
-          customBorder: const CircleBorder(),
+          borderRadius: corners,
           onTap: generating ? onStop : (canSend ? onSend : null),
           child: SizedBox(
-            width: 44,
-            height: 44,
+            width: dimension,
+            height: dimension,
             child: Icon(
-              generating ? Icons.stop_rounded : Icons.send_rounded,
-              size: 21,
-              color: Colors.white,
+              // 停止键的图标不让皮肤改：生成中和可发送是两个必须一眼分开的
+              // 状态，皮肤把两个都换成同一个图标就分不出来了。
+              generating
+                  ? Icons.stop_rounded
+                  : style.iconOr(Icons.send_rounded),
+              size: style.iconSizeOr(21),
+              color: style.iconColorOr(Colors.white),
             ),
           ),
         ),

@@ -14,6 +14,7 @@ import '../settings/settings_store.dart';
 import 'agent_settings_page.dart';
 import 'chat_appearance_page.dart';
 import 'channels_page.dart';
+import 'skin_store.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -25,6 +26,7 @@ class SettingsPage extends StatefulWidget {
     required this.currentTaskId,
     required this.overflow,
     required this.snapshots,
+    required this.skins,
     super.key,
   });
 
@@ -43,6 +45,9 @@ class SettingsPage extends StatefulWidget {
   final String currentTaskId;
   final OverflowManager overflow;
   final SnapshotStore snapshots;
+
+  /// 只为传给外观页。设置页自己不碰皮肤。
+  final ChatSkinStore skins;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -168,7 +173,9 @@ class _SettingsPageState extends State<SettingsPage> {
                     : '内置背景 · 头像与气泡预览',
               ),
               trailing: const Icon(Icons.chevron_right),
-              onTap: () => _push(ChatAppearancePage(store: widget.store)),
+              onTap: () => _push(
+                ChatAppearancePage(store: widget.store, skins: widget.skins),
+              ),
             ),
           ),
           const SizedBox(height: 18),

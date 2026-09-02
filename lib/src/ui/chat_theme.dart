@@ -88,6 +88,13 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
   /// 输入框那颗药丸的底色。
   final Color composerField;
 
+  /// 输入区最外层立体底座。皮肤包可以只替换这四个令牌，就改变底座的
+  /// 材质与投影，不需要碰输入框布局。
+  final Color composerDockTop;
+  final Color composerDockBottom;
+  final Color composerDockRim;
+  final Color composerDockShadow;
+
   const ChatTokens({
     required this.bgPrimary,
     required this.bgSecondary,
@@ -115,6 +122,10 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
     required this.headerBg,
     required this.composerBg,
     required this.composerField,
+    required this.composerDockTop,
+    required this.composerDockBottom,
+    required this.composerDockRim,
+    required this.composerDockShadow,
   });
 
   static const light = ChatTokens(
@@ -144,6 +155,10 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
     headerBg: Color(0xFFFFFFFF),
     composerBg: Color(0xFFFFFFFF),
     composerField: Color(0xFFF1F3F5),
+    composerDockTop: Color(0xFFFDFEFF),
+    composerDockBottom: Color(0xFFDCE8EE),
+    composerDockRim: Color(0xFFFFFFFF),
+    composerDockShadow: Color(0x52071A25),
   );
 
   static const dark = ChatTokens(
@@ -175,7 +190,145 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
     headerBg: Color(0xFF17212B),
     composerBg: Color(0xFF17212B),
     composerField: Color(0xFF232E3C),
+    composerDockTop: Color(0xFF18384A),
+    composerDockBottom: Color(0xFF071B26),
+    composerDockRim: Color(0xFF3C6479),
+    composerDockShadow: Color(0xC0000810),
   );
+
+  /// 按令牌名覆盖。皮肤包的 `tokens` 块走这里。
+  ///
+  /// 一个 30 路的 switch 而不是反射或者 `Map<String, Color>` 字段：反射在
+  /// Flutter 里不可用，而把令牌存成 map 会让 [ChatTokens] 的每次取值都变成
+  /// 一次字符串哈希 —— 那正是这套令牌存在的意义（编译期字段访问）的反面。
+  /// 代价是这里加一个令牌要改两处，而那是加令牌本来就该付的成本。
+  ///
+  /// **不认识的键忽略，认识但值写错的键保持原值。** 皮肤包是别人写的，
+  /// 一个拼错的键不该让整套配色回到出厂状态。
+  ChatTokens applyOverrides(
+    Map<String, Object?> overrides,
+    Color? Function(Object? raw) parse, {
+    void Function(String message)? onWarning,
+  }) {
+    var result = this;
+    for (final entry in overrides.entries) {
+      final color = parse(entry.value);
+      if (color == null) {
+        onWarning?.call('令牌 ${entry.key} 的值无法解析：${entry.value}');
+        continue;
+      }
+      final next = result._withNamed(entry.key, color);
+      if (next == null) {
+        onWarning?.call('未知令牌：${entry.key}');
+        continue;
+      }
+      result = next;
+    }
+    return result;
+  }
+
+  ChatTokens? _withNamed(String name, Color c) => switch (name) {
+        'bgPrimary' => copyWith(bgPrimary: c),
+        'bgSecondary' => copyWith(bgSecondary: c),
+        'bgTertiary' => copyWith(bgTertiary: c),
+        'bgBrandSecondary' => copyWith(bgBrandSecondary: c),
+        'bgErrorSecondary' => copyWith(bgErrorSecondary: c),
+        'tintPrimary' => copyWith(tintPrimary: c),
+        'tintSecondary' => copyWith(tintSecondary: c),
+        'tintTertiary' => copyWith(tintTertiary: c),
+        'tintError' => copyWith(tintError: c),
+        'tintWarning' => copyWith(tintWarning: c),
+        'tintSuccess' => copyWith(tintSuccess: c),
+        'borderPrimary' => copyWith(borderPrimary: c),
+        'brand' => copyWith(brand: c),
+        'wallpaperTop' => copyWith(wallpaperTop: c),
+        'wallpaperBottom' => copyWith(wallpaperBottom: c),
+        'bubbleIn' => copyWith(bubbleIn: c),
+        'bubbleOut' => copyWith(bubbleOut: c),
+        'tintOnIn' => copyWith(tintOnIn: c),
+        'tintOnOut' => copyWith(tintOnOut: c),
+        'timeIn' => copyWith(timeIn: c),
+        'timeOut' => copyWith(timeOut: c),
+        'servicePill' => copyWith(servicePill: c),
+        'tintOnService' => copyWith(tintOnService: c),
+        'headerBg' => copyWith(headerBg: c),
+        'composerBg' => copyWith(composerBg: c),
+        'composerField' => copyWith(composerField: c),
+        'composerDockTop' => copyWith(composerDockTop: c),
+        'composerDockBottom' => copyWith(composerDockBottom: c),
+        'composerDockRim' => copyWith(composerDockRim: c),
+        'composerDockShadow' => copyWith(composerDockShadow: c),
+        _ => null,
+      };
+
+  /// 所有令牌名，给导出和外观页的报错提示用。顺序和 [applyOverrides] 一致。
+  static const tokenNames = <String>[
+    'bgPrimary',
+    'bgSecondary',
+    'bgTertiary',
+    'bgBrandSecondary',
+    'bgErrorSecondary',
+    'tintPrimary',
+    'tintSecondary',
+    'tintTertiary',
+    'tintError',
+    'tintWarning',
+    'tintSuccess',
+    'borderPrimary',
+    'brand',
+    'wallpaperTop',
+    'wallpaperBottom',
+    'bubbleIn',
+    'bubbleOut',
+    'tintOnIn',
+    'tintOnOut',
+    'timeIn',
+    'timeOut',
+    'servicePill',
+    'tintOnService',
+    'headerBg',
+    'composerBg',
+    'composerField',
+    'composerDockTop',
+    'composerDockBottom',
+    'composerDockRim',
+    'composerDockShadow',
+  ];
+
+  /// 按名取值。导出皮肤包时用。
+  Color? named(String name) => switch (name) {
+        'bgPrimary' => bgPrimary,
+        'bgSecondary' => bgSecondary,
+        'bgTertiary' => bgTertiary,
+        'bgBrandSecondary' => bgBrandSecondary,
+        'bgErrorSecondary' => bgErrorSecondary,
+        'tintPrimary' => tintPrimary,
+        'tintSecondary' => tintSecondary,
+        'tintTertiary' => tintTertiary,
+        'tintError' => tintError,
+        'tintWarning' => tintWarning,
+        'tintSuccess' => tintSuccess,
+        'borderPrimary' => borderPrimary,
+        'brand' => brand,
+        'wallpaperTop' => wallpaperTop,
+        'wallpaperBottom' => wallpaperBottom,
+        'bubbleIn' => bubbleIn,
+        'bubbleOut' => bubbleOut,
+        'tintOnIn' => tintOnIn,
+        'tintOnOut' => tintOnOut,
+        'timeIn' => timeIn,
+        'timeOut' => timeOut,
+        'servicePill' => servicePill,
+        'tintOnService' => tintOnService,
+        'headerBg' => headerBg,
+        'composerBg' => composerBg,
+        'composerField' => composerField,
+        'composerDockTop' => composerDockTop,
+        'composerDockBottom' => composerDockBottom,
+        'composerDockRim' => composerDockRim,
+        'composerDockShadow' => composerDockShadow,
+        _ => null,
+      };
 
   @override
   ChatTokens copyWith({
@@ -205,6 +358,10 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
     Color? headerBg,
     Color? composerBg,
     Color? composerField,
+    Color? composerDockTop,
+    Color? composerDockBottom,
+    Color? composerDockRim,
+    Color? composerDockShadow,
   }) =>
       ChatTokens(
         bgPrimary: bgPrimary ?? this.bgPrimary,
@@ -233,6 +390,10 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
         headerBg: headerBg ?? this.headerBg,
         composerBg: composerBg ?? this.composerBg,
         composerField: composerField ?? this.composerField,
+        composerDockTop: composerDockTop ?? this.composerDockTop,
+        composerDockBottom: composerDockBottom ?? this.composerDockBottom,
+        composerDockRim: composerDockRim ?? this.composerDockRim,
+        composerDockShadow: composerDockShadow ?? this.composerDockShadow,
       );
 
   @override
@@ -266,6 +427,10 @@ class ChatTokens extends ThemeExtension<ChatTokens> {
       headerBg: c(headerBg, other.headerBg),
       composerBg: c(composerBg, other.composerBg),
       composerField: c(composerField, other.composerField),
+      composerDockTop: c(composerDockTop, other.composerDockTop),
+      composerDockBottom: c(composerDockBottom, other.composerDockBottom),
+      composerDockRim: c(composerDockRim, other.composerDockRim),
+      composerDockShadow: c(composerDockShadow, other.composerDockShadow),
     );
   }
 }

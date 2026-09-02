@@ -35,6 +35,7 @@ import 'src/settings/channel_store.dart';
 import 'src/settings/settings_store.dart';
 import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
+import 'src/ui/skin_store.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -284,6 +285,14 @@ Future<void> _boot({
   );
   await skills.open();
 
+  // 皮肤包装在 app 私有目录，**不是** rootfs —— rootfs 会被整个换掉，
+  // 换个发行版皮肤就没了；而降级模式下压根没有 rootfs，那样连主题都起不来。
+  //
+  // 在 runApp 之前 await：异步在首帧之后加载会先闪一下默认主题，
+  // 而主题闪烁是那种"看着就很廉价"的 bug。
+  final skins = ChatSkinStore(root: Directory('${files.path}/skins'));
+  await skins.open();
+
   // 前置多模态：对话模型不认图时，先找一个配了视觉模型的渠道把图描述成文字。
   //
   // 候选**每次现算**而不是启动时定好：渠道随时会被改、被删，
@@ -309,6 +318,7 @@ Future<void> _boot({
   );
 
   runApp(BurrowApp(
+    skins: skins,
     buildRuntime: buildRuntime,
     buildAgent: (host, runtime) => AgentLoop(
       llm: llm,

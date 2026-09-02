@@ -7,6 +7,7 @@ library;
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -33,6 +34,12 @@ import '../settings/channel_store.dart';
 import '../skills/skill_store.dart';
 import 'channels_page.dart';
 import 'chat_drawer.dart';
+import 'chat_appearance_page.dart';
+import 'chat_skin.dart';
+import 'skin_affordance.dart';
+import 'skin_parts.dart';
+import 'skin_store.dart';
+import 'skin_style.dart';
 import 'chat_theme.dart';
 import 'chat_view.dart';
 import 'image_attachments.dart';
@@ -327,30 +334,6 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
 // 主应用
 // ---------------------------------------------------------------------------
 
-/// 主题。种子色和各处底色见 chat_theme.dart，
-/// 让 Material 组件（弹窗、按钮、进度条）和聊天区是同一套颜色 ——
-/// 只改聊天区的话，一点开设置页就会看出是两个 app 拼起来的。
-ThemeData _buildTheme(Brightness brightness) {
-  final tokens =
-      brightness == Brightness.light ? ChatTokens.light : ChatTokens.dark;
-  return ThemeData(
-    useMaterial3: true,
-    brightness: brightness,
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: tokens.brand,
-      brightness: brightness,
-    ).copyWith(surface: tokens.bgPrimary),
-    scaffoldBackgroundColor: tokens.bgPrimary,
-    appBarTheme: AppBarTheme(
-      backgroundColor: tokens.bgPrimary,
-      foregroundColor: tokens.tintPrimary,
-      surfaceTintColor: Colors.transparent,
-      elevation: 0,
-    ),
-    extensions: <ThemeExtension<dynamic>>[tokens],
-  );
-}
-
 class BurrowApp extends StatelessWidget {
   final AgentLoop Function(AgentHost host, TaskRuntime runtime) buildAgent;
   final Future<TaskRuntime> Function(String taskId) buildRuntime;
@@ -374,6 +357,10 @@ class BurrowApp extends StatelessWidget {
   final AccountStore accounts;
   final ChannelStore channels;
 
+  /// 已安装的外部皮肤包。和 settings 一起被监听 —— 装完一个皮肤要立刻
+  /// 出现在列表里，而它不属于 SettingsStore。
+  final ChatSkinStore skins;
+
   const BurrowApp({
     super.key,
     required this.buildAgent,
@@ -390,40 +377,52 @@ class BurrowApp extends StatelessWidget {
     required this.skills,
     required this.accounts,
     required this.channels,
+    required this.skins,
   });
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
-        animation: settings,
-        builder: (context, _) => MaterialApp(
-          title: 'Burrow',
-          locale: _appLocale,
-          supportedLocales: _supportedLocales,
-          localizationsDelegates: _localizationsDelegates,
-          theme: _buildTheme(Brightness.light),
-          darkTheme: _buildTheme(Brightness.dark),
-          themeMode: switch (settings.chatColorStyle) {
-            ChatColorStyle.nekogramNight => ThemeMode.dark,
-            ChatColorStyle.followSystem => ThemeMode.system,
-            ChatColorStyle.light => ThemeMode.light,
-          },
-          home: ChatShell(
-            buildAgent: buildAgent,
-            buildRuntime: buildRuntime,
-            capabilities: capabilities,
-            prefixGens: prefixGens,
-            spawner: spawner,
-            activeDistro: activeDistro,
-            distros: distros,
-            abi: abi,
-            llm: llm,
-            settings: settings,
-            chats: chats,
-            skills: skills,
-            accounts: accounts,
-            channels: channels,
-          ),
-        ),
+        animation: Listenable.merge(<Listenable>[settings, skins]),
+        builder: (context, _) {
+          // 逃生舱：停用中就整套回内置外观，连解析都不做 —— 一个能让
+          // 界面不可用的皮肤，不该在"已经停用它"之后还有机会参与渲染。
+          final skin = settings.chatSkinSuspended
+              ? ChatSkinCatalog.fallback
+              : ChatSkinCatalog.resolve(
+                  settings.chatSkinId,
+                  installed: skins.packs,
+                );
+          return MaterialApp(
+            title: 'Burrow',
+            locale: _appLocale,
+            supportedLocales: _supportedLocales,
+            localizationsDelegates: _localizationsDelegates,
+            theme: buildSkinTheme(Brightness.light, skin),
+            darkTheme: buildSkinTheme(Brightness.dark, skin),
+            themeMode: switch (settings.chatColorStyle) {
+              ChatColorStyle.nekogramNight => ThemeMode.dark,
+              ChatColorStyle.followSystem => ThemeMode.system,
+              ChatColorStyle.light => ThemeMode.light,
+            },
+            home: ChatShell(
+              skins: skins,
+              buildAgent: buildAgent,
+              buildRuntime: buildRuntime,
+              capabilities: capabilities,
+              prefixGens: prefixGens,
+              spawner: spawner,
+              activeDistro: activeDistro,
+              distros: distros,
+              abi: abi,
+              llm: llm,
+              settings: settings,
+              chats: chats,
+              skills: skills,
+              accounts: accounts,
+              channels: channels,
+            ),
+          );
+        },
       );
 }
 
@@ -452,6 +451,9 @@ class ChatShell extends StatefulWidget {
   final AccountStore accounts;
   final ChannelStore channels;
 
+  /// 只往下传，见 BurrowApp.skins。
+  final ChatSkinStore skins;
+
   const ChatShell({
     super.key,
     required this.buildAgent,
@@ -468,6 +470,7 @@ class ChatShell extends StatefulWidget {
     required this.skills,
     required this.accounts,
     required this.channels,
+    required this.skins,
   });
 
   @override
@@ -525,6 +528,7 @@ class _ChatShellState extends State<ChatShell> {
       skills: widget.skills,
       accounts: widget.accounts,
       channels: widget.channels,
+      skins: widget.skins,
       threadId: _threadId,
       title: _title,
       onSelectThread: _select,
@@ -559,6 +563,9 @@ class HomeShell extends StatefulWidget {
   final SkillStore skills;
   final AccountStore accounts;
   final ChannelStore channels;
+
+  /// 只往下传，见 BurrowApp.skins。
+  final ChatSkinStore skins;
   final String? threadId;
   final String title;
 
@@ -585,6 +592,7 @@ class HomeShell extends StatefulWidget {
     required this.skills,
     required this.accounts,
     required this.channels,
+    required this.skins,
     required this.threadId,
     required this.title,
     required this.onSelectThread,
@@ -603,6 +611,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   final List<ChatMessage> _visible = [];
   final _input = TextEditingController();
   final _scroll = ScrollController();
+
+  /// 抽屉入口是我们自己 compose 的（见 _buildDrawerButton），所以要一个 key
+  /// 才能从 AppBar 里够到 Scaffold。
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  /// 列表是否已经滚离顶部。皮肤的 `header:scrolled` 状态靠它。
+  /// 只在**跨过阈值**时 setState，不是每帧 —— 顶栏样式没有中间态。
+  bool _scrolledAway = false;
 
   /// 已经选好、还没发出去的图。存的是**拷进会话目录之后**的路径 ——
   /// 相册给的那个路径在系统缓存里，随时会被清掉。
@@ -656,12 +672,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 界面还是旧的，用户会以为那个开关坏了 —— 而它其实已经存下去了，
     // 只是要杀进程重开才看得到，这是最难自证的一类"没生效"。
     widget.settings.addListener(_onSettingsChanged);
+    _scroll.addListener(_onScroll);
     _prepareRuntime();
-  }
-
-  /// 当前提供商名，用来给底部模型标来源。
-  String? get _sourceName {
-    return widget.channels.active?.providerLabel;
   }
 
   String? _displayMessageSource(String? source) {
@@ -795,6 +807,105 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     }
   }
 
+  // ---- 顶栏：骨架固定，皮肤只提供样式 ----
+
+  PartStyle get _header {
+    final parts = context.parts;
+    return (_scrolledAway ? parts.header.on(SkinState.scrolled) : null) ??
+        parts.header;
+  }
+
+  /// 顶栏的渐变、背景图和毛玻璃。放 flexibleSpace 而不是 backgroundColor：
+  /// 后者只吃得下一个纯色。
+  Widget? _buildHeaderBackdrop() {
+    final style = _header;
+    if (style.gradient == null && style.image == null && style.blur == null) {
+      return null;
+    }
+    return SkinBox(style: style, child: const SizedBox.expand());
+  }
+
+  /// 抽屉入口。**必留部件**，见 skin_affordance.dart 的说明。
+  Widget _buildDrawerButton() {
+    final t = context.chat;
+    return Center(
+      child: SkinAffordance(
+        style: context.parts.headerDrawer,
+        icon: Icons.menu_rounded,
+        foreground: t.tintPrimary,
+        behind: _header.fillColor(t.headerBg) ?? t.headerBg,
+        tooltip: '会话与设置（长按可临时停用皮肤）',
+        onTap: () => _scaffoldKey.currentState?.openDrawer(),
+        onLongPress: _showSkinSafetyMenu,
+      ),
+    );
+  }
+
+  /// 逃生舱菜单。
+  ///
+  /// **整个菜单用内置主题渲染**，不受当前皮肤影响 —— 这个菜单存在的唯一理由
+  /// 就是"皮肤把界面搞坏了"，让它跟着坏掉的皮肤走就等于没有这个功能。
+  Future<void> _showSkinSafetyMenu() async {
+    final settings = widget.settings;
+    final safe = buildSkinTheme(
+      Theme.of(context).brightness,
+      ChatSkinCatalog.fallback,
+    );
+    final tokens = safe.extension<ChatTokens>() ?? ChatTokens.dark;
+    final suspended = settings.chatSkinSuspended;
+
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: tokens.bgPrimary,
+      builder: (sheetContext) => Theme(
+        data: safe,
+        child: SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              ListTile(
+                leading: Icon(
+                  suspended ? Icons.palette_outlined : Icons.format_paint_outlined,
+                  color: tokens.tintPrimary,
+                ),
+                title: Text(
+                  suspended ? '恢复皮肤' : '临时停用皮肤',
+                  style: TextStyle(color: tokens.tintPrimary),
+                ),
+                subtitle: Text(
+                  suspended ? '重新应用当前选中的皮肤包' : '整个界面回到内置外观，皮肤包不会被卸载',
+                  style: TextStyle(color: tokens.tintSecondary, fontSize: 12),
+                ),
+                onTap: () => Navigator.of(sheetContext).pop('toggle'),
+              ),
+              ListTile(
+                leading: Icon(Icons.tune_rounded, color: tokens.tintPrimary),
+                title: Text('聊天外观', style: TextStyle(color: tokens.tintPrimary)),
+                onTap: () => Navigator.of(sheetContext).pop('appearance'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (!mounted) return;
+    switch (choice) {
+      case 'toggle':
+        await settings.setChatSkinSuspended(!suspended);
+      case 'appearance':
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => ChatAppearancePage(
+              store: settings,
+              skins: widget.skins,
+            ),
+          ),
+        );
+        if (mounted) setState(() {});
+    }
+  }
+
   // ---- 抽屉里的入口 ----
 
   Future<void> _openSettings() async {
@@ -810,6 +921,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           currentTaskId: _runtime.id,
           overflow: _agent.overflow,
           snapshots: _runtime.snapshots,
+          skins: widget.skins,
         ),
       ),
     );
@@ -1026,6 +1138,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       unawaited(_runtime.root.delete(recursive: true));
     }
     _input.dispose();
+    _scroll.removeListener(_onScroll);
     _scroll.dispose();
     _streamPaintTimer?.cancel();
     super.dispose();
@@ -1208,6 +1321,12 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     await _send();
   }
 
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final away = _scroll.offset > 12;
+    if (away != _scrolledAway && mounted) setState(() => _scrolledAway = away);
+  }
+
   void _scrollToEnd({bool animated = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
@@ -1239,6 +1358,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         if (!didPop) setState(() => _tab = 0);
       },
       child: Scaffold(
+        key: _scaffoldKey,
+        // 顶栏透明时让壁纸从它下面穿过去。**层序不变** —— AppBar 仍然画在
+        // body 之上，所以必留的抽屉入口不可能被皮肤控制的图层盖住。
+        extendBodyBehindAppBar:
+            context.parts.headerStyle == SkinHeaderStyle.transparent,
         drawer: ChatDrawer(
           store: widget.chats,
           currentThreadId: _threadId,
@@ -1248,7 +1372,17 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           onOpenChannels: _openChannels,
         ),
         appBar: AppBar(
-          backgroundColor: context.chat.headerBg,
+          backgroundColor: _header.fillColor(
+            context.parts.headerStyle == SkinHeaderStyle.transparent
+                ? Colors.transparent
+                : context.chat.headerBg,
+          ),
+          flexibleSpace: _buildHeaderBackdrop(),
+          toolbarHeight: _header.height,
+          // 抽屉入口是**必留部件**：皮肤能改图标、底色、形状、大小，不能让它
+          // 消失。Scaffold 默认会自己插一个汉堡，这里换成我们钳制过的那颗。
+          leading: _buildDrawerButton(),
+          leadingWidth: math.max(56, (_header.size ?? 0) + 56),
           titleSpacing: 0,
           // Telegram 的顶栏是「名字 + 一行状态」。点它进设置 ——
           // 对应 Telegram 里点头部进「聊天信息」。
@@ -1261,7 +1395,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                   ChatAvatar(
                     role: 'assistant',
                     imagePath: widget.settings.assistantAvatarPath,
-                    diameter: 38,
+                    diameter: context.parts.headerAvatar.size ?? 38,
+                    style: context.parts.headerAvatar,
                   ),
                   const SizedBox(width: 10),
                   Expanded(
@@ -1273,10 +1408,12 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                           widget.title,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 16.5,
-                            fontWeight: FontWeight.w600,
-                            color: context.chat.tintPrimary,
+                          style: context.parts.headerTitle.styled(
+                            TextStyle(
+                              fontSize: 16.5,
+                              fontWeight: FontWeight.w600,
+                              color: context.chat.tintPrimary,
+                            ),
                           ),
                         ),
                         const SizedBox(height: 1),
@@ -1295,9 +1432,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
               tooltip: _threadPrompt == null ? '系统提示词' : '这个会话有自己的系统提示词',
               icon: Icon(
                 Icons.psychology_outlined,
+                size: context.parts.headerAction.iconSizeOr(24),
                 // 会话有自己那份时点亮：它会盖掉全局，而"为什么这个会话
-                // 说话方式不一样"要能一眼看出来。
-                color: _threadPrompt == null ? null : context.chat.brand,
+                // 说话方式不一样"要能一眼看出来。皮肤能改常态色，改不了
+                // 这个点亮色 —— 它是状态指示，不是装饰。
+                color: _threadPrompt == null
+                    ? context.parts.headerAction.icon?.color
+                    : context.chat.brand,
               ),
               onPressed: _editThreadPrompt,
             ),
@@ -1352,9 +1493,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             dim: widget.settings.chatWallpaperDim,
             child: ListView.builder(
               controller: _scroll,
-              // 模型条和输入区悬浮在列表上面；给最后一条消息留下同等空间，
+              // 输入区悬浮在列表上面；给最后一条消息留下同等空间，
               // 否则它会停在玻璃下面，看得见却点不到。
-              padding: EdgeInsets.fromLTRB(0, 8, 0, 136 + bottomInset),
+              padding: context.parts.list.padded(
+                EdgeInsets.fromLTRB(0, 8, 0, 84 + bottomInset),
+              ),
               itemCount: rows.length,
               itemBuilder: (_, i) => _buildRow(rows[i]),
             ),
@@ -1376,15 +1519,6 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                   unawaited(File(path).delete().catchError((_) => File(path)));
                 }),
               ),
-              ModelSwitchBar(
-                model: widget.settings.config.model,
-                embeddingModel: widget.settings.embeddingModel,
-                sourceName: _sourceName,
-                embeddingError: _agent.retrieval.lastEmbeddingError,
-                onPickModel: _pickModel,
-                onPickEmbedding: _pickEmbeddingModel,
-                floating: true,
-              ),
               ChatComposer(
                 controller: _input,
                 generating: _busy,
@@ -1395,9 +1529,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                 effect: widget.settings.chatComposerEffect,
                 blur: widget.settings.chatComposerBlur,
                 opacity: widget.settings.chatComposerOpacity,
-                leading: [_buildAttachButton(), _buildTerminalButton()],
-                // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
-                trailing: [if (_agent.terminalMode) _buildApprovalButton()],
+                leading: [_buildPlusButton()],
               ),
             ],
           ),
@@ -1423,7 +1555,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       final lastInGroup = next == null
           ? streaming == null || message.role != 'assistant'
           : next.role != message.role || !_sameDay(message.at, next.at);
-      rows.add(_ChatRow.message(i, lastInGroup));
+      // 组内第一条。皮肤的 `:first` 状态要它 —— 判据和上面插日期分隔的那条
+      // 一致，否则"组"在两处会是两个不同的概念。
+      final previous = i > 0 ? _visible[i - 1] : null;
+      final firstInGroup = previous == null ||
+          previous.role != message.role ||
+          !_sameDay(previous.at, message.at);
+      rows.add(_ChatRow.message(i, lastInGroup, firstInGroup));
     }
     if (streaming != null) rows.add(_ChatRow.streaming(streaming));
     return rows;
@@ -1470,6 +1608,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       meta: _displayMessageSource(message.source),
       isError: isError,
       lastInGroup: row.lastInGroup,
+      firstInGroup: row.firstInGroup,
       avatarPath: isUser
           ? widget.settings.userAvatarPath
           : message.role == 'assistant'
@@ -1519,11 +1658,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       text,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: TextStyle(
-        fontSize: 12.5,
-        height: 1.2,
-        color: danger ? t.tintError : t.tintTertiary,
-      ),
+      // 危险态的红色不让皮肤改：它是"沙箱关了"的唯一提示，
+      // 被一个皮肤调成灰色就等于没有这个提示。
+      style: danger
+          ? TextStyle(fontSize: 12.5, height: 1.2, color: t.tintError)
+          : context.parts.headerSubtitle.styled(
+              TextStyle(fontSize: 12.5, height: 1.2, color: t.tintTertiary),
+            ),
     );
   }
 
@@ -1534,8 +1675,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     return IconButton(
       tooltip: active ? '返回对话' : tooltip,
       onPressed: () => setState(() => _tab = active ? 0 : tab),
-      icon: Icon(icon),
-      color: active ? context.chat.brand : null,
+      icon: Icon(icon, size: context.parts.headerAction.iconSizeOr(24)),
+      color: active
+          ? context.chat.brand
+          : context.parts.headerAction.icon?.color,
     );
   }
 
@@ -1668,41 +1811,19 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     if (mounted) setState(() {});
   }
 
-  Future<void> _pickImages() async {
+  /// 选图。来源已经由 `+` 菜单选好了，这里只管取和存。
+  ///
+  /// 以前这里自己弹一层「相册 / 拍照」，现在那两项直接摆在 `+` 菜单里 ——
+  /// 少一层嵌套，也少一次"点开又点开"。
+  Future<void> _pickImages({required bool camera}) async {
     if (_busy) return;
     if (_attachments.length >= maxAttachments) {
       _setStatus('一次最多附 $maxAttachments 张图');
       return;
     }
-    final source = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: context.chat.bgPrimary,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            ListTile(
-              leading: const Icon(Icons.photo_library_outlined),
-              title: const Text('从相册选择'),
-              onTap: () => Navigator.pop(ctx, 'gallery'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.photo_camera_outlined),
-              title: const Text('拍一张'),
-              onTap: () => Navigator.pop(ctx, 'camera'),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (source == null || !mounted) return;
-
     try {
       final room = maxAttachments - _attachments.length;
-      final picked = source == 'camera'
+      final picked = camera
           ? await _images.pickFromCamera()
           : await _images.pickFromGallery(limit: room);
       if (!mounted || picked.isEmpty) return;
@@ -1730,66 +1851,259 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         '到「渠道管理」里填一个视觉模型';
   }
 
-  Widget _buildAttachButton() {
-    // 当前这套配置能不能真的把图送进去，直接画在图标上：
-    // 送不进去时是警告色，点开选图之前就看得见。
-    final blocked = !widget.settings.sendImagesInline &&
-        !widget.channels.channels.any((c) => c.canDescribeImages);
-    return ComposerIconButton(
-      icon: Icons.add_photo_alternate_outlined,
-      tooltip: blocked
-          ? '当前渠道不认图，也没配视觉模型'
-          : widget.settings.sendImagesInline
-              ? '直接把图发给对话模型'
-              : '先用视觉模型把图描述成文字',
-      enabled: !_busy,
-      color: blocked ? context.chat.tintWarning : null,
-      onTap: _pickImages,
-    );
-  }
+  static const _approvalLabels = <ApprovalMode, String>{
+    ApprovalMode.readOnly: '只读',
+    ApprovalMode.onRequest: '按需审批',
+    ApprovalMode.auto: '自动执行',
+    ApprovalMode.yolo: '关闭沙箱',
+  };
 
-  Widget _buildTerminalButton() {
-    final on = _agent.terminalMode;
-    return ComposerIconButton(
-      icon: on ? Icons.terminal : Icons.terminal_outlined,
-      tooltip: on
-          ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
-          : _distro == null
-              ? '开启后会先装一个 Linux 基座（约 3–30MB）'
-              : '普通聊天，模型没有任何工具',
-      active: on,
-      enabled: !_busy && !_installingDistro,
-      onTap: () => _setTerminalMode(!on),
-    );
-  }
-
-  Widget _buildApprovalButton() {
-    const labels = {
-      ApprovalMode.readOnly: '只读',
-      ApprovalMode.onRequest: '按需审批',
-      ApprovalMode.auto: '自动执行',
-      ApprovalMode.yolo: '关闭沙箱',
-    };
-    final danger = _agent.mode == ApprovalMode.yolo;
-    return PopupMenuButton<ApprovalMode>(
-      initialValue: _agent.mode,
-      tooltip: '审批档位：${labels[_agent.mode]}',
-      // 写回设置而不是只改 _agent —— 这个按钮和设置页里的「审批档位」
-      // 是同一件事，两份状态迟早会不一致。写回之后 _onSettingsChanged
-      // 会把它同步到 _agent 上。
-      onSelected: (m) => widget.settings.setApprovalMode(m),
-      itemBuilder: (_) => [
-        for (final entry in labels.entries)
-          PopupMenuItem(value: entry.key, child: Text(entry.value)),
+  /// 输入框左边那个 `+`。
+  ///
+  /// 原来这里并排放着「加图」「终端模式」，上面还压着一条模型切换栏。
+  /// 全收进一个菜单之后，输入区回到「一个加号 + 一个输入框 + 一个发送」，
+  /// 而那三样都是**偶尔**才动的东西，不值得一直占着屏幕最底下那一行。
+  ///
+  /// 收进去的代价是状态看不见了，所以按钮本身要把两件要紧的事画出来：
+  /// **终端模式开着**（模型手里有工具）用品牌色，**有东西配坏了**
+  /// （没模型 / 嵌入不可用 / 图发不出去）加一个警告小点。
+  /// 其余状态在顶栏副标题里一直看得见，不必在这里重复。
+  Widget _buildPlusButton() {
+    final t = context.chat;
+    final armed = _agent.terminalMode;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: <Widget>[
+        ComposerIconButton(
+          icon: Icons.add,
+          tooltip: armed ? '更多 · 终端模式开着' : '更多',
+          active: armed,
+          enabled: !_busy && !_installingDistro,
+          onTap: _showComposerMenu,
+        ),
+        if (_composerWarning != null)
+          Positioned(
+            right: 6,
+            top: 8,
+            child: Container(
+              width: 7,
+              height: 7,
+              decoration: BoxDecoration(
+                color: t.tintWarning,
+                shape: BoxShape.circle,
+                // 描一圈底色，免得小点落在图标上时糊成一团。
+                border: Border.all(color: t.composerField, width: 1),
+              ),
+            ),
+          ),
       ],
-      // 关掉沙箱是唯一需要抢眼的档位，用红色而不是品牌色 ——
-      // 品牌色在输入框这一排已经表示「开着」了。
-      child: ComposerIconButton(
-        icon: danger ? Icons.gpp_maybe : Icons.shield_outlined,
-        active: !danger && _agent.mode != ApprovalMode.onRequest,
-        color: danger ? context.chat.tintError : null,
+    );
+  }
+
+  /// 有没有配坏的东西。有就返回那句话，用来点亮 `+` 上的小点。
+  ///
+  /// 按严重程度排：没模型是"整个 app 现在不能用"，排最前。
+  String? get _composerWarning {
+    if (widget.settings.config.model.isEmpty) return '还没有配对话模型';
+    final embedError = _agent.retrieval.lastEmbeddingError;
+    if (embedError != null) return '嵌入检索不可用：$embedError';
+    if (!widget.settings.sendImagesInline &&
+        !widget.channels.channels.any((c) => c.canDescribeImages)) {
+      return '当前渠道不认图，也没配视觉模型 —— 现在发不了图';
+    }
+    return null;
+  }
+
+  Future<void> _showComposerMenu() async {
+    final t = context.chat;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: t.bgPrimary,
+      showDragHandle: true,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      // 菜单里改终端模式要当场看到开关变化，所以自带一份 setState。
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) => SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.82,
+            ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 2, 8, 6),
+                    child: Row(
+                      children: <Widget>[
+                        Expanded(
+                          child: Text(
+                            '输入工具',
+                            style: Theme.of(sheetContext).textTheme.titleLarge,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: '关闭',
+                          onPressed: () => Navigator.pop(sheetContext),
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_composerWarning case final warning?)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                      child: Row(
+                        children: <Widget>[
+                          Icon(Icons.error_outline,
+                              size: 16, color: t.tintWarning),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              warning,
+                              style:
+                                  TextStyle(fontSize: 12, color: t.tintWarning),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ListTile(
+                    leading: const Icon(Icons.photo_library_outlined),
+                    title: const Text('从相册选择'),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _pickImages(camera: false);
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.photo_camera_outlined),
+                    title: const Text('拍一张'),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _pickImages(camera: true);
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.auto_awesome),
+                    title: const Text('对话模型'),
+                    subtitle: Text(
+                      widget.settings.sourceLabel.isEmpty
+                          ? '还没配'
+                          : widget.settings.sourceLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _pickModel();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.hub_outlined),
+                    title: const Text('嵌入模型'),
+                    subtitle: Text(
+                      _agent.retrieval.lastEmbeddingError != null
+                          ? '不可用'
+                          : widget.settings.embeddingModel.isEmpty
+                              ? '关 · 记忆检索只用两路词法'
+                              : widget.settings.embeddingModel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _pickEmbeddingModel();
+                    },
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    secondary: Icon(_agent.terminalMode
+                        ? Icons.terminal
+                        : Icons.terminal_outlined),
+                    title: const Text('终端模式'),
+                    subtitle: Text(
+                      _agent.terminalMode
+                          ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
+                          : _distro == null
+                              ? '开启后会先装一个 Linux 基座（约 3–30MB）'
+                              : '普通聊天，模型没有任何工具',
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                    value: _agent.terminalMode,
+                    onChanged: (on) async {
+                      // 装基座会推一个整页出来，菜单得先让开。
+                      if (on && _distro == null) Navigator.pop(sheetContext);
+                      await _setTerminalMode(on);
+                      if (mounted) setSheetState(() {});
+                    },
+                  ),
+                  // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
+                  if (_agent.terminalMode)
+                    ListTile(
+                      leading: Icon(
+                        _agent.mode == ApprovalMode.yolo
+                            ? Icons.gpp_maybe
+                            : Icons.shield_outlined,
+                        color: _agent.mode == ApprovalMode.yolo
+                            ? t.tintError
+                            : null,
+                      ),
+                      title: const Text('审批档位'),
+                      subtitle: Text(
+                        _approvalLabels[_agent.mode] ?? '',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _agent.mode == ApprovalMode.yolo
+                              ? t.tintError
+                              : null,
+                        ),
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () async {
+                        final picked = await showModalBottomSheet<ApprovalMode>(
+                          context: sheetContext,
+                          backgroundColor: t.bgPrimary,
+                          builder: (pickerContext) => SafeArea(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: <Widget>[
+                                for (final entry in _approvalLabels.entries)
+                                  ListTile(
+                                    leading: Icon(entry.key == _agent.mode
+                                        ? Icons.radio_button_checked
+                                        : Icons.radio_button_unchecked),
+                                    title: Text(entry.value),
+                                    onTap: () =>
+                                        Navigator.pop(pickerContext, entry.key),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        );
+                        if (picked != null) {
+                          // 写回设置而不是只改 _agent —— 这个入口和设置页里的
+                          // 「审批档位」是同一件事，两份状态迟早会不一致。
+                          await widget.settings.setApprovalMode(picked);
+                          if (mounted) setSheetState(() {});
+                        }
+                      },
+                    ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
+    if (mounted) setState(() {});
   }
 }
 
@@ -1802,20 +2116,23 @@ class _ChatRow {
   final int index;
   final String? streaming;
   final bool lastInGroup;
+  final bool firstInGroup;
 
   const _ChatRow.date(this.day)
       : index = -1,
         streaming = null,
-        lastInGroup = true;
+        lastInGroup = true,
+        firstInGroup = true;
 
-  const _ChatRow.message(this.index, this.lastInGroup)
+  const _ChatRow.message(this.index, this.lastInGroup, this.firstInGroup)
       : day = null,
         streaming = null;
 
   const _ChatRow.streaming(this.streaming)
       : day = null,
         index = -1,
-        lastInGroup = true;
+        lastInGroup = true,
+        firstInGroup = false;
 }
 
 /// 检查点时间线。回滚入口。

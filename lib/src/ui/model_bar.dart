@@ -1,11 +1,8 @@
-/// 输入框上面那条模型快速切换器。
+/// 模型选择器：先选来源（渠道），再选模型。
 ///
-/// 取代原来的「对话 / 终端 / 检查点」三格底栏。终端是给模型用的，不该在
-/// 用户的主动线上占一格（顶栏右上角保留入口）；而**换模型**才是聊天时真正
-/// 会反复做的动作 —— 换个更强的重答一次、换个便宜的接着聊。
-///
-/// 两个位置：对话模型，和用于记忆检索的嵌入模型。它们通常不是同一个模型，
-/// 所以并排放而不是塞进一个下拉里。
+/// 入口在输入框左边那个 `+` 菜单里。原来这里还有一条常驻的快速切换栏，
+/// 后来收进菜单了 —— 那一栏一直占着屏幕最底下一行，而换模型是**偶尔**
+/// 才做的事；「现在用的是谁」在顶栏副标题里一直看得见，不必占两处。
 ///
 /// ## 为什么处处标着来源
 ///
@@ -14,9 +11,8 @@
 /// `gpt-5` 的话，用户以为在走自己的网关，实际每一轮都在扣官方额度 ——
 /// 而这种事往往要等到账单出来才发现。
 ///
-/// 所以：芯片上带渠道名，选择器里先选来源再选模型，跨来源挑模型会明说
-/// 「这会把渠道一起切过去」。只有一个渠道时这些标注全部收起来 ——
-/// 没有第二个来源要区分，那个前缀就只是噪音。
+/// 所以：选择器里先选来源再选模型，每个来源下面写的是**地址**而不只是
+/// 渠道名，跨来源挑模型会明说「这会把渠道一起切过去」。
 library;
 
 import 'package:flutter/material.dart';
@@ -61,143 +57,6 @@ class ModelChoice {
   final String model;
 
   const ModelChoice(this.sourceId, this.model);
-}
-
-class ModelSwitchBar extends StatelessWidget {
-  /// 当前对话模型。空 = 没配。
-  final String model;
-
-  /// 当前嵌入模型。空 = 没启用记忆检索的向量路。
-  final String embeddingModel;
-
-  /// 当前渠道名。null = 只有一个渠道，不用标注来源。
-  final String? sourceName;
-
-  /// 嵌入后端上一次失败的原因。非空时那颗芯片变成警告色 ——
-  /// 「配了但用不了」和「没配」是两回事，看起来不能一样。
-  final String? embeddingError;
-
-  final VoidCallback onPickModel;
-  final VoidCallback onPickEmbedding;
-  final bool floating;
-
-  const ModelSwitchBar({
-    super.key,
-    required this.model,
-    required this.embeddingModel,
-    required this.onPickModel,
-    required this.onPickEmbedding,
-    this.sourceName,
-    this.embeddingError,
-    this.floating = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.chat;
-    return Container(
-      color: floating ? Colors.transparent : t.composerBg,
-      padding: const EdgeInsets.fromLTRB(8, 6, 8, 0),
-      child: Row(
-        children: <Widget>[
-          Expanded(
-            child: _ModelChip(
-              icon: Icons.auto_awesome,
-              source: sourceName,
-              label: model.isEmpty ? '未配置模型' : model,
-              // 没配模型是"这个 app 现在不能用"，值得抢眼。
-              color: model.isEmpty ? t.tintWarning : null,
-              onTap: onPickModel,
-            ),
-          ),
-          const SizedBox(width: 6),
-          Expanded(
-            child: _ModelChip(
-              icon: Icons.hub_outlined,
-              // 嵌入也走当前渠道、也计费，同样要标来源。关着的时候不标：
-              // 没在花钱的东西不需要说明花的是谁的钱。
-              source: embeddingModel.isEmpty ? null : sourceName,
-              label: embeddingError != null
-                  ? '嵌入不可用'
-                  : embeddingModel.isEmpty
-                      ? '嵌入：关'
-                      : embeddingModel,
-              color: embeddingError != null ? t.tintError : null,
-              dim: embeddingError == null && embeddingModel.isEmpty,
-              onTap: onPickEmbedding,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ModelChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-
-  /// 渠道名，画在模型名前面。null = 不标。
-  final String? source;
-  final Color? color;
-
-  /// 功能没开着。画得更淡，但不是禁用 —— 点它就是去开。
-  final bool dim;
-  final VoidCallback onTap;
-
-  const _ModelChip({
-    required this.icon,
-    required this.label,
-    required this.onTap,
-    this.source,
-    this.color,
-    this.dim = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.chat;
-    final fg = color ?? (dim ? t.tintTertiary : t.tintSecondary);
-    return Material(
-      color: t.composerField,
-      borderRadius: BorderRadius.circular(ChatShape.composerRadius),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(ChatShape.composerRadius),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              Icon(icon, size: 15, color: fg),
-              const SizedBox(width: 5),
-              Expanded(
-                // 一行 RichText 而不是两个 Text：位置不够时被截掉的是模型名，
-                // 来源留住。反过来（截掉来源）恰好丢掉最该看见的那半。
-                child: Text.rich(
-                  TextSpan(children: <InlineSpan>[
-                    if (source != null)
-                      TextSpan(
-                        text: '$source · ',
-                        style: TextStyle(
-                          color: t.tintTertiary,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    TextSpan(text: label),
-                  ]),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 12.5, color: fg),
-                ),
-              ),
-              Icon(Icons.expand_less, size: 15, color: t.tintTertiary),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 /// 模型选择弹层。
