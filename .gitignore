@@ -41,6 +41,11 @@ android/app/src/main/jniLibs/*/libproot-loader32.so
 *.iml
 .vscode/
 
+# ---- 敏感凭据 ----
+# 把 lib/secrets/google_oauth.example.dart 复制成 lib/secrets/google_oauth.dart
+# 并填入你自己的 Google OAuth 凭据。这个文件不会被提交。
+lib/secrets/google_oauth.dart
+
 # ---- 系统 ----
 .DS_Store
 Thumbs.db

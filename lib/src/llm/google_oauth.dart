@@ -71,6 +71,8 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import '../../secrets/google_oauth.dart'
+    show googleOAuthClientId, googleOAuthClientSecret;
 import 'oauth.dart';
 
 /// OAuth 客户端凭据。
@@ -89,9 +91,12 @@ class GoogleOAuthClient {
   final String secret;
 
   /// gemini-cli 随包分发的公开凭据。
+  ///
+  /// 这些值来自 lib/secrets/google_oauth.dart，它不被 git 追踪。
+  /// 用户可以编辑那个文件切换到自己注册的 Google Cloud 项目凭据。
   static const bundled = GoogleOAuthClient(
-    id: '681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com',
-    secret: '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',
+    id: googleOAuthClientId,
+    secret: googleOAuthClientSecret,
   );
 
   bool get isBundled => id == bundled.id;
