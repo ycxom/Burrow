@@ -37,10 +37,15 @@ import 'src/settings/channel_store.dart';
 import 'src/settings/settings_store.dart';
 import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
+import 'src/ui/liquid_glass.dart';
 import 'src/ui/skin_store.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 输入框那块玻璃的折射着色器。不 await —— 编译要几十毫秒，挡在启动路径上
+  // 只会让首帧更晚；编好之前输入框自己会先画成普通毛玻璃。
+  unawaited(LiquidGlassProgram.warmUp());
 
   // app 私有目录。rename 要求同一文件系统，而发行版的
   // rootfs / rootfs.staging / rootfs.gen 三者必须能互相 rename，

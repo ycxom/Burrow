@@ -188,4 +188,113 @@ void main() {
     expect(plusTapped, isTrue);
     expect(sendTapped, isTrue);
   });
+
+  testWidgets('发送键跟随文字内容切换状态，空输入不会误触', (tester) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    var sendCount = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(
+          useMaterial3: true,
+          brightness: Brightness.dark,
+          extensions: const <ThemeExtension<dynamic>>[ChatTokens.dark],
+        ),
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: ChatComposer(
+              controller: controller,
+              generating: false,
+              enabled: true,
+              hintText: '输入消息',
+              onSend: () => sendCount += 1,
+              onStop: () {},
+              safeAreaBottom: false,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byTooltip('输入内容后发送'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.send_rounded));
+    expect(sendCount, 0);
+
+    await tester.enterText(find.byType(TextField), '你好');
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('发送'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.send_rounded));
+    expect(sendCount, 1);
+  });
+
+  testWidgets('只有附件时发送键仍可用', (tester) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    var sent = false;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(
+          useMaterial3: true,
+          extensions: const <ThemeExtension<dynamic>>[ChatTokens.light],
+        ),
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: ChatComposer(
+              controller: controller,
+              generating: false,
+              enabled: true,
+              hasExternalContent: true,
+              hintText: '输入消息',
+              onSend: () => sent = true,
+              onStop: () {},
+              safeAreaBottom: false,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byTooltip('发送'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.send_rounded));
+    expect(sent, isTrue);
+  });
+
+  testWidgets('多行输入平滑扩展输入区高度', (tester) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(
+          useMaterial3: true,
+          extensions: const <ThemeExtension<dynamic>>[ChatTokens.light],
+        ),
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: ChatComposer(
+              controller: controller,
+              generating: false,
+              enabled: true,
+              hintText: '输入消息',
+              onSend: () {},
+              onStop: () {},
+              safeAreaBottom: false,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final singleLineHeight = tester.getSize(find.byType(ChatComposer)).height;
+    await tester.enterText(find.byType(TextField), '第一行\n第二行\n第三行');
+    await tester.pumpAndSettle();
+    final multiLineHeight = tester.getSize(find.byType(ChatComposer)).height;
+
+    expect(multiLineHeight, greaterThan(singleLineHeight));
+  });
 }

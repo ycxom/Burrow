@@ -45,21 +45,16 @@ android {
         // 只打这两个 ABI。armeabi-v7a 的 32 位机器已经不值得为它多背一份
         // rootfs（bootstrap 是按 ABI 分包的，多一个 ABI 就多几十 MB）。
         // x86_64 保留是为了模拟器 —— 没有它就没法在 CI 和模拟器上验证。
-        ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
-        }
-
         externalNativeBuild {
             cmake {
                 // pty.c 是纯 C，burrow_launch.c 也是。不需要 C++ 运行时，
                 // 关掉能省下 libc++_shared.so（每 ABI 约 1MB）。
                 arguments += listOf("-DANDROID_STL=none")
 
-                // 这一份 abiFilters 不能省。上面 `ndk { abiFilters }` 只约束
-                // 打包，管不住 CMake 去编哪些 ABI —— 结果是 armeabi-v7a
-                // 仍然被编出来并打进 APK，而 proot 只为 arm64/x86_64 构建
-                // （tool/build_proot.sh），于是 32 位设备会拿到一个
-                // 「有 burrow-launch 没 proot」的残缺组合：装得上，沙箱起不来。
+                // 这一份 abiFilters 约束 CMake 实际编译的 ABI。APK 级别的
+                // 过滤由 Flutter 的 --target-platform / split ABI 控制；
+                // 不要再加 defaultConfig.ndk.abiFilters，新版 Flutter 会把它
+                // 判定为与 split ABI 冲突。
                 abiFilters += listOf("arm64-v8a", "x86_64")
             }
         }

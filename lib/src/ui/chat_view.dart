@@ -19,7 +19,6 @@
 library;
 
 import 'dart:io';
-import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -30,6 +29,7 @@ import '../context/token_counter.dart';
 import '../settings/settings_store.dart';
 import 'chat_theme.dart';
 import 'image_attachments.dart';
+import 'liquid_glass.dart';
 import 'skin_parts.dart';
 import 'skin_style.dart';
 import 'thinking.dart';
@@ -1315,7 +1315,7 @@ class _InlineTimeText extends StatelessWidget {
 /// Telegram 把附件、表情这些放在输入框**里面**，发送键在外面。这里放的是
 /// 终端模式和审批档位 —— 它们决定「这一句话怎么被处理」，和附件一样属于
 /// "这条消息的修饰"，位置是对的。
-class ComposerIconButton extends StatelessWidget {
+class ComposerIconButton extends StatefulWidget {
   final IconData icon;
   final String? tooltip;
   final bool active;
@@ -1337,32 +1337,56 @@ class ComposerIconButton extends StatelessWidget {
   });
 
   @override
+  State<ComposerIconButton> createState() => _ComposerIconButtonState();
+}
+
+class _ComposerIconButtonState extends State<ComposerIconButton> {
+  bool _pressed = false;
+
+  void _setPressed(bool value) {
+    if (_pressed != value) setState(() => _pressed = value);
+  }
+
+  @override
   Widget build(BuildContext context) {
     final t = context.chat;
     final style = context.parts.composerIcon;
-    final fg = !enabled
+    final fg = !widget.enabled
         ? t.tintTertiary.withValues(alpha: 0.5)
-        : color ?? (active ? t.brand : style.icon?.color ?? t.tintTertiary);
+        : widget.color ??
+            (widget.active ? t.brand : style.icon?.color ?? t.tintTertiary);
     final dimension = style.size ?? 40;
 
-    final child = SizedBox.square(
-      dimension: dimension,
-      child: Material(
-        color: active
-            ? t.brand.withValues(alpha: 0.12)
-            : style.fillColor(Colors.transparent),
-        shape: const CircleBorder(),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: enabled ? onTap : null,
-          child: Center(
-            child: Icon(icon, size: style.iconSizeOr(21), color: fg),
+    final child = AnimatedScale(
+      duration: Duration(milliseconds: _pressed ? 90 : 180),
+      curve: _pressed ? Curves.easeOutCubic : Curves.easeOutBack,
+      scale: _pressed && widget.enabled ? 0.88 : 1,
+      child: SizedBox.square(
+        dimension: dimension,
+        child: Material(
+          color: widget.active
+              ? t.brand.withValues(alpha: 0.12)
+              : style.fillColor(Colors.transparent),
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onHighlightChanged: widget.enabled ? _setPressed : null,
+            onTap: widget.enabled ? widget.onTap : null,
+            child: Center(
+              child: Icon(
+                widget.icon,
+                size: style.iconSizeOr(21),
+                color: fg,
+              ),
+            ),
           ),
         ),
       ),
     );
-    return tooltip == null ? child : Tooltip(message: tooltip!, child: child);
+    return widget.tooltip == null
+        ? child
+        : Tooltip(message: widget.tooltip!, child: child);
   }
 }
 
@@ -1382,6 +1406,7 @@ class ChatComposer extends StatefulWidget {
   final double blur;
   final double opacity;
   final bool safeAreaBottom;
+  final bool hasExternalContent;
 
   /// 药丸里左边的图标。
   final List<Widget> leading;
@@ -1401,6 +1426,7 @@ class ChatComposer extends StatefulWidget {
     this.blur = 20,
     this.opacity = 0.68,
     this.safeAreaBottom = true,
+    this.hasExternalContent = false,
     this.leading = const [],
     this.trailing = const [],
   });
@@ -1454,78 +1480,98 @@ class _ChatComposerState extends State<ChatComposer> {
       child: _ComposerDock(
         docked: docked,
         focused: _focus.hasFocus,
+        // 液态档下底座自己不上色 —— 见 _ComposerDock.glass。
+        glass: widget.effect == ChatComposerEffect.liquid,
         child: Padding(
           padding: const EdgeInsets.all(5),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: <Widget>[
               Expanded(
-                child: _ComposerSurface(
-                  effect: widget.effect,
-                  blur: widget.blur,
-                  opacity: widget.opacity,
-                  style: field,
-                  focused: _focus.hasFocus,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(minHeight: 42),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 3),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: <Widget>[
-                          ...widget.leading,
-                          Expanded(
-                            child: TextField(
-                              controller: widget.controller,
-                              focusNode: _focus,
-                              enabled: widget.enabled,
-                              minLines: 1,
-                              maxLines: 6,
-                              // 输入框是**必留部件**：皮肤能改字号和颜色，
-                              // 但这里从不读它的 visible —— 一个没有输入框的
-                              // 聊天页不是皮肤，是坏了。
-                              style: field.styled(
-                                TextStyle(fontSize: 16, color: t.tintPrimary),
-                              ),
-                              cursorColor: t.brand,
-                              decoration: InputDecoration(
-                                hintText: widget.hintText,
-                                hintStyle: field
-                                    .styled(
-                                      TextStyle(
-                                        fontSize: 16,
-                                        color: t.tintTertiary,
-                                      ),
-                                    )
-                                    .copyWith(color: t.tintTertiary),
-                                // 药丸本身就是输入框的边界。
-                                border: InputBorder.none,
-                                enabledBorder: InputBorder.none,
-                                focusedBorder: InputBorder.none,
-                                disabledBorder: InputBorder.none,
-                                isDense: true,
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 5,
-                                  vertical: 10,
+                child: AnimatedSize(
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeOutCubic,
+                  alignment: Alignment.bottomCenter,
+                  clipBehavior: Clip.none,
+                  child: _ComposerSurface(
+                    effect: widget.effect,
+                    blur: widget.blur,
+                    opacity: widget.opacity,
+                    style: field,
+                    focused: _focus.hasFocus,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(minHeight: 42),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 3),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: <Widget>[
+                            ...widget.leading,
+                            Expanded(
+                              child: TextField(
+                                controller: widget.controller,
+                                focusNode: _focus,
+                                enabled: widget.enabled,
+                                minLines: 1,
+                                maxLines: 6,
+                                // 输入框是**必留部件**：皮肤能改字号和颜色，
+                                // 但这里从不读它的 visible —— 一个没有输入框的
+                                // 聊天页不是皮肤，是坏了。
+                                style: field.styled(
+                                  TextStyle(
+                                    fontSize: 16,
+                                    height: 1.32,
+                                    color: t.tintPrimary,
+                                  ),
                                 ),
+                                cursorColor: t.brand,
+                                cursorRadius: const Radius.circular(1),
+                                cursorWidth: 1.8,
+                                decoration: InputDecoration(
+                                  hintText: widget.hintText,
+                                  hintStyle: field
+                                      .styled(
+                                        TextStyle(
+                                          fontSize: 16,
+                                          height: 1.32,
+                                          color: t.tintTertiary,
+                                        ),
+                                      )
+                                      .copyWith(color: t.tintTertiary),
+                                  // 药丸本身就是输入框的边界。
+                                  border: InputBorder.none,
+                                  enabledBorder: InputBorder.none,
+                                  focusedBorder: InputBorder.none,
+                                  disabledBorder: InputBorder.none,
+                                  isDense: true,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 10,
+                                  ),
+                                ),
+                                textInputAction: TextInputAction.newline,
+                                keyboardType: TextInputType.multiline,
                               ),
-                              textInputAction: TextInputAction.newline,
-                              keyboardType: TextInputType.multiline,
                             ),
-                          ),
-                          ...widget.trailing,
-                        ],
+                            ...widget.trailing,
+                          ],
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
               const SizedBox(width: 6),
-              _SendButton(
-                generating: widget.generating,
-                enabled: widget.enabled,
-                onSend: widget.onSend,
-                onStop: widget.onStop,
+              ValueListenableBuilder<TextEditingValue>(
+                valueListenable: widget.controller,
+                builder: (context, value, _) => _SendButton(
+                  generating: widget.generating,
+                  enabled: widget.enabled,
+                  hasContent:
+                      widget.hasExternalContent || value.text.trim().isNotEmpty,
+                  onSend: widget.onSend,
+                  onStop: widget.onStop,
+                ),
               ),
             ],
           ),
@@ -1545,11 +1591,22 @@ class _ComposerDock extends StatelessWidget {
     required this.child,
     this.docked = false,
     this.focused = false,
+    this.glass = false,
   });
 
   final Widget child;
   final bool docked;
   final bool focused;
+
+  /// 里面那块是液态玻璃，底座就不要再画自己的边框和底色了。
+  ///
+  /// 底座和输入药丸是两个同心圆角矩形，各画各的描边。以前药丸糊得很重、
+  /// 边界模糊，两圈叠在一起看不太出来；换上折射之后药丸边缘一下子变得很
+  /// 清晰，于是**两圈描边就成了肉眼可见的「套了两层」**。
+  ///
+  /// 玻璃本身已经足够立体（折射 + 内阴影 + 高光），底座这时只留布局和外边距。
+  /// 皮肤如果自己指定了底色/描边，仍然照画 —— 那是皮肤作者的明确意图。
+  final bool glass;
 
   @override
   Widget build(BuildContext context) {
@@ -1575,27 +1632,45 @@ class _ComposerDock extends StatelessWidget {
       ),
     ];
 
+    // 皮肤有没有自己指定过**底色或描边**。指定过就一律照画，玻璃与否都不插手。
+    //
+    // 阴影不算数：内置皮肤好几个都写着 `shadows: []`（意思是「这一档不要
+    // 投影」），把它当成「皮肤自己画了底座」的话，底座会继续画出那圈描边，
+    // 于是玻璃药丸外面又套了一层框 —— 正是要修掉的那个「两层」。
+    final skinned =
+        style.fillColor() != null || gradient != null || style.border != null;
+    final bare = glass && !skinned;
+
     return AnimatedContainer(
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOutCubic,
       decoration: BoxDecoration(
         borderRadius: radius,
-        color: gradient == null ? style.fillColor() : null,
-        gradient: gradient ??
-            (style.fillColor() != null
-                ? null
-                : LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: <Color>[t.composerDockTop, t.composerDockBottom],
-                  )),
-        border: style.borderOr(
-          Border.all(
-            color: focused ? t.brand.withValues(alpha: 0.6) : t.composerDockRim,
-            width: focused ? 1.2 : 0.8,
-          ),
-        ),
-        boxShadow: style.shadowsOr(defaultShadows),
+        color: bare || gradient != null ? null : style.fillColor(),
+        gradient: bare
+            ? null
+            : gradient ??
+                (style.fillColor() != null
+                    ? null
+                    : LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: <Color>[
+                          t.composerDockTop,
+                          t.composerDockBottom,
+                        ],
+                      )),
+        border: bare
+            ? null
+            : style.borderOr(
+                Border.all(
+                  color: focused
+                      ? t.brand.withValues(alpha: 0.6)
+                      : t.composerDockRim,
+                  width: focused ? 1.2 : 0.8,
+                ),
+              ),
+        boxShadow: bare ? null : style.shadowsOr(defaultShadows),
       ),
       child: ClipRRect(
         borderRadius: radius,
@@ -1603,8 +1678,8 @@ class _ComposerDock extends StatelessWidget {
           children: <Widget>[
             child,
             // 顶边那道高光只属于立体底座。皮肤把底座改成扁平（去掉阴影）之后
-            // 还留着它，会变成一条没有来由的白线。
-            if (style.shadows == null)
+            // 还留着它，会变成一条没有来由的白线；底座整个隐身时同理。
+            if (style.shadows == null && !bare)
               Positioned(
                 left: 18,
                 right: 18,
@@ -1692,27 +1767,31 @@ class _ComposerSurface extends StatelessWidget {
           ),
         ];
       case ChatComposerEffect.liquid:
-        color = null;
+        // KernelSU 在折射后的表面统一画 surfaceContainer(40%)。这里用主题的
+        // composer 底色承担同一职责，上面的渐变只保留玻璃的方向性高光。
+        color = t.composerBg.withValues(alpha: alpha * 0.38);
         gradient = LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
           colors: dark
               ? <Color>[
-                  Colors.white.withValues(alpha: alpha * 0.22),
-                  t.bgSecondary.withValues(alpha: alpha * 0.86),
-                  t.brand.withValues(alpha: alpha * 0.16),
+                  Colors.white.withValues(alpha: alpha * 0.10),
+                  t.bgSecondary.withValues(alpha: alpha * 0.30),
+                  t.brand.withValues(alpha: alpha * 0.08),
                 ]
               : <Color>[
-                  Colors.white.withValues(alpha: alpha * 0.96),
-                  t.bgBrandSecondary.withValues(alpha: alpha * 0.76),
-                  Colors.white.withValues(alpha: alpha * 0.62),
+                  Colors.white.withValues(alpha: alpha * 0.46),
+                  t.bgBrandSecondary.withValues(alpha: alpha * 0.30),
+                  Colors.white.withValues(alpha: alpha * 0.26),
                 ],
         );
-        border = Border.all(
-          color: Colors.white.withValues(alpha: dark ? 0.24 : 0.82),
-          width: 1.1,
-        );
-        sigma = requestedBlur * 1.1;
+        // 描边交给 _GlassEdge 那圈**带角度的**渐变，这里给一条透明的占位。
+        // 一圈均匀的白边是「描过边的方块」，不是玻璃 —— 真玻璃的亮边跟着
+        // 光源走：左上最亮、两侧几乎没有、右下有一点反射。
+        border = Border.all(color: Colors.transparent, width: 0);
+        // KernelSU 的主玻璃用 4dp。把用户设置映射到同一档：默认 20 落到 4，
+        // 最大也只到 6dp，避免把折射环完全抹平。
+        sigma = (requestedBlur * 0.20).clamp(2.0, 6.0).toDouble();
         shadows = <BoxShadow>[
           const BoxShadow(
             color: Color(0x26000000),
@@ -1755,24 +1834,40 @@ class _ComposerSurface extends StatelessWidget {
       ),
       child: ClipRRect(
         borderRadius: radius,
-        child: BackdropFilter(
-          filter: ImageFilter.blur(
-            sigmaX: skinBlur ?? sigma,
-            sigmaY: skinBlur ?? sigma,
-          ),
+        child: LiquidGlass(
+          blurSigma: skinBlur ?? sigma,
+          // 折射只给「液态」这一档。毛玻璃档要的就是一块糊掉的板子，
+          // 给它加折射等于把两档做成同一个东西。
+          refract: effect == ChatComposerEffect.liquid && skinBlur == null,
+          // 和外面那个 ClipRRect 用同一个半径，否则折射环会和真正的边缘错开。
+          cornerRadius: radius,
+          // 原版是 24dp/24dp 配 56dp 高的药丸（约 0.43 个高度）。
+          // 这里药丸约 48 高，按同样的比例给 —— 之前 16/12 太保守，
+          // 边上那点弯几乎看不出来，整块还是像毛玻璃。
+          refractionHeight: 20,
+          refractionAmount: 20,
+          // KernelSU 的主玻璃层不做色散；色散只在按压指示器里短暂出现。
+          // 输入框常驻彩边会显脏，也会让小字号文字边缘显得发虚。
+          chromaticAberration: 0,
+          saturation: 1.5,
+          brightness: 0,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 250),
             curve: Curves.easeOutCubic,
             decoration: BoxDecoration(
               color: skinGradient != null ? null : (skinColor ?? color),
               gradient: skinGradient ?? (skinColor != null ? null : gradient),
+              // 液态档的边缘完全交给 _GlassEdge。这里再补一圈焦点白边，
+              // 会和镜面描边叠成肉眼可见的双框。
               border: style.borderOr(
-                Border.all(
-                  color: focused
-                      ? Colors.white.withValues(alpha: dark ? 0.45 : 0.95)
-                      : border.top.color,
-                  width: focused ? 1.4 : border.top.width,
-                ),
+                effect == ChatComposerEffect.liquid
+                    ? Border.all(color: Colors.transparent, width: 0)
+                    : Border.all(
+                        color: focused
+                            ? t.brand.withValues(alpha: dark ? 0.72 : 0.62)
+                            : border.top.color,
+                        width: focused ? 1.2 : border.top.width,
+                      ),
               ),
               borderRadius: radius,
             ),
@@ -1782,18 +1877,14 @@ class _ComposerSurface extends StatelessWidget {
                 if (effect == ChatComposerEffect.liquid &&
                     skinGradient == null &&
                     skinColor == null)
-                  Positioned(
-                    left: 22,
-                    right: 22,
-                    top: 1,
+                  Positioned.fill(
                     child: IgnorePointer(
-                      child: Container(
-                        height: 1,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(
-                            alpha: dark ? 0.22 : 0.76,
-                          ),
-                          borderRadius: BorderRadius.circular(1),
+                      child: CustomPaint(
+                        painter: _GlassEdge(
+                          radius: radius,
+                          dark: dark,
+                          focused: focused,
+                          brand: t.brand,
                         ),
                       ),
                     ),
@@ -1807,36 +1898,136 @@ class _ComposerSurface extends StatelessWidget {
   }
 }
 
+/// 玻璃的**边**：一圈真内阴影 + 一圈带角度的镜面描边。
+///
+/// KernelSU 那套里这是两个独立的效果（`innerShadow` 和 `highlight`），
+/// 也正是折射之外最像玻璃的两样东西：
+///
+///   - **内阴影**给厚度。少了它，药丸是贴在屏幕上的一张纸；有了它，
+///     是一块压在壁纸上的料。之前用「顶部往下的线性渐变」凑，
+///     只有上边有厚度，转过圆角就露馅。
+///   - **镜面描边**给光。一圈均匀的白边是「描过边的方块」；真玻璃的亮边
+///     跟着光源走 —— 左上最亮，两侧几乎没有，右下有一点点反射。
+///
+/// 两样都画在内容**上面**：它们是玻璃表面的性质，不是背景的。
+class _GlassEdge extends CustomPainter {
+  const _GlassEdge({
+    required this.radius,
+    required this.dark,
+    required this.focused,
+    required this.brand,
+  });
+
+  final BorderRadius radius;
+  final bool dark;
+  final bool focused;
+  final Color brand;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) return;
+    final rrect = radius.toRRect(Offset.zero & size);
+
+    // ---- 内阴影 ----
+    // 描一圈很粗的模糊黑边，再裁掉形状外面的部分，留下的就是内阴影。
+    // Flutter 没有现成的 inner shadow；`BlurStyle.inner` 画的是「阴影」
+    // 而不是「描边的内半边」，在半透明填充上会整块发灰。
+    canvas.save();
+    canvas.clipRRect(rrect);
+    canvas.drawRRect(
+      rrect.deflate(3),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5
+        ..color = Colors.black.withValues(alpha: dark ? 0.22 : 0.10)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3),
+    );
+    canvas.restore();
+
+    // ---- 镜面描边 ----
+    final rim = rrect.deflate(0.6);
+    final white = dark ? 0.52 : 0.84;
+    canvas.drawRRect(
+      rim,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = focused ? 1.4 : 1.1
+        ..shader = LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: <Color>[
+            Colors.white.withValues(alpha: white),
+            Colors.white.withValues(alpha: white * 0.18),
+            Colors.white.withValues(alpha: white * 0.10),
+            Colors.white.withValues(alpha: white * 0.34),
+          ],
+          stops: const <double>[0, 0.32, 0.62, 1],
+        ).createShader(Offset.zero & size),
+    );
+
+    // 聚焦时沿边压一层品牌色。比整圈换成蓝色克制 ——
+    // 玻璃还是玻璃，只是被点亮了一点。
+    if (focused) {
+      canvas.drawRRect(
+        rim,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.4
+          ..color = brand.withValues(alpha: dark ? 0.26 : 0.22),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_GlassEdge old) =>
+      old.radius != radius ||
+      old.dark != dark ||
+      old.focused != focused ||
+      old.brand != brand;
+}
+
 /// 44px 圆形发送键。生成中变成停止键 ——
 /// 换图标不换颜色的话，两个状态在余光里是一样的。
-class _SendButton extends StatelessWidget {
+class _SendButton extends StatefulWidget {
   final bool generating;
   final bool enabled;
+  final bool hasContent;
   final VoidCallback onSend;
   final VoidCallback onStop;
 
   const _SendButton({
     required this.generating,
     required this.enabled,
+    required this.hasContent,
     required this.onSend,
     required this.onStop,
   });
 
   @override
+  State<_SendButton> createState() => _SendButtonState();
+}
+
+class _SendButtonState extends State<_SendButton> {
+  bool _pressed = false;
+
+  void _setPressed(bool value) {
+    if (_pressed != value) setState(() => _pressed = value);
+  }
+
+  @override
   Widget build(BuildContext context) {
     final t = context.chat;
     final style = context.parts.composerSend;
-    final canSend = enabled || generating;
-    final bg = generating
+    final canSend = widget.generating || (widget.enabled && widget.hasContent);
+    final bg = widget.generating
         ? t.tintSecondary
         : canSend
             ? style.fillColor(t.brand)!
-            // 禁用时用一个实心的弱色而不是降透明度：降透明度的话，
-            // 按钮在深色下会糊进底色里，看不出这里还有个按钮。
-            : t.tintTertiary.withValues(alpha: 0.35);
+            // 禁用态仍保留一个实体轮廓，但不再像可点击的主操作。
+            : Color.lerp(t.composerField, t.tintTertiary, 0.16)!;
 
-    final top = Color.lerp(bg, Colors.white, 0.18)!;
-    final bottom = Color.lerp(bg, Colors.black, 0.18)!;
+    final top = Color.lerp(bg, Colors.white, 0.12)!;
+    final bottom = Color.lerp(bg, Colors.black, 0.08)!;
     final dimension = style.size ?? 42;
     final corners = style.shape == SkinShape.rounded
         ? style.rounded(BorderRadius.circular(12))
@@ -1845,57 +2036,103 @@ class _SendButton extends StatelessWidget {
     // 写了 background 之后还看到高光渐变，会以为自己的值没生效。
     final flat = style.background?.color != null;
 
-    return AnimatedScale(
-      duration: const Duration(milliseconds: 200),
-      scale: canSend ? 1.0 : 0.85,
-      curve: Curves.easeOutBack,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        decoration: BoxDecoration(
-          borderRadius: corners,
-          color: flat ? bg : null,
-          gradient: style.gradient ??
-              (flat
-                  ? null
-                  : LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: <Color>[top, bg, bottom],
-                    )),
-          border: style.borderOr(Border.all(
-            color: Colors.white.withValues(alpha: canSend ? 0.26 : 0.1),
-            width: 0.8,
-          )),
-          boxShadow: style.shadowsOr(<BoxShadow>[
-            const BoxShadow(
-              color: Color(0x52000000),
-              blurRadius: 7,
-              offset: Offset(0, 4),
-            ),
-            if (canSend)
-              BoxShadow(
-                color: bg.withValues(alpha: 0.32),
-                blurRadius: 10,
-                spreadRadius: -2,
-              ),
-          ]),
-        ),
-        child: Material(
-          color: Colors.transparent,
-          borderRadius: corners,
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
+    final action = widget.generating
+        ? widget.onStop
+        : canSend
+            ? widget.onSend
+            : null;
+    final tooltip = widget.generating
+        ? '停止生成'
+        : canSend
+            ? '发送'
+            : '输入内容后发送';
+
+    return Tooltip(
+      message: tooltip,
+      child: AnimatedScale(
+        duration: Duration(milliseconds: _pressed ? 90 : 190),
+        scale: !canSend
+            ? 0.88
+            : _pressed
+                ? 0.91
+                : 1,
+        curve: _pressed ? Curves.easeOutCubic : Curves.easeOutBack,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 190),
+          curve: Curves.easeOutCubic,
+          decoration: BoxDecoration(
             borderRadius: corners,
-            onTap: generating ? onStop : (canSend ? onSend : null),
-            child: SizedBox(
-              width: dimension,
-              height: dimension,
-              child: Icon(
-                generating
-                    ? Icons.stop_rounded
-                    : style.iconOr(Icons.send_rounded),
-                size: style.iconSizeOr(21),
-                color: style.iconColorOr(Colors.white),
+            color: flat || !canSend ? bg : null,
+            gradient: !canSend
+                ? null
+                : style.gradient ??
+                    (flat
+                        ? null
+                        : LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: <Color>[top, bg, bottom],
+                          )),
+            border: style.borderOr(Border.all(
+              color: Colors.white.withValues(alpha: canSend ? 0.20 : 0.08),
+              width: 0.8,
+            )),
+            boxShadow: style.shadowsOr(<BoxShadow>[
+              BoxShadow(
+                color: Colors.black.withValues(alpha: canSend ? 0.26 : 0.12),
+                blurRadius: canSend ? 8 : 4,
+                offset: Offset(0, canSend ? 3 : 2),
+              ),
+              if (canSend)
+                BoxShadow(
+                  color: bg.withValues(alpha: 0.24),
+                  blurRadius: 12,
+                  spreadRadius: -3,
+                ),
+            ]),
+          ),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: corners,
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              borderRadius: corners,
+              onHighlightChanged: action == null ? null : _setPressed,
+              onTap: action,
+              child: SizedBox(
+                width: dimension,
+                height: dimension,
+                child: Center(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 160),
+                    transitionBuilder: (child, animation) => FadeTransition(
+                      opacity: animation,
+                      child: ScaleTransition(
+                        scale: Tween<double>(begin: 0.72, end: 1).animate(
+                          CurvedAnimation(
+                            parent: animation,
+                            curve: Curves.easeOutBack,
+                          ),
+                        ),
+                        child: child,
+                      ),
+                    ),
+                    child: Icon(
+                      widget.generating
+                          ? Icons.stop_rounded
+                          : style.iconOr(Icons.send_rounded),
+                      key: ValueKey<String>(widget.generating
+                          ? 'stop'
+                          : canSend
+                              ? 'send-enabled'
+                              : 'send-disabled'),
+                      size: style.iconSizeOr(21),
+                      color: canSend
+                          ? style.iconColorOr(Colors.white)
+                          : t.tintTertiary.withValues(alpha: 0.72),
+                    ),
+                  ),
+                ),
               ),
             ),
           ),

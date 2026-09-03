@@ -26,6 +26,22 @@ ChatMessage reply(String text, {int ms = 0}) => ChatMessage(
       usage: const TokenUsage(input: 10, output: 20),
     );
 
+ChatMessage toolStep(
+  String title, {
+  bool ok = true,
+  int ms = 0,
+  String name = 'exec',
+}) =>
+    ChatMessage(
+      role: 'tool',
+      content: '$title 的输出',
+      at: DateTime.fromMillisecondsSinceEpoch(1500),
+      toolName: name,
+      toolTitle: title,
+      toolOk: ok,
+      toolMs: ms,
+    );
+
 void main() {
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
@@ -227,6 +243,66 @@ void main() {
       await upgraded.close();
       if (await dir.exists()) await dir.delete(recursive: true);
     });
+
+    test('v10 的库升到 v11：老的工具消息读得出来，且默认算成功', () async {
+      final dir = await Directory.systemTemp.createTemp('burrow_migrate11');
+      final path = '${dir.path}/old.db';
+
+      // v10：有 branch_id，但还没有 tool_* 那四列。
+      final old = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 10,
+          onCreate: (db, _) async {
+            await db.execute('''
+              CREATE TABLE threads(
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, preview TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                terminal_mode INTEGER NOT NULL DEFAULT 0, system_prompt TEXT)
+            ''');
+            await db.execute('''
+              CREATE TABLE messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                created_at INTEGER NOT NULL, output_ref TEXT, checkpoint INTEGER,
+                source TEXT, images TEXT, tokens_in INTEGER, tokens_out INTEGER,
+                tokens_cached INTEGER, tokens_estimated INTEGER,
+                reasoning TEXT, reasoning_ms INTEGER, branch_id TEXT)
+            ''');
+            await db.insert('threads', <String, Object?>{
+              'id': 't1',
+              'title': '老会话',
+              'preview': '结果',
+              'updated_at': 1000,
+            });
+            await db.insert('messages', <String, Object?>{
+              'thread_id': 't1',
+              'role': 'tool',
+              'content': '老命令的输出',
+              'created_at': 1000,
+            });
+          },
+        ),
+      );
+      await old.close();
+
+      final upgraded = await ChatStore.openAt(path);
+      final tool = (await upgraded.messages('t1')).single;
+      expect(tool.content, '老命令的输出');
+      expect(tool.toolOk, isTrue, reason: '没记过成败的老命令不该被画成失败');
+      expect(tool.toolTitle, isNull);
+
+      // 新列真的建出来了才写得进去。没建的话第一次跑命令就炸。
+      await upgraded.append(
+        't1',
+        toolStep('echo hi', ms: 5),
+      );
+      final back = await upgraded.messages('t1');
+      expect(back.last.toolTitle, 'echo hi');
+
+      await upgraded.close();
+      if (await dir.exists()) await dir.delete(recursive: true);
+    });
   });
 
   group('branch_id 跟着消息一起持久化', () {
@@ -241,4 +317,70 @@ void main() {
       expect(back[1].branchId, isNull);
     });
   });
+  group('工具调用要能存回来', () {
+    // 卡片上那三样东西（是谁跑的、成没成、跑了多久）只在内存里的话，
+    // 重开会话就只剩一坨结果正文 —— 而助手气泡照样是断开的，
+    // 中间那个"为什么断"就又没了。
+
+    test('消息表存得下工具那几个字段', () async {
+      await store.replaceMessages(thread, <ChatMessage>[
+        user('装个 sshpass'),
+        reply('这就装'),
+        toolStep('apt install -y sshpass', ms: 42000),
+        reply('装好了'),
+      ]);
+
+      final back = await store.messages(thread);
+      final tool = back.firstWhere((m) => m.role == 'tool');
+      expect(tool.toolName, 'exec');
+      expect(tool.toolTitle, 'apt install -y sshpass');
+      expect(tool.toolOk, isTrue);
+      expect(tool.toolMs, 42000);
+    });
+
+    test('失败状态不会在存回来之后变成成功', () async {
+      await store.replaceMessages(
+          thread, <ChatMessage>[toolStep('rm -rf /nope', ok: false)]);
+
+      final back = await store.messages(thread);
+      expect(back.single.toolOk, isFalse);
+    });
+
+    test('老消息（这一列是 NULL）默认算成功', () async {
+      // v11 之前存进去的 tool 消息没有这一列。给它画个红叉比不画更误导 ——
+      // 那些命令当时多半是成功的，只是没人记下来。
+      await store.append(
+        thread,
+        ChatMessage(
+          role: 'tool',
+          content: '很久以前的输出',
+          at: DateTime.fromMillisecondsSinceEpoch(1),
+        ),
+      );
+
+      final back = await store.messages(thread);
+      final tool = back.firstWhere((m) => m.role == 'tool');
+      expect(tool.toolOk, isTrue);
+      expect(tool.toolTitle, isNull, reason: '没有标题就让界面退回工具名');
+      expect(tool.toolMs, 0);
+    });
+
+    test('分支版本里的工具步骤也一起存', () async {
+      // 分支走的是另一条序列化路径（JSON 段），漏一个字段的话
+      // 切换版本之后卡片会突然变空。
+      final tail = <ChatMessage>[
+        user('试试看'),
+        toolStep('ls -la', ms: 120),
+        reply('好了'),
+      ];
+      await store.saveVariant(threadId: thread, branchId: 'b1', tail: tail);
+
+      final back = (await store.loadVariant('b1', 0))!;
+      final tool = back.firstWhere((m) => m.role == 'tool');
+      expect(tool.toolTitle, 'ls -la');
+      expect(tool.toolMs, 120);
+      expect(tool.toolOk, isTrue);
+    });
+  });
+
 }

@@ -23,6 +23,12 @@ import '../agent/agent_loop.dart' show TokenUsage;
 import 'token_counter.dart';
 
 class ChatMessage {
+  /// 数据库里的稳定行 id。内存里刚造出的消息还没有落库，值为 null。
+  ///
+  /// 搜索结果要用它定位回某一条历史消息；用内容或位置匹配都会在
+  /// 编辑、分支切换和长对话里失准。
+  final int? messageId;
+
   final String role; // user / assistant / tool / system
   final String content;
   final DateTime at;
@@ -91,7 +97,24 @@ class ChatMessage {
   /// 共用一个编号，切换时会取到另一条分支的内容。随机 id 没有这个问题。
   final String? branchId;
 
+  /// 这条 tool 消息是哪个工具产生的（`exec` / `read_file` …）。
+  ///
+  /// 存下来是为了**重开会话之后那张卡片还画得出来**。工具消息本身只装
+  /// 结果正文，光靠正文认不出是谁跑的 —— 而界面上「刚才那一步做了什么」
+  /// 恰恰是用户回头翻记录时最想看的东西。
+  final String? toolName;
+
+  /// 那一步的标题，通常就是命令行本身。见 `toolCallTitle`。
+  final String? toolTitle;
+
+  /// 那一步成没成。false = 被拒绝，或者退出码非 0。
+  final bool toolOk;
+
+  /// 那一步跑了多久，毫秒。0 = 没量到（老消息就是这样）。
+  final int toolMs;
+
   const ChatMessage({
+    this.messageId,
     required this.role,
     required this.content,
     required this.at,
@@ -103,11 +126,16 @@ class ChatMessage {
     this.reasoning = '',
     this.reasoningMs = 0,
     this.branchId,
+    this.toolName,
+    this.toolTitle,
+    this.toolOk = true,
+    this.toolMs = 0,
   });
 
   bool get hasImages => images.isNotEmpty;
 
   ChatMessage copyWith({
+    int? messageId,
     String? content,
     int? checkpoint,
     TokenUsage? usage,
@@ -116,6 +144,7 @@ class ChatMessage {
     String? branchId,
   }) =>
       ChatMessage(
+        messageId: messageId ?? this.messageId,
         role: role,
         content: content ?? this.content,
         at: at,
@@ -127,6 +156,10 @@ class ChatMessage {
         reasoning: reasoning ?? this.reasoning,
         reasoningMs: reasoningMs ?? this.reasoningMs,
         branchId: branchId ?? this.branchId,
+        toolName: toolName,
+        toolTitle: toolTitle,
+        toolOk: toolOk,
+        toolMs: toolMs,
       );
 }
 

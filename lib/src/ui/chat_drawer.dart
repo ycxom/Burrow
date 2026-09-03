@@ -12,10 +12,14 @@
 /// 那两个图标在手机上一定会被误触，而删除会话是不可逆的。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../data/chat_store.dart';
 import 'chat_theme.dart';
+
+enum _SearchScope { threads, current, global }
 
 class ChatDrawer extends StatefulWidget {
   final ChatStore store;
@@ -25,6 +29,9 @@ class ChatDrawer extends StatefulWidget {
 
   /// 选中一个会话。传 null 表示「开一个新的」。
   final ValueChanged<String?> onSelect;
+
+  /// 打开消息搜索结果。跨会话时由聊天外壳先换会话，再定位消息。
+  final void Function(String threadId, int messageId) onOpenMessage;
 
   /// 抽屉底部的入口。
   final VoidCallback onOpenSettings;
@@ -36,6 +43,7 @@ class ChatDrawer extends StatefulWidget {
     required this.store,
     required this.currentThreadId,
     required this.onSelect,
+    required this.onOpenMessage,
     required this.onOpenSettings,
     required this.onOpenSkills,
     required this.onOpenChannels,
@@ -46,13 +54,27 @@ class ChatDrawer extends StatefulWidget {
 }
 
 class _ChatDrawerState extends State<ChatDrawer> {
+  static const _searchDebounce = Duration(milliseconds: 180);
+
   late Future<List<ChatThread>> _threads;
+  final _searchController = TextEditingController();
   String _query = '';
+  _SearchScope _scope = _SearchScope.threads;
+  Future<List<ChatMessageSearchHit>>? _messageHits;
+  int _searchRevision = 0;
+  Timer? _searchTimer;
 
   @override
   void initState() {
     super.initState();
     _reload();
+  }
+
+  @override
+  void dispose() {
+    _searchTimer?.cancel();
+    _searchController.dispose();
+    super.dispose();
   }
 
   void _reload() => _threads = widget.store.threads();
@@ -164,103 +186,319 @@ class _ChatDrawerState extends State<ChatDrawer> {
       );
 
   Widget _search(ChatTokens t) => Padding(
-        padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-        child: TextField(
-          style: TextStyle(fontSize: 14, color: t.tintPrimary),
-          decoration: InputDecoration(
-            hintText: '搜索会话',
-            hintStyle: TextStyle(fontSize: 14, color: t.tintTertiary),
-            prefixIcon: Icon(Icons.search, size: 18, color: t.tintTertiary),
-            filled: true,
-            fillColor: t.bgSecondary,
-            isDense: true,
-            contentPadding: const EdgeInsets.symmetric(vertical: 10),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(ChatShape.radiusLg),
-              borderSide: BorderSide.none,
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+        child: Column(
+          children: [
+            SizedBox(
+              height: 36,
+              child: TextField(
+                controller: _searchController,
+                style: TextStyle(fontSize: 14, color: t.tintPrimary),
+                decoration: InputDecoration(
+                  hintText: switch (_scope) {
+                    _SearchScope.threads => '搜索会话',
+                    _SearchScope.current => '搜索当前会话',
+                    _SearchScope.global => '搜索全部消息',
+                  },
+                  hintStyle: TextStyle(fontSize: 14, color: t.tintTertiary),
+                  prefixIcon:
+                      Icon(Icons.search, size: 18, color: t.tintTertiary),
+                  prefixIconConstraints: const BoxConstraints(
+                    minWidth: 36,
+                    minHeight: 36,
+                  ),
+                  suffixIcon: _query.isEmpty
+                      ? null
+                      : IconButton(
+                          tooltip: '清除',
+                          iconSize: 18,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 36,
+                            minHeight: 36,
+                          ),
+                          onPressed: () {
+                            _searchController.clear();
+                            _setQuery('');
+                          },
+                          icon: Icon(Icons.close, color: t.tintTertiary),
+                        ),
+                  filled: true,
+                  fillColor: t.bgSecondary,
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(vertical: 0),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(ChatShape.radiusLg),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+                onChanged: _setQuery,
+              ),
             ),
-          ),
-          onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.center,
+              child: SizedBox(
+                height: 28,
+                child: SegmentedButton<_SearchScope>(
+                  selected: {_scope},
+                  showSelectedIcon: false,
+                  onSelectionChanged: (selection) => _setScope(selection.first),
+                  style: ButtonStyle(
+                    visualDensity: const VisualDensity(
+                      horizontal: -3,
+                      vertical: -3,
+                    ),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    minimumSize: const WidgetStatePropertyAll(Size(0, 28)),
+                    padding: const WidgetStatePropertyAll(
+                      EdgeInsets.symmetric(horizontal: 12),
+                    ),
+                    textStyle: WidgetStatePropertyAll(
+                      TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                          color: t.tintSecondary),
+                    ),
+                  ),
+                  segments: const [
+                    ButtonSegment(
+                        value: _SearchScope.threads, label: Text('会话')),
+                    ButtonSegment(
+                        value: _SearchScope.current, label: Text('当前')),
+                    ButtonSegment(
+                        value: _SearchScope.global, label: Text('全局')),
+                  ],
+                ),
+              ),
+            ),
+          ],
         ),
       );
 
-  Widget _list(ChatTokens t) => FutureBuilder<List<ChatThread>>(
-        future: _threads,
+  void _setQuery(String value) {
+    setState(() {
+      _query = value.trim().toLowerCase();
+      _searchTimer?.cancel();
+      if (_scope == _SearchScope.threads || _query.isEmpty) {
+        _messageHits = null;
+        return;
+      }
+      _searchTimer = Timer(_searchDebounce, _searchMessages);
+    });
+  }
+
+  void _setScope(_SearchScope scope) {
+    setState(() {
+      _scope = scope;
+      _searchTimer?.cancel();
+      if (scope == _SearchScope.threads || _query.isEmpty) {
+        _messageHits = null;
+      } else {
+        _searchMessages();
+      }
+    });
+  }
+
+  Future<void> _searchMessages() async {
+    final keyword = _query.trim();
+    if (keyword.isEmpty) return;
+    final revision = ++_searchRevision;
+    final threadId =
+        _scope == _SearchScope.current ? widget.currentThreadId : null;
+    if (threadId == null && _scope == _SearchScope.current) {
+      setState(() => _messageHits = Future.value(const []));
+      return;
+    }
+    final future = widget.store.searchMessages(keyword, threadId: threadId);
+    setState(() => _messageHits = future);
+    await future;
+    if (mounted && revision == _searchRevision) setState(() {});
+  }
+
+  Widget _messageList(ChatTokens t) =>
+      FutureBuilder<List<ChatMessageSearchHit>>(
+        future: _messageHits,
         builder: (context, snapshot) {
-          if (!snapshot.hasData) {
+          if (_query.isNotEmpty && _messageHits == null) {
+            return Center(
+              child: Text('正在搜索…',
+                  style: TextStyle(fontSize: 13, color: t.tintTertiary)),
+            );
+          }
+          if (snapshot.connectionState != ConnectionState.done &&
+              !snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
-          // 标题和预览都参与匹配：用户记得的往往是自己说过的那句话，
-          // 而不是被截成 28 个字的标题。
-          final threads = snapshot.data!.where((thread) {
-            if (_query.isEmpty) return true;
-            return thread.title.toLowerCase().contains(_query) ||
-                thread.preview.toLowerCase().contains(_query);
-          }).toList();
-
-          if (threads.isEmpty) {
+          if (snapshot.hasError) {
             return Center(
               child: Text(
-                _query.isEmpty ? '还没有会话' : '没有匹配的会话',
-                style: TextStyle(fontSize: 13, color: t.tintTertiary),
+                '搜索失败',
+                style: TextStyle(fontSize: 13, color: t.tintError),
               ),
             );
           }
-
+          final hits = snapshot.data ?? const <ChatMessageSearchHit>[];
+          if (hits.isEmpty) {
+            final empty =
+                _scope == _SearchScope.current && widget.currentThreadId == null
+                    ? '当前会话还没有保存的消息'
+                    : '没有匹配的消息';
+            return Center(
+              child: Text(empty,
+                  style: TextStyle(fontSize: 13, color: t.tintTertiary)),
+            );
+          }
           return ListView.builder(
             padding: const EdgeInsets.symmetric(horizontal: 8),
-            itemCount: threads.length,
-            itemBuilder: (context, i) {
-              final thread = threads[i];
-              final active = thread.id == widget.currentThreadId;
-              return Container(
-                margin: const EdgeInsets.only(bottom: 2),
-                decoration: BoxDecoration(
-                  color: active ? t.bgBrandSecondary : null,
+            itemCount: hits.length,
+            itemBuilder: (context, index) {
+              final hit = hits[index];
+              return ListTile(
+                dense: true,
+                shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(ChatShape.radiusLg),
                 ),
-                child: ListTile(
-                  dense: true,
-                  visualDensity: VisualDensity.compact,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(ChatShape.radiusLg),
-                  ),
-                  leading: Icon(
-                    thread.terminalMode
-                        ? Icons.terminal
-                        : Icons.chat_bubble_outline,
-                    size: 18,
-                    color: active ? t.brand : t.tintTertiary,
-                  ),
-                  title: Text(
-                    thread.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: active ? t.brand : t.tintPrimary,
-                      fontWeight: active ? FontWeight.w500 : FontWeight.normal,
-                    ),
-                  ),
-                  subtitle: Text(
-                    thread.preview,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 11, color: t.tintTertiary),
-                  ),
-                  onTap: () {
-                    Navigator.of(context).pop();
-                    if (thread.id != widget.currentThreadId) {
-                      widget.onSelect(thread.id);
-                    }
+                leading: Icon(
+                  switch (hit.role) {
+                    'user' => Icons.person_outline,
+                    'assistant' => Icons.smart_toy_outlined,
+                    'tool' => Icons.build_outlined,
+                    _ => Icons.info_outline,
                   },
-                  onLongPress: () => _showThreadMenu(thread),
+                  size: 18,
+                  color: t.tintTertiary,
                 ),
+                title: Text(
+                  _snippet(hit.message),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 13, color: t.tintPrimary),
+                ),
+                subtitle: Text(
+                  _hitSubtitle(hit),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11, color: t.tintTertiary),
+                ),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  widget.onOpenMessage(hit.threadId, hit.messageId);
+                },
               );
             },
           );
         },
       );
+
+  String _snippet(String text) {
+    final compact = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (compact.length <= 100) return compact;
+    final query = _query.trim();
+    final offset = compact.toLowerCase().indexOf(query);
+    if (offset < 0) return '${compact.substring(0, 100)}…';
+    final start = (offset - 32).clamp(0, compact.length);
+    final end = (start + 100).clamp(0, compact.length);
+    return '${start == 0 ? '' : '…'}${compact.substring(start, end)}'
+        '${end == compact.length ? '' : '…'}';
+  }
+
+  String _hitSubtitle(ChatMessageSearchHit hit) {
+    final role = switch (hit.role) {
+      'user' => '我',
+      'assistant' => '助手',
+      'tool' => '工具',
+      _ => '系统',
+    };
+    final time =
+        '${hit.createdAt.year}/${hit.createdAt.month}/${hit.createdAt.day}';
+    return _scope == _SearchScope.global
+        ? '$role · ${hit.threadTitle} · $time'
+        : '$role · $time';
+  }
+
+  Widget _list(ChatTokens t) {
+    if (_scope != _SearchScope.threads && _query.isNotEmpty) {
+      return _messageList(t);
+    }
+    return FutureBuilder<List<ChatThread>>(
+      future: _threads,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        // 标题和预览都参与匹配：用户记得的往往是自己说过的那句话，
+        // 而不是被截成 28 个字的标题。
+        final threads = snapshot.data!.where((thread) {
+          if (_query.isEmpty) return true;
+          return thread.title.toLowerCase().contains(_query) ||
+              thread.preview.toLowerCase().contains(_query);
+        }).toList();
+
+        if (threads.isEmpty) {
+          return Center(
+            child: Text(
+              _query.isEmpty ? '还没有会话' : '没有匹配的会话',
+              style: TextStyle(fontSize: 13, color: t.tintTertiary),
+            ),
+          );
+        }
+
+        return ListView.builder(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          itemCount: threads.length,
+          itemBuilder: (context, i) {
+            final thread = threads[i];
+            final active = thread.id == widget.currentThreadId;
+            return Container(
+              margin: const EdgeInsets.only(bottom: 2),
+              decoration: BoxDecoration(
+                color: active ? t.bgBrandSecondary : null,
+                borderRadius: BorderRadius.circular(ChatShape.radiusLg),
+              ),
+              child: ListTile(
+                dense: true,
+                visualDensity: VisualDensity.compact,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(ChatShape.radiusLg),
+                ),
+                leading: Icon(
+                  thread.terminalMode
+                      ? Icons.terminal
+                      : Icons.chat_bubble_outline,
+                  size: 18,
+                  color: active ? t.brand : t.tintTertiary,
+                ),
+                title: Text(
+                  thread.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: active ? t.brand : t.tintPrimary,
+                    fontWeight: active ? FontWeight.w500 : FontWeight.normal,
+                  ),
+                ),
+                subtitle: Text(
+                  thread.preview,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11, color: t.tintTertiary),
+                ),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  if (thread.id != widget.currentThreadId) {
+                    widget.onSelect(thread.id);
+                  }
+                },
+                onLongPress: () => _showThreadMenu(thread),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
 
   Future<void> _showThreadMenu(ChatThread thread) async {
     await showModalBottomSheet<void>(

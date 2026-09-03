@@ -39,10 +39,58 @@ class ToolResult {
   final String? outputRef;
   final bool rejected;
 
-  const ToolResult.ok(this.content, {this.outputRef}) : rejected = false;
+  /// 命令的退出码。null = 这个工具没有退出码这个概念（读写文件、检查点）。
+  ///
+  /// 单独留一个字段而不是让调用方去正文里翻：正文是给**模型**看的蒸馏文本，
+  /// 措辞会变；界面要判断「这次到底成没成」，靠解析那段文字迟早会错。
+  final int? exitCode;
+
+  /// 跑了多久，毫秒。0 = 不适用或没量。
+  final int elapsedMs;
+
+  const ToolResult.ok(this.content,
+      {this.outputRef, this.exitCode, this.elapsedMs = 0})
+      : rejected = false;
   const ToolResult.rejected(this.content)
       : outputRef = null,
+        exitCode = null,
+        elapsedMs = 0,
         rejected = true;
+
+  /// 界面上画 ✗ 还是 ✓。被拒绝、或者退出码非 0 都算没成。
+  bool get failed => rejected || (exitCode != null && exitCode != 0);
+}
+
+/// 工具调用在界面上的一行标题。
+///
+/// 取的是**这次调用做了什么**里最有信息量的那个参数：exec 取命令行，
+/// 文件类取路径，grep 取模式。取不到就只显示工具名 —— 那也比一个
+/// 空卡片强。
+///
+/// 不做截断：截多长是排版的事，交给 `Text.overflow`，
+/// 否则同一个标题在气泡里和在长按菜单里会是两个长度。
+String toolCallTitle(String name, Map<String, Object?> args) {
+  String? arg(String key) {
+    final v = args[key];
+    if (v is! String) return null;
+    final t = v.trim();
+    return t.isEmpty ? null : t;
+  }
+
+  final subject = switch (name) {
+    'exec' => arg('command'),
+    'read_file' || 'write_file' || 'apply_patch' => arg('path'),
+    'list_dir' => arg('path') ?? '.',
+    'grep' => arg('pattern'),
+    'grep_output' => arg('pattern'),
+    'recall_memory' => arg('query'),
+    'read_skill' => arg('name'),
+    'checkpoint' => arg('reason'),
+    _ => null,
+  };
+  if (subject == null) return name;
+  // exec 的命令行本身就够自解释了，再前缀一个 `exec` 只是噪音。
+  return name == 'exec' ? subject : '$name $subject';
 }
 
 const readOnlyTools = {

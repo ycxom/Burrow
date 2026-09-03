@@ -56,6 +56,25 @@ abstract class AgentHost {
   /// 状态变化：打了检查点、触发了摘要、沙箱降级等。用于 UI 上的小提示。
   void onStatus(String message);
 
+  /// 模型在这一回合里写完了一段正文，已经进 history。
+  ///
+  /// 一个回合可能产出好几段（说一句 → 跑命令 → 再说一句）。以前 UI 把它们
+  /// 攒成一个气泡，于是**活着看到的**和**重开会话看到的**是两种排版；而且
+  /// 中间跑命令的那几十秒里，界面上那一条气泡一个字都不变，看起来就是卡死。
+  ///
+  /// 现在每段落地就通知一次，UI 收口成一条消息，中间的工具调用画成自己的
+  /// 一行 —— 两种视图从此一致。
+  void onAssistantMessage(ChatMessage message);
+
+  /// 要开始跑一个工具了。UI 拿它画「执行中」。
+  ///
+  /// 在**审批之前**发：等审批弹窗弹出来时，背景里已经能看到是哪条命令
+  /// 在等确认了。
+  void onToolStart(ToolCall call);
+
+  /// 工具跑完了，[message] 就是刚进 history 的那条 tool 消息。
+  void onToolEnd(ChatMessage message);
+
   /// 往历史里插了一条**不是用户也不是模型说的**消息：检索回来的片段、
   /// 图片的文字描述。
   ///
@@ -497,7 +516,7 @@ class AgentLoop {
       }
 
       if (turn.text.isNotEmpty) {
-        history.add(ChatMessage(
+        final written = ChatMessage(
           role: 'assistant',
           content: turn.text,
           at: DateTime.now(),
@@ -511,20 +530,29 @@ class AgentLoop {
           // （模型边说边调工具），那些消息同样是这一轮的一部分。累加值挂在
           // 最后写出的那条上，前面几条各自带自己那一段。
           usage: spent.isEmpty ? null : spent,
-        ));
+        );
+        history.add(written);
+        host.onAssistantMessage(written);
         spent = const TokenUsage();
       }
       if (turn.toolCalls.isEmpty) break;
 
       for (final call in turn.toolCalls) {
+        host.onToolStart(call);
         final result = await _dispatch(call);
         if (epoch != _cancelEpoch) throw const AgentCancelledException();
-        history.add(ChatMessage(
+        final done = ChatMessage(
           role: 'tool',
           content: result.content,
           at: DateTime.now(),
           outputRef: result.outputRef,
-        ));
+          toolName: call.name,
+          toolTitle: toolCallTitle(call.name, call.args),
+          toolOk: !result.failed,
+          toolMs: result.elapsedMs,
+        );
+        history.add(done);
+        host.onToolEnd(done);
       }
 
       if (await overflow.onMessageAdded(history)) {
@@ -608,9 +636,12 @@ class AgentLoop {
   /// 下一轮的收紧系数会更狠。
   /// 最近一轮 [send] 的总用量。
   ///
-  /// 单独暴露一个出口，是因为 UI 在流式结束时会把这一轮所有的助手文本**合成
-  /// 一条**气泡显示（工具循环里模型可能分几段说话）。那条气泡是 UI 现造的，
-  /// 拿不到 history 里逐条挂着的用量；靠文本比对去找又会在分段时对不上。
+  /// 正常收尾时用不到它 —— 每一段正文都由 [AgentHost.onAssistantMessage]
+  /// 原样交给界面，用量就挂在那一条上。
+  ///
+  /// 它是给**没能正常收尾**的那一轮兜底的：用户按了停止、或者中途断线，
+  /// 文字流出来了一半但没进 history，界面只能自己造一条气泡 —— 那条气泡
+  /// 拿不到 history 里逐条挂着的用量，只能用这个整轮的数。
   TokenUsage? lastTurnUsage;
 
   /// 上一次实际发出去的那批消息估算出的 token 数。
@@ -834,7 +865,12 @@ class AgentLoop {
       sandboxDenials: result.sandboxDenials,
     );
 
-    return ToolResult.ok(distilled.text, outputRef: ref);
+    return ToolResult.ok(
+      distilled.text,
+      outputRef: ref,
+      exitCode: result.exitCode,
+      elapsedMs: result.elapsed.inMilliseconds,
+    );
   }
 
   /// `pkg install` 这类：在 `$PREFIX` 的暂存副本里跑，成功才原子切换。
@@ -897,7 +933,9 @@ class AgentLoop {
       return ToolResult.ok(
           '${distilled.text}\n'
           '[环境变更已提交为第 ${gen.id} 代，可用 rollback_env 回退]',
-          outputRef: ref);
+          outputRef: ref,
+          exitCode: result.exitCode,
+          elapsedMs: result.elapsed.inMilliseconds);
     }
 
     await tx.abort();
@@ -905,7 +943,10 @@ class AgentLoop {
     return ToolResult.ok(
         '${distilled.text}\n'
         '[命令失败，环境暂存副本已丢弃，当前环境未发生任何变化]',
-        outputRef: ref);
+        outputRef: ref,
+        // 超时没有退出码可言，给一个非 0 值，界面才画得出「失败」。
+        exitCode: result.timedOut ? -1 : result.exitCode,
+        elapsedMs: result.elapsed.inMilliseconds);
   }
 
   Future<ToolResult> _readSkill(ToolCall call) async {

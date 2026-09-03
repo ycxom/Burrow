@@ -45,6 +45,28 @@ class BranchState {
   bool get hasChoice => total > 1;
 }
 
+/// 一条消息搜索结果。
+///
+/// [messageId] 对应 `messages.id`，界面用它把列表滚到那条消息；
+/// 标题随结果一起带出来，全局结果不需要再按 thread 反查。
+class ChatMessageSearchHit {
+  const ChatMessageSearchHit({
+    required this.threadId,
+    required this.messageId,
+    required this.threadTitle,
+    required this.role,
+    required this.message,
+    required this.createdAt,
+  });
+
+  final String threadId;
+  final int messageId;
+  final String threadTitle;
+  final String role;
+  final String message;
+  final DateTime createdAt;
+}
+
 class ChatStore {
   ChatStore._(this._db);
 
@@ -58,7 +80,7 @@ class ChatStore {
   static Future<ChatStore> openAt(String path) async {
     final db = await openDatabase(
       path,
-      version: 10,
+      version: 11,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -111,6 +133,17 @@ class ChatStore {
           await db.execute(_createBranches);
           await db.execute(_createBranchIndex);
         }
+        if (from < 11) {
+          // 工具调用在聊天流里画成一张卡片，这四列是画它要的东西。
+          //
+          // 老会话的 tool 消息没有这些字段：卡片会退化成一行「工具结果」，
+          // 点开还能看到正文 —— 比把它们继续藏起来强，藏起来的后果是
+          // 助手气泡莫名其妙断成两半，中间什么都没有。
+          await db.execute('ALTER TABLE messages ADD COLUMN tool_name TEXT');
+          await db.execute('ALTER TABLE messages ADD COLUMN tool_title TEXT');
+          await db.execute('ALTER TABLE messages ADD COLUMN tool_ok INTEGER');
+          await db.execute('ALTER TABLE messages ADD COLUMN tool_ms INTEGER');
+        }
         if (from < 8) {
           // 这一条是不是估算值。1 = 估算。
           //
@@ -149,7 +182,11 @@ class ChatStore {
             tokens_estimated INTEGER,
             reasoning TEXT,
             reasoning_ms INTEGER,
-            branch_id TEXT
+            branch_id TEXT,
+            tool_name TEXT,
+            tool_title TEXT,
+            tool_ok INTEGER,
+            tool_ms INTEGER
           )
         ''');
         await db.execute(
@@ -368,6 +405,7 @@ class ChatStore {
     );
     return rows
         .map((row) => ChatMessage(
+              messageId: row['id']! as int,
               role: row['role']! as String,
               content: row['content']! as String,
               at: DateTime.fromMillisecondsSinceEpoch(
@@ -381,8 +419,64 @@ class ChatStore {
               reasoning: row['reasoning'] as String? ?? '',
               reasoningMs: row['reasoning_ms'] as int? ?? 0,
               branchId: row['branch_id'] as String?,
+              toolName: row['tool_name'] as String?,
+              toolTitle: row['tool_title'] as String?,
+              // 老消息这一列是 NULL。默认成功 —— 给一条没记过结果的历史
+              // 记录画个红叉，比不画更误导。
+              toolOk: (row['tool_ok'] as int? ?? 1) == 1,
+              toolMs: row['tool_ms'] as int? ?? 0,
             ))
         .toList();
+  }
+
+  /// 按关键词搜索消息。[threadId] 非空时只搜这一个会话。
+  ///
+  /// `LIKE` 先缩小范围，Dart 再按大小写折叠做一次精确筛选：
+  /// SQLite 的 `lower()` 只覆盖 ASCII，中文虽然不受影响，但不能把
+  /// 这当成所有 Unicode 输入的保证。
+  Future<List<ChatMessageSearchHit>> searchMessages(
+    String query, {
+    String? threadId,
+    int limit = 80,
+  }) async {
+    final keyword = query.trim();
+    if (keyword.isEmpty) return const <ChatMessageSearchHit>[];
+
+    final escaped = keyword
+        .replaceAll(r'\', r'\\')
+        .replaceAll('%', r'\%')
+        .replaceAll('_', r'\_');
+    final hits = <ChatMessageSearchHit>[];
+    final threadFilter = threadId == null ? '' : 'AND m.thread_id = ? ';
+    final rows = await _db.rawQuery(
+      'SELECT m.id AS message_id, m.thread_id, m.role, m.content, '
+      'm.created_at, t.title AS thread_title '
+      'FROM messages m '
+      'INNER JOIN threads t ON t.id = m.thread_id '
+      "WHERE m.content LIKE ? ESCAPE '\\' "
+      '$threadFilter'
+      'ORDER BY m.id DESC LIMIT ?',
+      <Object?>[
+        '%$escaped%',
+        if (threadId != null) threadId,
+        limit,
+      ],
+    );
+    for (final row in rows) {
+      final content = row['content']! as String;
+      if (!content.toLowerCase().contains(keyword.toLowerCase())) continue;
+      hits.add(ChatMessageSearchHit(
+        threadId: row['thread_id']! as String,
+        messageId: row['message_id']! as int,
+        threadTitle: row['thread_title']! as String,
+        role: row['role']! as String,
+        message: content,
+        createdAt: DateTime.fromMillisecondsSinceEpoch(
+          row['created_at']! as int,
+        ),
+      ));
+    }
+    return hits;
   }
 
   /// 三列合成一个 [TokenUsage]。全为 NULL（老消息、或服务端没回报）时返回
@@ -416,6 +510,10 @@ class ChatStore {
       'reasoning': message.reasoning.isEmpty ? null : message.reasoning,
       'reasoning_ms': message.reasoningMs == 0 ? null : message.reasoningMs,
       'branch_id': message.branchId,
+      'tool_name': message.toolName,
+      'tool_title': message.toolTitle,
+      'tool_ok': message.toolOk ? 1 : 0,
+      'tool_ms': message.toolMs == 0 ? null : message.toolMs,
     });
     await _db.update(
       'threads',
@@ -444,6 +542,10 @@ class ChatStore {
         'reasoning': m.reasoning,
         'reasoningMs': m.reasoningMs,
         'branchId': m.branchId,
+        'toolName': m.toolName,
+        'toolTitle': m.toolTitle,
+        'toolOk': m.toolOk,
+        'toolMs': m.toolMs,
         'usage': m.usage == null
             ? null
             : <String, Object?>{
@@ -470,6 +572,10 @@ class ChatStore {
       reasoning: j['reasoning'] as String? ?? '',
       reasoningMs: j['reasoningMs'] as int? ?? 0,
       branchId: j['branchId'] as String?,
+      toolName: j['toolName'] as String?,
+      toolTitle: j['toolTitle'] as String?,
+      toolOk: j['toolOk'] as bool? ?? true,
+      toolMs: j['toolMs'] as int? ?? 0,
       usage: usage is Map<String, Object?>
           ? TokenUsage(
               input: usage['input'] as int? ?? 0,
@@ -603,10 +709,11 @@ class ChatStore {
     });
   }
 
-  Future<void> replaceMessages(
+  Future<List<ChatMessage>> replaceMessages(
     String threadId,
     List<ChatMessage> messages,
   ) async {
+    final stored = <ChatMessage>[];
     await _db.transaction((txn) async {
       await txn.delete(
         'messages',
@@ -614,7 +721,7 @@ class ChatStore {
         whereArgs: <Object?>[threadId],
       );
       for (final message in messages) {
-        await txn.insert('messages', <String, Object?>{
+        final id = await txn.insert('messages', <String, Object?>{
           'thread_id': threadId,
           'role': message.role,
           'content': message.content,
@@ -630,8 +737,14 @@ class ChatStore {
           'reasoning': message.reasoning.isEmpty ? null : message.reasoning,
           'reasoning_ms': message.reasoningMs == 0 ? null : message.reasoningMs,
           'branch_id': message.branchId,
+          'tool_name': message.toolName,
+          'tool_title': message.toolTitle,
+          'tool_ok': message.toolOk ? 1 : 0,
+          'tool_ms': message.toolMs == 0 ? null : message.toolMs,
         });
+        stored.add(message.copyWith(messageId: id));
       }
     });
+    return stored;
   }
 }

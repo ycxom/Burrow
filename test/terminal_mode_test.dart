@@ -52,6 +52,14 @@ class _RecordingHost implements AgentHost {
   final StringBuffer thoughts = StringBuffer();
   final List<String> statuses = <String>[];
   final List<ChatMessage> injected = <ChatMessage>[];
+
+  /// 界面看到的那条流水账，按到达顺序。
+  ///
+  /// 记顺序而不是只记条数：这几个回调存在的全部理由就是让界面能按
+  /// 「说一句 → 跑命令 → 再说一句」的次序画出来，顺序错了功能就没了。
+  final List<String> feed = <String>[];
+  final List<ChatMessage> assistantMessages = <ChatMessage>[];
+  final List<ChatMessage> toolMessages = <ChatMessage>[];
   int approvalsAsked = 0;
 
   @override
@@ -74,6 +82,22 @@ class _RecordingHost implements AgentHost {
 
   @override
   void onContextMessage(ChatMessage message) => injected.add(message);
+
+  @override
+  void onAssistantMessage(ChatMessage message) {
+    assistantMessages.add(message);
+    feed.add('say:${message.content}');
+  }
+
+  @override
+  void onToolStart(ToolCall call) =>
+      feed.add('start:${toolCallTitle(call.name, call.args)}');
+
+  @override
+  void onToolEnd(ChatMessage message) {
+    toolMessages.add(message);
+    feed.add('end:${message.toolTitle}:${message.toolOk ? 'ok' : 'fail'}');
+  }
 }
 
 class _NeverSpawns implements NativePtySpawner {
@@ -290,6 +314,114 @@ void main() {
       await agent.send('看看');
 
       expect(agent.snapshots.checkpoints, isNotEmpty);
+    });
+  });
+
+  group('工具调用要在聊天流里看得见', () {
+    // 起因：模型说一句「我来 SSH 连一下」，然后跑 17 秒命令，再说结果。
+    // 界面上表现成两个紧挨着的气泡、中间什么都没有，而那 17 秒里一个像素
+    // 都不动 —— 用户完全有理由认为它卡死了。
+
+    test('每段正文落地就通知一次，工具调用夹在中间', () async {
+      final (agent, _, host) = await buildLoop([
+        const LlmTurn(text: '我来看看目录', toolCalls: [
+          ToolCall(id: '1', name: 'read_file', args: {'path': 'a.txt'}),
+        ]),
+        const LlmTurn(text: '看完了'),
+      ]);
+      agent.terminalMode = true;
+      await File('${tmp.path}/workspace/a.txt').writeAsString('hello');
+
+      await agent.send('看看 a.txt');
+
+      // 顺序就是界面要画的顺序。以前界面只能拿到「整轮结束」这一个信号，
+      // 于是把两段正文拼成一个气泡，工具调用完全不可见。
+      expect(host.feed, <String>[
+        'say:我来看看目录',
+        'start:read_file a.txt',
+        'end:read_file a.txt:ok',
+        'say:看完了',
+      ]);
+    });
+
+    test('通知里给的就是 history 里那一条，不是另造的副本', () async {
+      final (agent, _, host) = await buildLoop([
+        const LlmTurn(text: '嗯', toolCalls: [
+          ToolCall(id: '1', name: 'list_dir', args: {'path': '.'}),
+        ]),
+        const LlmTurn(text: '好了'),
+      ]);
+      agent.terminalMode = true;
+
+      await agent.send('看看');
+
+      // 界面直接把这个对象放进自己的列表里。同一个对象才能让
+      // 「按下标从 _visible 找回 history」走恒等匹配那条快路。
+      for (final m in <ChatMessage>[
+        ...host.assistantMessages,
+        ...host.toolMessages
+      ]) {
+        expect(agent.history.any((h) => identical(h, m)), isTrue,
+            reason: '通知给界面的必须是 history 里那一条本身');
+      }
+    });
+
+    test('工具消息带着标题和成败，重开会话还画得出卡片', () async {
+      final (agent, _, host) = await buildLoop([
+        const LlmTurn(text: '读一下', toolCalls: [
+          ToolCall(id: '1', name: 'read_file', args: {'path': 'a.txt'}),
+        ]),
+        const LlmTurn(text: '完'),
+      ]);
+      agent.terminalMode = true;
+      await File('${tmp.path}/workspace/a.txt').writeAsString('hello');
+
+      await agent.send('读');
+
+      final tool = agent.history.firstWhere((m) => m.role == 'tool');
+      expect(tool.toolName, 'read_file');
+      expect(tool.toolTitle, 'read_file a.txt');
+      expect(tool.toolOk, isTrue);
+    });
+
+    test('被拒绝的调用记成失败', () async {
+      final (agent, _, _) = await buildLoop([
+        const LlmTurn(text: '我跑一下', toolCalls: [
+          ToolCall(id: '1', name: 'exec', args: {'command': 'ls'}),
+        ]),
+        const LlmTurn(text: '好吧'),
+      ]);
+      // 聊天模式下工具一律被拒 —— 借它造一个失败的调用。
+      agent.terminalMode = false;
+
+      await agent.send('看看');
+
+      final tool = agent.history.firstWhere((m) => m.role == 'tool');
+      expect(tool.toolOk, isFalse, reason: '被拒绝要画成失败，不能和成功长一样');
+    });
+  });
+
+  group('工具卡片的标题', () {
+    test('exec 直接用命令行，不加工具名前缀', () {
+      // `exec ssh hello@host` 里的 `exec` 是纯噪音：命令行本身已经说清了。
+      expect(toolCallTitle('exec', {'command': 'ssh hello@192.168.36.248'}),
+          'ssh hello@192.168.36.248');
+    });
+
+    test('其余工具带上工具名，否则一个裸路径看不出在干嘛', () {
+      expect(toolCallTitle('read_file', {'path': 'lib/main.dart'}),
+          'read_file lib/main.dart');
+      expect(toolCallTitle('grep', {'pattern': 'TODO'}), 'grep TODO');
+    });
+
+    test('list_dir 不给路径时补一个 .，而不是退化成光秃秃的工具名', () {
+      expect(toolCallTitle('list_dir', const {}), 'list_dir .');
+    });
+
+    test('取不到参数就只显示工具名', () {
+      expect(toolCallTitle('list_checkpoints', const {}), 'list_checkpoints');
+      // 参数在但是空的，也算取不到 —— 一个末尾挂着空格的标题更像是坏了。
+      expect(toolCallTitle('exec', const {'command': '   '}), 'exec');
     });
   });
 

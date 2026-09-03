@@ -4,6 +4,7 @@
 .flutter-plugins
 .flutter-plugins-dependencies
 build/
+dist/
 
 # ---- Android ----
 android/.gradle/

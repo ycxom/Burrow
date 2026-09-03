@@ -51,6 +51,7 @@ import 'model_bar.dart';
 import 'settings_page.dart';
 import 'system_prompt_page.dart';
 import 'skills_page.dart';
+import 'tool_card.dart';
 
 /// 当前 UI 文案是中文。把 locale 明确交给 Material 本地化后，TextField 的
 /// 原生操作菜单也会使用“剪切 / 复制 / 粘贴 / 全选”，而不是落回英文。
@@ -522,6 +523,7 @@ class ChatShell extends StatefulWidget {
 class _ChatShellState extends State<ChatShell> {
   String? _threadId;
   String _title = '新对话';
+  int? _searchTargetMessageId;
 
   /// 未存盘会话的 runtime id。每开一个新会话换一个 ——
   /// 复用的话两个草稿会共用同一个 workspace，互相看到对方的文件。
@@ -547,6 +549,12 @@ class _ChatShellState extends State<ChatShell> {
       _threadId = threadId;
       _title = match.isEmpty ? '对话' : match.first.title;
     });
+  }
+
+  Future<void> _openSearchHit(String threadId, int messageId) async {
+    if (threadId != _threadId) await _select(threadId);
+    if (!mounted) return;
+    setState(() => _searchTargetMessageId = messageId);
   }
 
   @override
@@ -575,6 +583,11 @@ class _ChatShellState extends State<ChatShell> {
       title: _title,
       onSelectThread: _select,
       onTitleChanged: (title) => setState(() => _title = title),
+      onOpenSearchHit: _openSearchHit,
+      searchTargetMessageId: _searchTargetMessageId,
+      onSearchTargetConsumed: () {
+        if (mounted) setState(() => _searchTargetMessageId = null);
+      },
     );
   }
 }
@@ -617,6 +630,14 @@ class HomeShell extends StatefulWidget {
   /// 第一条消息落库之后，把标题回传给外壳。
   final ValueChanged<String> onTitleChanged;
 
+  /// 抽屉消息搜索结果要求换会话并定位。
+  final Future<void> Function(String threadId, int messageId)
+      onOpenSearchHit;
+
+  /// 抽屉里的搜索结果要打开的那条消息；null = 没有待定位目标。
+  final int? searchTargetMessageId;
+  final VoidCallback onSearchTargetConsumed;
+
   const HomeShell({
     super.key,
     required this.buildAgent,
@@ -639,6 +660,9 @@ class HomeShell extends StatefulWidget {
     required this.title,
     required this.onSelectThread,
     required this.onTitleChanged,
+    required this.onOpenSearchHit,
+    required this.searchTargetMessageId,
+    required this.onSearchTargetConsumed,
   });
 
   @override
@@ -653,6 +677,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   final List<ChatMessage> _visible = [];
   final _input = TextEditingController();
   final _scroll = ScrollController();
+  final _messageKeys = <int, GlobalKey>{};
+  int? _highlightMessageId;
+  Timer? _highlightTimer;
 
   /// 抽屉入口是我们自己 compose 的（见 _buildDrawerButton），所以要一个 key
   /// 才能从 AppBar 里够到 Scaffold。
@@ -708,6 +735,13 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   /// [AgentLoop] 那份量出来的定值。
   DateTime? _thinkStartedAt;
 
+  /// 正在跑的那个工具：标题 + 起跑时刻。null = 现在没有命令在跑。
+  ///
+  /// 它撑起的是**跑命令那段时间里屏幕上唯一在动的东西**。在此之前，
+  /// 模型说完一句话去跑一条 ssh，那十几秒里界面完全静止 —— 输入框还灰着，
+  /// 但没有任何东西说明它在等什么，看起来就是卡死了。
+  ({String title, DateTime startedAt})? _runningTool;
+
   /// branchId → 这个分支点有几个版本、正在看第几个。
   ///
   /// 缓存而不是画的时候现查：`build` 里不能等异步结果，而每条消息都去查一次
@@ -740,6 +774,15 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     widget.settings.addListener(_onSettingsChanged);
     _scroll.addListener(_onScroll);
     _prepareRuntime();
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final target = widget.searchTargetMessageId;
+    if (target != null && target != oldWidget.searchTargetMessageId) {
+      _revealMessage(target);
+    }
   }
 
   String? _displayMessageSource(String? source) {
@@ -824,14 +867,79 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     if (id != null) {
       final messages = await widget.chats.messages(id);
       _agent.history.addAll(messages);
-      _visible.addAll(messages.where((message) => message.role != 'tool'));
+      // tool 消息也进来。以前这里把它们滤掉，代价是同一个回合的两段
+      // 正文变成两个紧挨着的气泡、中间什么都没有 —— 看着像一条消息
+      // 断成了两半。现在它们画成一张工具卡片，那个"断"就有了理由。
+      _visible.addAll(messages);
     }
     if (mounted) setState(() => _loadingHistory = false);
     await _refreshBranches();
-    // 打开会话直接停在最新消息——和其他聊天应用一致，也是上面"是否跟随
-    // 底部"判断成立的前提：不跳过去的话，长对话默认停在顶部，流式回复
-    // 永远判定成"用户在看历史"，无声无息地不跟随。
-    _scrollToEnd();
+    final target = widget.searchTargetMessageId;
+    if (target != null) {
+      _revealMessage(target);
+    } else {
+      // 打开会话直接停在最新消息——和其他聊天应用一致，也是上面"是否跟随
+      // 底部"判断成立的前提：不跳过去的话，长对话默认停在顶部，流式回复
+      // 永远判定成"用户在看历史"，无声无息地不跟随。
+      _scrollToEnd();
+    }
+  }
+
+  GlobalKey? _messageKey(int? messageId) {
+    final id = messageId;
+    if (id == null) return null;
+    return _messageKeys.putIfAbsent(id, GlobalKey.new);
+  }
+
+  void _revealMessage(int messageId) {
+    final visibleIndex =
+        _visible.indexWhere((message) => message.messageId == messageId);
+    if (visibleIndex < 0) {
+      widget.onSearchTargetConsumed();
+      return;
+    }
+
+    _highlightTimer?.cancel();
+    setState(() => _highlightMessageId = messageId);
+    _highlightTimer = Timer(const Duration(milliseconds: 2200), () {
+      if (mounted) setState(() => _highlightMessageId = null);
+    });
+
+    final rows = _buildRows(null);
+    final rowIndex = rows.indexWhere((row) => row.index == visibleIndex);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      bool reveal() {
+        final keyContext = _messageKey(messageId)?.currentContext;
+        if (keyContext != null) {
+          Scrollable.ensureVisible(
+            keyContext,
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
+            alignment: 0.28,
+          );
+          return true;
+        }
+        return false;
+      }
+
+      if (reveal()) return;
+      if (!_scroll.hasClients || rowIndex < 0) return;
+
+      // ListView.builder 只会构建视口附近的行。特别长的对话里目标还没被
+      // 创建，先用行号比例估一个位置跳过去；列表落到目标附近后再用它的
+      // context 做精确滚动。
+      final maxExtent = _scroll.position.maxScrollExtent;
+      final estimate =
+          rows.length <= 1 ? 0.0 : maxExtent * rowIndex / (rows.length - 1);
+      _scroll.jumpTo(
+        (estimate - _scroll.position.viewportDimension * 0.28)
+            .clamp(0.0, maxExtent),
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _scroll.hasClients) reveal();
+      });
+    });
+    widget.onSearchTargetConsumed();
   }
 
   Future<void> _startShell() async {
@@ -1179,7 +1287,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     return true;
   }
 
-  /// `_visible` 过滤掉了 tool 消息，所以下标和 `history` 对不上。
+  /// 界面那份和 `history` 的下标不保证一致，见 message_index.dart。
   /// 规则见 [historyIndexOfVisible]。
   int _historyIndexOf(int visibleIndex) =>
       historyIndexOfVisible(_visible, _agent.history, visibleIndex);
@@ -1247,7 +1355,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         ..addAll(tail);
       _visible
         ..removeRange(visibleAnchor, _visible.length)
-        ..addAll(tail.where((message) => message.role != 'tool'));
+        ..addAll(tail);
     });
     await _persist();
     await widget.chats.setActiveVariant(branchId, target);
@@ -1257,7 +1365,23 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   Future<void> _persist() async {
     final id = _threadId;
-    if (id != null) await widget.chats.replaceMessages(id, _agent.history);
+    if (id != null) await _persistMessages(id);
+  }
+
+  Future<void> _persistMessages(String id) async {
+    final persisted = await widget.chats.replaceMessages(id, _agent.history);
+    if (persisted.length != _agent.history.length) return;
+
+    // replaceMessages 删掉旧行重插，数据库 id 会变。把新 id 同步回内存，
+    // 否则刚发完的消息立刻在当前会话里搜得到，点过去却定位不到。
+    for (var i = 0; i < persisted.length; i++) {
+      final original = _agent.history[i];
+      final updated = persisted[i];
+      _agent.history[i] = updated;
+      final visibleIndex =
+          _visible.indexWhere((message) => identical(message, original));
+      if (visibleIndex >= 0) _visible[visibleIndex] = updated;
+    }
   }
 
   /// 打开编辑框。返回用户选了哪个动作，取消返回 null。
@@ -1510,6 +1634,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   void dispose() {
     widget.settings.removeListener(_onSettingsChanged);
     _statusTimer?.cancel();
+    _highlightTimer?.cancel();
     _shell?.killGroup();
     if (_runtimeReady && _threadId == null) {
       unawaited(_runtime.root.delete(recursive: true));
@@ -1653,6 +1778,45 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   void onStatus(String message) => _setStatus(message);
 
   @override
+  void onAssistantMessage(ChatMessage message) {
+    if (!mounted) return;
+    // 这一段正文已经进 history 了，界面把流式缓冲收口成同一条消息。
+    //
+    // **必须用 AgentLoop 给的这一条，不能拿 _streaming 自己再造一条。**
+    // 思考、耗时、用量都挂在它上面；自己造的那份取不到，只能靠猜，
+    // 而猜出来的和重开会话之后读到的对不上。
+    setState(() {
+      _visible.add(message);
+      _streaming.clear();
+      _reasoning.clear();
+      _thinkStartedAt = null;
+    });
+    if (!_scrolledAway) _scrollToEnd(animated: true);
+  }
+
+  @override
+  void onToolStart(ToolCall call) {
+    if (!mounted) return;
+    setState(() {
+      _runningTool = (
+        title: toolCallTitle(call.name, call.args),
+        startedAt: DateTime.now(),
+      );
+    });
+    if (!_scrolledAway) _scrollToEnd(animated: true);
+  }
+
+  @override
+  void onToolEnd(ChatMessage message) {
+    if (!mounted) return;
+    setState(() {
+      _runningTool = null;
+      _visible.add(message);
+    });
+    if (!_scrolledAway) _scrollToEnd(animated: true);
+  }
+
+  @override
   void onContextMessage(ChatMessage message) {
     // 插在流式气泡**之前**：这条是模型开口之前就已经存在的输入，
     // 排在回答后面会让人以为是模型说的。
@@ -1745,31 +1909,35 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       // 底部——和流式过程中的道理一样，是不是"跟着"要在内容落地前判断。
       final wasFollowingBottom = !_scrolledAway;
       setState(() {
+        // 正常写完的每一段都已经由 onAssistantMessage 收进 _visible 了，
+        // 缓冲这时是空的。走到这里说明这一轮**没能正常收尾** —— 用户按了
+        // 停止，或者中途断线：文字流出来了一半，AgentLoop 那边还没来得及
+        // 把它记进 history。
         if (_streaming.isNotEmpty) {
-          _visible.add(ChatMessage(
+          final partial = ChatMessage(
             role: 'assistant',
             content: _streaming.toString(),
             at: DateTime.now(),
             source: widget.settings.sourceLabel,
-            // 思考也接上，不接的话回答写完的瞬间那一块会整个消失，
+            // 思考也接上，不接的话回答断掉的瞬间那一块会整个消失，
             // 而它明明刚刚还在。
-            //
-            // 内容用界面自己攒的这份：工具循环里一个回合会产出好几条助手
-            // 消息，而这里合成的是**一条**气泡 —— 正文已经是全部拼在一起的，
-            // 思考只取其中一条会对不上。
             reasoning: _reasoning.toString(),
-            // 时长只有 AgentLoop 那边量得到。取最后一条助手消息的 ——
-            // 多轮时这是不完整的，但把几轮加起来会得到一个"想了 40 秒"
-            // 这种明显不对的数，而绝大多数回合本来就只有一轮。
+            // 时长只有 AgentLoop 那边量得到。取最后一条助手消息的。
             reasoningMs: _lastAssistantReasoningMs(),
-            // 用量取整轮的。这条气泡是这里现造的，AgentLoop 挂在 history 上的
-            // 那份取不到 —— 不接这一条，token 要等到重新载入会话才显示出来。
+            // 用量取整轮的：这条是界面现造的，history 上没有对应的那一条。
             usage: _agent.lastTurnUsage,
-          ));
+          );
+          // **两份都要加。** 只加 _visible 的话，用户看得见这半句话，
+          // 但它没进 history，重开会话就没了 —— 而"刚才明明说了一半"
+          // 是用户最想留下的那种残骸（尤其是他主动按停止的时候）。
+          _agent.history.add(partial);
+          _visible.add(partial);
           _streaming.clear();
           _reasoning.clear();
           _thinkStartedAt = null;
         }
+        // 被取消时 onToolEnd 不会到，卡片会永远停在"执行中"。
+        _runningTool = null;
         _busy = false;
       });
       // 分支点上的新版本要先挂上 id 再存，否则重开 App 之后这条消息
@@ -1786,7 +1954,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           if (visibleIndex >= 0) _visible[visibleIndex] = tagged;
         }
       }
-      await widget.chats.replaceMessages(id, _agent.history);
+      await _persistMessages(id);
       if (branchId != null && anchorIndex != null) {
         await widget.chats.saveVariant(
           threadId: id,
@@ -1907,6 +2075,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           store: widget.chats,
           currentThreadId: _threadId,
           onSelect: widget.onSelectThread,
+          onOpenMessage: widget.onOpenSearchHit,
           onOpenSettings: _openSettings,
           onOpenSkills: _openSkills,
           onOpenChannels: _openChannels,
@@ -2053,7 +2222,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 正在跑就一定有这一行，哪怕一个字都还没到 —— 那一行会画成三个跳动的
     // 点。**发出消息之后界面上什么都不变**是这个页面最容易被当成 bug 的
     // 表现，而它恰好发生在等待最久的推理模型上。
-    final rows = _buildRows(_busy ? _streaming.toString() : null);
+    // 有命令在跑的时候不画打字气泡：那一刻真正在发生的事是"命令在跑"，
+    // 底下再挂三个跳动的点等于同时说两件事，而其中一件是假的
+    // —— 模型此刻并没有在输出。
+    final rows = _buildRows(
+        _busy && _runningTool == null ? _streaming.toString() : null);
 
     final bottomInset = MediaQuery.paddingOf(context).bottom;
     return Stack(
@@ -2114,6 +2287,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                 controller: _input,
                 generating: _busy,
                 enabled: !_busy && !_loadingHistory,
+                hasExternalContent: _attachments.isNotEmpty,
                 hintText: _agent.terminalMode ? '描述你希望 Agent 完成的任务' : '随便聊点什么',
                 onSend: _send,
                 onStop: _stop,
@@ -2154,11 +2328,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           !_sameDay(previous.at, message.at);
       rows.add(_ChatRow.message(i, lastInGroup, firstInGroup));
     }
+    final running = _runningTool;
+    if (running != null) rows.add(_ChatRow.runningTool(running));
     if (streaming != null) rows.add(_ChatRow.streaming(streaming));
     return rows;
   }
 
   Widget _buildRow(_ChatRow row) {
+    final running = row.runningTool;
+    if (running != null) {
+      return ToolCallCard(
+        title: running.title,
+        state: ToolCallState.running,
+        startedAt: running.startedAt,
+      );
+    }
+
     final streaming = row.streaming;
     if (streaming != null) {
       return ChatBubble(
@@ -2179,6 +2364,22 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
     final i = row.index;
     final message = _visible[i];
+
+    // 工具调用不是"谁说的话"，画成卡片而不是气泡 —— 做成气泡的话，
+    // 一屏里会有一半的"发言"其实是命令输出。
+    if (message.role == 'tool') {
+      return _messageSurface(
+        message,
+        ToolCallCard(
+          // 老会话（v11 之前）的 tool 消息没记下是谁跑的，只能给一个泛称。
+          title: message.toolTitle ?? message.toolName ?? '工具调用',
+          state: message.toolOk ? ToolCallState.ok : ToolCallState.failed,
+          output: message.content,
+          elapsedMs: message.toolMs,
+        ),
+      );
+    }
+
     final isError =
         message.role == 'system' && message.content.startsWith(kErrorPrefix);
 
@@ -2186,7 +2387,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 长得像助手发言的话，用户会以为模型在自言自语。
     // 报错除外：它可能很长，压进胶囊会读不了，仍然走气泡。
     if (message.role == 'system' && !isError) {
-      return ServicePill(text: message.content);
+      return _messageSurface(message, ServicePill(text: message.content));
     }
 
     final isLastAssistant =
@@ -2205,48 +2406,68 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       }
     }
     final branch = branchOwner == null ? null : _branches[branchOwner];
-    return ChatBubble(
-      role: message.role,
-      text: message.content,
-      images: message.images,
-      time: message.at,
-      // 用消息**自己记下的**来源，而不是当前配置。换个渠道就把满屏历史
-      // 全部改署成新渠道的话，恰好会在用户回头查"刚才那次是谁花的额度"时
-      // 给出错误答案。老消息没有这个记录，那就不署名。
-      meta: _displayMessageSource(message.source),
-      usage: message.usage,
-      showTokens: widget.settings.showTokenUsage,
-      reasoning: message.reasoning,
-      reasoningMs: message.reasoningMs,
-      // 切换器画在两个地方：分支锚点那条问话下面，以及这一轮最后一条回复
-      // 下面。它们背后是同一个分支状态 —— 点「重新生成」的人会去回复那边
-      // 找，点「编辑」的人会去问话那边找，两处都放才不会有人找不到。
-      variantCount: branch?.total ?? 0,
-      variantIndex: branch?.active ?? 0,
-      onSwitchVariant: branch == null || _busy
-          ? null
-          : (target) => _switchVariant(branchOwner!, target),
-      isError: isError,
-      lastInGroup: row.lastInGroup,
-      firstInGroup: row.firstInGroup,
-      avatarPath: isUser
-          ? widget.settings.userAvatarPath
-          : message.role == 'assistant'
-              ? widget.settings.assistantAvatarPath
-              : '',
-      showAvatar: widget.settings.showMessageAvatars,
-      onRetry: isLastAssistant ? _retry : null,
-      // 编辑对用户和助手都开放，但两者能做的事不同（见 _editMessage）：
-      // 用户消息可以「保存并重发」，助手消息只能就地改内容 —— 改完模型
-      // 看到的上下文也跟着变，这正是要改它的理由。
-      onEdit: (isUser || message.role == 'assistant') && !_busy
-          ? () => _editMessage(i)
-          : null,
-      // 回退仍然只给用户消息：它的语义是「从这句重来」，
-      // 挂在助手消息上没有对应的动作。
-      onRewind: isUser && !_busy ? () => _rewindTo(i) : null,
-      onDelete: !_busy ? () => _deleteFrom(i) : null,
-    );
+    return _messageSurface(
+        message,
+        ChatBubble(
+          role: message.role,
+          text: message.content,
+          images: message.images,
+          time: message.at,
+          // 用消息**自己记下的**来源，而不是当前配置。换个渠道就把满屏历史
+          // 全部改署成新渠道的话，恰好会在用户回头查"刚才那次是谁花的额度"时
+          // 给出错误答案。老消息没有这个记录，那就不署名。
+          meta: _displayMessageSource(message.source),
+          usage: message.usage,
+          showTokens: widget.settings.showTokenUsage,
+          reasoning: message.reasoning,
+          reasoningMs: message.reasoningMs,
+          // 切换器画在两个地方：分支锚点那条问话下面，以及这一轮最后一条回复
+          // 下面。它们背后是同一个分支状态 —— 点「重新生成」的人会去回复那边
+          // 找，点「编辑」的人会去问话那边找，两处都放才不会有人找不到。
+          variantCount: branch?.total ?? 0,
+          variantIndex: branch?.active ?? 0,
+          onSwitchVariant: branch == null || _busy
+              ? null
+              : (target) => _switchVariant(branchOwner!, target),
+          isError: isError,
+          lastInGroup: row.lastInGroup,
+          firstInGroup: row.firstInGroup,
+          avatarPath: isUser
+              ? widget.settings.userAvatarPath
+              : message.role == 'assistant'
+                  ? widget.settings.assistantAvatarPath
+                  : '',
+          showAvatar: widget.settings.showMessageAvatars,
+          onRetry: isLastAssistant ? _retry : null,
+          // 编辑对用户和助手都开放，但两者能做的事不同（见 _editMessage）：
+          // 用户消息可以「保存并重发」，助手消息只能就地改内容 —— 改完模型
+          // 看到的上下文也跟着变，这正是要改它的理由。
+          onEdit: (isUser || message.role == 'assistant') && !_busy
+              ? () => _editMessage(i)
+              : null,
+          // 回退仍然只给用户消息：它的语义是「从这句重来」，
+          // 挂在助手消息上没有对应的动作。
+          onRewind: isUser && !_busy ? () => _rewindTo(i) : null,
+          onDelete: !_busy ? () => _deleteFrom(i) : null,
+        ));
+  }
+
+  Widget _messageSurface(ChatMessage message, Widget child) {
+    final key = _messageKey(message.messageId);
+    Widget result = key == null ? child : KeyedSubtree(key: key, child: child);
+    if (message.messageId != null && message.messageId == _highlightMessageId) {
+      final t = context.chat;
+      result = AnimatedContainer(
+        duration: const Duration(milliseconds: 220),
+        decoration: BoxDecoration(
+          color: t.bgBrandSecondary.withValues(alpha: 0.42),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: t.brand, width: 1.25),
+        ),
+        child: result,
+      );
+    }
+    return result;
   }
 
   static bool _sameDay(DateTime a, DateTime b) =>
@@ -2773,19 +2994,33 @@ class _ChatRow {
   final bool lastInGroup;
   final bool firstInGroup;
 
+  /// 正在跑的那个工具。跑完之后它会变成 `_visible` 里的一条 tool 消息，
+  /// 由 [_ChatRow.message] 接手 —— 所以这一种只在命令跑着的时候存在。
+  final ({String title, DateTime startedAt})? runningTool;
+
   const _ChatRow.date(this.day)
       : index = -1,
         streaming = null,
+        runningTool = null,
         lastInGroup = true,
         firstInGroup = true;
 
   const _ChatRow.message(this.index, this.lastInGroup, this.firstInGroup)
       : day = null,
-        streaming = null;
+        streaming = null,
+        runningTool = null;
 
   const _ChatRow.streaming(this.streaming)
       : day = null,
         index = -1,
+        runningTool = null,
+        lastInGroup = true,
+        firstInGroup = false;
+
+  const _ChatRow.runningTool(this.runningTool)
+      : day = null,
+        index = -1,
+        streaming = null,
         lastInGroup = true,
         firstInGroup = false;
 }

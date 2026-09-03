@@ -67,3 +67,6 @@ flutter:
     # 多半还没联网拉到，而那正是最需要它的时刻。
     # 用 tool/generate_model_snapshot.dart 重新生成。
     - assets/model_registry.json
+  shaders:
+    # 输入框那块液态玻璃的边缘折射。见 lib/src/ui/liquid_glass.dart。
+    - shaders/liquid_glass.frag
