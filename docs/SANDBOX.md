@@ -29,8 +29,10 @@ codex 在桌面 Linux 上的方案是 bubblewrap + Landlock + seccomp。搬到 A
 ## 2. 五层，逐层降级
 
 ```sh
-burrow-launch --seccomp-no-net --landlock-rw=<workspace> --rlimit-nproc=64 -- \
-  proot -r <发行版 rootfs> \
+burrow-launch --seccomp-no-net \
+              --landlock-rw=<发行版 rootfs> --landlock-ro=/system \
+              --landlock-rw=<workspace> --rlimit-nproc=64 -- \
+  proot -0 -l -L -r <发行版 rootfs> \
         -b /dev -b /proc -b /sys \
         -b <workspace>:/workspace \
         -w /workspace \
@@ -40,6 +42,19 @@ burrow-launch --seccomp-no-net --landlock-rw=<workspace> --rlimit-nproc=64 -- \
 用 `/bin/sh` 而不是 `/usr/bin/bash`：任何发行版都保证有前者，
 而 Alpine 默认不带 bash。写死一个不一定存在的解释器，会让整个沙箱
 在用户选了 Alpine 之后静默失效。
+
+`-0 -l -L` 三个都是**装包的必需品**，各自对应一种「apt 跑到最后一步才倒」：
+
+| 缺哪个 | 报错 | 真正原因 |
+| --- | --- | --- |
+| `-0` | `dpkg: error: requested operation requires superuser privilege` | guest 里不是 root。uid 0 只在 proot 眼里成立，内核看到的仍是 app 自己那个 uid，实体机上什么都没多拿 |
+| `-l` | `dpkg: error: error creating new backup file '/var/lib/dpkg/status-old': Permission denied` | dpkg 用 `link()` 备份 status，而 Android 的 SELinux 不许在 app 数据区建硬链接。同目录 `touch` 是通的，所以这个报错**看着像磁盘只读，其实不是** |
+| `-L` | tar / dpkg 校验尺寸时翻车 | `-l` 把硬链接全换成了符号链接，`lstat` 的 `st_size` 得跟着变成链接本身的长度 |
+
+rootfs 给的是 `--landlock-rw` 而不是 `--landlock-ro`：装包本来就是往
+`/var/lib/dpkg`、`/usr/bin` 里写，钉死只读等于 Agent 永远装不上环境。
+这不放宽对实体机的约束 —— landlock 是白名单，没列出来的路径一律拒绝，
+而这一条指向的是 app 私有目录下的一棵树。只有 `readOnly` 级别才给 `ro`。
 
 ### L0 命令策略（`exec_policy.dart`）
 
@@ -104,8 +119,12 @@ LLM 会把它误诊成网络抖动然后重试到天荒地老。
 返回 ABI 版本；`EOPNOTSUPP` 就跳过。探测结果会一路传到 UI 上显示 ——
 **用户有权知道自己现在实际被保护到什么程度**，而不是看到一个笼统的「已启用沙箱」。
 
-规则很简单：发行版 rootfs 和 `/system` 只读，workspace 读写，`/dev` 读写，`/proc` 只读。
+规则很简单：发行版 rootfs 和 workspace 读写，`/system` 只读，`/dev` 读写，`/proc` 只读。
 `/dev` 和 `/proc` 必须放行，否则 pty、`/dev/null`、`/proc/self/exe` 全不可用。
+rootfs 只有在 `readOnly` 级别才降成只读 —— 其余级别下它就是包管理器的家，见 §2。
+
+**这里的白名单是全部**：没列出来的路径，landlock 一律拒绝。所以「rootfs 可写」
+放宽的只是 app 自己私有目录下的一棵树，实体机上的任何东西都还是碰不到。
 
 ### L4 资源上限
 

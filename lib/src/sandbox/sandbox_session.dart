@@ -237,14 +237,18 @@ class SandboxSession {
   ///
   /// 最终形态（能力全开时）：
   /// ```
-  /// burrow-launch --seccomp-no-net --landlock=<abi> --rlimit-nproc=64 ...
-  ///   -- proot -r <rootfs>
-  ///            -b <prefix>:/usr           (只读)
-  ///            -b <workspace>:/workspace  (可写)
+  /// burrow-launch --seccomp-no-net
+  ///               --landlock-rw=<rootfs> --landlock-ro=/system
+  ///               --landlock-rw=<workspace> --rlimit-nproc=64 ...
+  ///   -- proot -0 -l -L -r <rootfs>
   ///            -b /dev -b /proc -b /sys
+  ///            -b <workspace>:/workspace
   ///            -w /workspace
-  ///      /usr/bin/bash -lc "<command>"
+  ///      /bin/sh -lc "<command>"
   /// ```
+  ///
+  /// `-0 -l -L` 三个都是「让发行版的包管理器能正常工作」的必需品，
+  /// 缺一个就是一种装不上包的姿势，具体见下面各自的注释。
   ///
   /// `burrow-launch` 是我们自己的原生小程序：装 seccomp filter、设 rlimit、
   /// （可选）装 landlock ruleset，然后 execve。它必须在 proot **外面** ——
@@ -261,9 +265,22 @@ class SandboxSession {
       if (caps.seccomp && noNetwork) argv.add('--seccomp-no-net');
 
       if (caps.hasLandlock) {
-        // rootfs 整体只读、workspace 可写。这一层是 proot 的兜底：
-        // proot 靠 ptrace 转换路径，理论上有逃逸面；landlock 是内核强制的。
-        argv.add('--landlock-ro=$rootfsPath');
+        // landlock 是 proot 的兜底：proot 靠 ptrace 转换路径，理论上有
+        // 逃逸面；landlock 是内核强制的。规则是白名单 —— 没列出来的
+        // 路径一律拒绝，所以实体机上除了这几条之外什么都碰不到。
+        //
+        // rootfs 跟着可写级别走，**不能钉死成只读**：装包就是往 rootfs
+        // 里写（/var/lib/dpkg、/usr/bin……），钉死只读等于 Agent 永远
+        // 装不上环境。这条曾经写死成 ro，而手头的测试机 landlock_abi=0，
+        // 于是整条规则根本没生效、问题一直没暴露 —— 换一台内核 5.13+
+        // 的设备，apt 会在第一个写操作上就倒，且报错和 -l 那个一模一样
+        // （Permission denied），极难分辨到底是哪一层拦的。
+        //
+        // rootfs 可写不等于实体机可写：那是 app 私有目录下的一棵树，
+        // 本来就该由沙箱里的包管理器随便改。
+        argv.add(level == SandboxLevel.readOnly
+            ? '--landlock-ro=$rootfsPath'
+            : '--landlock-rw=$rootfsPath');
         argv.add('--landlock-ro=/system');
         if (level != SandboxLevel.readOnly) {
           argv.add('--landlock-rw=$workspacePath');
@@ -295,6 +312,28 @@ class SandboxSession {
     if (canIsolate && level != SandboxLevel.dangerFullAccess) {
       argv.addAll([
         prootPath!,
+        // 让 rootfs 里认为自己是 root。**装包全靠它**：dpkg 会直接拒绝
+        // 非 root 运行（`requested operation requires superuser privilege`），
+        // apt 下载完一整轮 40MB 之后倒在最后一步。
+        //
+        // 这不是把权限放给了实体机 —— proot 是用户态的路径重定向，uid 0
+        // 只在 guest 眼里成立，对 Android 内核来说仍然是 app 自己那个 uid，
+        // 能碰到的东西一个都没变多。proot-distro / Termux 也是默认开这个。
+        '-0',
+        // 用符号链接顶替硬链接。**装包同样全靠它**：dpkg 更新 status 前
+        // 会先 `link(status, status-old)` 做备份，而 Android 的 SELinux
+        // 策略不允许在 app 数据区建硬链接 —— 实测 `ln a b` 直接
+        // `Permission denied`，但同目录 `touch` 是通的，所以这既不是
+        // 目录权限问题也不是 landlock（那两条都放行了）。
+        //
+        // 不加这个的表现极具误导性：apt 下载解包全都正常，最后倒在
+        // `error creating new backup file '/var/lib/dpkg/status-old':
+        // Permission denied`，看着像磁盘只读。
+        '-l',
+        // 让 lstat 对符号链接返回正确的 st_size。上面这一开，rootfs 里
+        // 原本的硬链接全都变成了符号链接，读到错的大小会让 tar / dpkg
+        // 这类会核对尺寸的工具翻车。proot-distro 也是这两个成对给的。
+        '-L',
         '-r', rootfsPath,
         // rootfs 里的二进制硬编码的是 /usr /lib /etc 这些标准 FHS 路径，
         // proot 的 -r 正好把它们重定向过来 —— 这就是换掉自建 Termux

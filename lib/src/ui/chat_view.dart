@@ -1129,7 +1129,9 @@ class ChatBubble extends StatelessWidget {
               dense: true,
               contentPadding: EdgeInsets.zero,
               leading: Icon(Icons.edit_outlined, size: 20),
-              title: Text('编辑并重发'),
+              // 具体是"保存"还是"保存并重发"由编辑框里再选 ——
+              // 助手消息没有"重发"，那个按钮压根不会出现。
+              title: Text('编辑'),
             ),
           ),
         if (onRewind != null)

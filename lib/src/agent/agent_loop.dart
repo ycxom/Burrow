@@ -764,15 +764,23 @@ class AgentLoop {
     final commandLine = call.name == 'exec'
         ? (call.args['command'] as String? ?? '')
         : '${call.name} ${call.args['path'] ?? ''}';
-    final verdict = policy.evaluate(commandLine);
+    // 沙箱开着时这一层不否决任何东西 —— 边界是 proot，不是这张规则表。
+    // 关掉沙箱之后每条命令都要问，除非用户自己放行过。
+    final verdict = policy.evaluate(
+      commandLine,
+      sandboxed: sandboxLevel != SandboxLevel.dangerFullAccess,
+    );
 
     if (verdict.decision == Decision.forbidden) {
       return ToolResult.rejected('该命令被策略禁止：${verdict.reason}。'
           '请换一种做法，不要重试同一条命令。');
     }
 
-    final needsApproval =
-        verdict.decision == Decision.prompt && mode == ApprovalMode.onRequest;
+    // 关了沙箱就一律要审批，连 `auto` 也不例外：那一档的前提是"沙箱兜底"，
+    // 沙箱没了，前提也就没了。
+    final needsApproval = verdict.decision == Decision.prompt &&
+        (mode == ApprovalMode.onRequest ||
+            sandboxLevel == SandboxLevel.dangerFullAccess);
     if (needsApproval && !await host.requestApproval(call, verdict)) {
       return ToolResult.rejected('用户拒绝了这次操作（${verdict.reason}）。'
           '请说明你为什么需要它，或换一种做法。');

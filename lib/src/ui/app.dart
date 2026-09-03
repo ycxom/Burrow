@@ -43,6 +43,7 @@ import 'skin_parts.dart';
 import 'skin_store.dart';
 import 'skin_style.dart';
 import 'chat_theme.dart';
+import 'message_index.dart';
 import 'interactive_terminal.dart';
 import 'chat_view.dart';
 import 'image_attachments.dart';
@@ -1041,16 +1042,48 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   Future<void> _editMessage(int visibleIndex) async {
     if (_busy) return;
     final id = _threadId;
-    final text = _visible[visibleIndex].content;
+    final original = _visible[visibleIndex];
     final historyIndex = _historyIndexOf(visibleIndex);
-    if (historyIndex < 0) return;
+    // 静默返回是这个功能之前"点了没反应"的原因之一：对不上位置时什么都
+    // 不做，也什么都不说。宁可说一句让人能去反馈，也别装作没点过。
+    if (historyIndex < 0) {
+      _setStatus('这条消息在上下文里对不上位置，编辑不了');
+      return;
+    }
+
+    // 「重发」只对用户消息成立：助手那条已经答完了，没有可以重发的提问。
+    final choice = await _promptEdit(
+      original.content,
+      canResend: original.role == 'user',
+      reasoning: original.reasoning,
+      resendWarning: _rewindWarning(visibleIndex),
+    );
+    if (choice == null || !mounted) return;
+
+    if (!choice.resend) {
+      await _saveMessageEdit(
+        visibleIndex,
+        choice.text,
+        reasoning: choice.reasoning,
+      );
+      return;
+    }
+
+    final text = choice.text.trim();
+    // 空内容不能走重发：这条会被截掉，而 _send 又会因为没内容直接返回，
+    // 结果是"点一下，对话少了一截，什么也没发生"。
+    if (text.isEmpty) {
+      _setStatus('内容是空的，没法重发');
+      return;
+    }
 
     // 分支 id 要在截断**之前**拿到并存下旧的一段 —— 截断之后那段就没了。
     final branchId = id == null ? null : _ensureBranchId(historyIndex);
     final oldTail =
         branchId == null ? null : _agent.history.sublist(historyIndex);
 
-    final ok = await _rewind(visibleIndex, confirmTitle: '编辑并重发');
+    // 不再弹第二个确认框：编辑框里那句提示已经把同一件事说过了。
+    final ok = await _applyRewind(visibleIndex);
     if (!ok) return;
 
     if (id != null && branchId != null && oldTail != null) {
@@ -1060,12 +1093,16 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         tail: oldTail,
         active: false,
       );
-      // 新版本要等用户真的按下发送才存在，先把账记着。
+      // 新版本是这一次发送的产物，发完在 _runTurn 里结账。
       _pendingBranch = (branchId: branchId, anchorIndex: historyIndex);
     }
 
+    if (!mounted) return;
+    // **真的发出去。** 之前只是把文字填回输入框就收工了，按钮写着"重发"
+    // 却要用户自己再按一次发送 —— 那是"编辑"，不是"编辑并重发"。
     _input.text = text;
     _input.selection = TextSelection.collapsed(offset: text.length);
+    await _send();
   }
 
   /// 回到某条消息之前：截断对话 + 回滚文件。
@@ -1092,25 +1129,39 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     await _persist();
   }
 
-  Future<bool> _rewind(int visibleIndex, {required String confirmTitle}) async {
+  /// 回退会丢掉什么。编辑框和「回到这里」的确认框共用这一句 ——
+  /// 两处说法不一致的话，用户在其中一处建立的预期到另一处就是错的。
+  String _rewindWarning(int visibleIndex) {
     final message = _visible[visibleIndex];
-    final hasCheckpoint = message.checkpoint != null;
-    final confirmed = await _confirm(
-      confirmTitle,
-      hasCheckpoint
-          ? '这条消息之后的对话会被丢弃，workspace 里的文件也会一起回到'
-              '发这条消息之前的状态（检查点 #${message.checkpoint}）。'
-          // 老会话没有检查点记录。**必须说出来** —— 用户点「回到这里」
-          // 的预期就是文件也回去，静默地只截对话会让他在一个已经被改过的
-          // workspace 上继续操作而不自知。
-          : '这条消息之后的对话会被丢弃。\n'
-              '这条消息是旧版本存下的，没有检查点记录，'
-              'workspace 里的文件不会回滚。',
-    );
-    if (!confirmed) return false;
+    return message.checkpoint != null
+        ? '这条消息之后的对话会被丢弃，workspace 里的文件也会一起回到'
+            '发这条消息之前的状态（检查点 #${message.checkpoint}）。'
+        // 老会话没有检查点记录。**必须说出来** —— 用户点「回到这里」
+        // 的预期就是文件也回去，静默地只截对话会让他在一个已经被改过的
+        // workspace 上继续操作而不自知。
+        : '这条消息之后的对话会被丢弃。\n'
+            '这条消息是旧版本存下的，没有检查点记录，'
+            'workspace 里的文件不会回滚。';
+  }
 
+  Future<bool> _rewind(int visibleIndex, {required String confirmTitle}) async {
+    final confirmed =
+        await _confirm(confirmTitle, _rewindWarning(visibleIndex));
+    if (!confirmed) return false;
+    return _applyRewind(visibleIndex);
+  }
+
+  /// 真正执行回退：截断对话 + 回滚文件。**不问**。
+  ///
+  /// 和确认分开，是因为「编辑并重发」在编辑框里就已经把同一件事问过一遍了。
+  /// 同一个决定问两遍，第二遍会被当成"是不是刚才没点上"。
+  Future<bool> _applyRewind(int visibleIndex) async {
     final historyIndex = _historyIndexOf(visibleIndex);
-    if (historyIndex < 0) return false;
+    if (historyIndex < 0) {
+      // 用户已经在确认框上点过"确定"了，这里再无声失败最容易被当成卡死。
+      _setStatus('这条消息在上下文里对不上位置，回退不了');
+      return false;
+    }
 
     final result = await _agent.rewindTo(historyIndex);
     if (!mounted) return false;
@@ -1129,13 +1180,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   }
 
   /// `_visible` 过滤掉了 tool 消息，所以下标和 `history` 对不上。
-  /// 靠身份匹配而不是算偏移 —— 算偏移在「删了一条又加一条」之后就会错位，
-  /// 而错位的表现是回滚到了错误的位置，非常难发现。
-  int _historyIndexOf(int visibleIndex) {
-    if (visibleIndex < 0 || visibleIndex >= _visible.length) return -1;
-    final target = _visible[visibleIndex];
-    return _agent.history.indexWhere((m) => identical(m, target));
-  }
+  /// 规则见 [historyIndexOfVisible]。
+  int _historyIndexOf(int visibleIndex) =>
+      historyIndexOfVisible(_visible, _agent.history, visibleIndex);
 
   /// 重新读一遍当前可见消息涉及的分支状态。
   Future<void> _refreshBranches() async {
@@ -1211,6 +1258,139 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   Future<void> _persist() async {
     final id = _threadId;
     if (id != null) await widget.chats.replaceMessages(id, _agent.history);
+  }
+
+  /// 打开编辑框。返回用户选了哪个动作，取消返回 null。
+  ///
+  /// 两个动作是分开的，这是"编辑"在聊天里本来就有的两种意思：
+  ///
+  ///   - **保存**：就地改掉这条的内容，不重新生成。改 AI 回复只有这一种
+  ///     解释——模型已经答完了，没有"重发"可言；而改完之后模型看到的
+  ///     上下文也跟着变，这正是想改它的理由（纠正一个事实、删掉一段
+  ///     跑偏的推理，好让后面的对话接着对的前提走）。
+  ///   - **保存并重发**：只对用户消息成立，语义是"当我没说过，重说一遍"，
+  ///     它会丢弃这条之后的全部对话。
+  Future<({String text, String reasoning, bool resend})?> _promptEdit(
+    String original, {
+    required bool canResend,
+    String reasoning = '',
+    String resendWarning = '',
+  }) async {
+    final body = TextEditingController(text: original);
+    body.selection = TextSelection.collapsed(offset: original.length);
+    // 思考只在**本来就有**的时候才给编辑框。给一条没有思考的消息摆一个空
+    // 输入框，等于邀请用户凭空写一段模型没想过的东西，那不是"编辑"。
+    final hasReasoning = reasoning.isNotEmpty;
+    final thought = TextEditingController(text: reasoning);
+
+    ({String text, String reasoning, bool resend}) result(bool resend) => (
+          text: body.text,
+          reasoning: hasReasoning ? thought.text : reasoning,
+          resend: resend,
+        );
+
+    try {
+      return await showDialog<({String text, String reasoning, bool resend})>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('编辑消息'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                if (hasReasoning) ...<Widget>[
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 6),
+                    child: Text('思考', style: TextStyle(fontSize: 12)),
+                  ),
+                  TextField(
+                    controller: thought,
+                    maxLines: 6,
+                    minLines: 2,
+                    style: const TextStyle(fontSize: 13),
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.only(top: 14, bottom: 6),
+                    child: Text('正文', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+                TextField(
+                  controller: body,
+                  autofocus: !hasReasoning,
+                  maxLines: 8,
+                  minLines: 3,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
+                // 破坏性后果要在**做决定的这一屏**上说。原来它在点完之后
+                // 才弹出来，那时用户已经把话打完了，等于先让人干活再告诉
+                // 他代价。
+                if (canResend && resendWarning.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Text(
+                      '「保存并重发」：$resendWarning',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: context.chat.tintTertiary,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(result(false)),
+              child: const Text('保存'),
+            ),
+            if (canResend)
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(result(true)),
+                child: const Text('保存并重发'),
+              ),
+          ],
+        ),
+      );
+    } finally {
+      body.dispose();
+      thought.dispose();
+    }
+  }
+
+  /// 就地改掉一条消息的内容。
+  ///
+  /// **两个列表都要改，而且换成同一个对象。** 只改 `_visible` 的话界面变了
+  /// 但模型看到的还是旧的，是一种最难发现的假象；而换成两个内容相同的
+  /// 不同实例，会让 [historyIndexOfVisible] 的身份快路径失效。
+  Future<void> _saveMessageEdit(
+    int visibleIndex,
+    String text, {
+    required String reasoning,
+  }) async {
+    final historyIndex = _historyIndexOf(visibleIndex);
+    if (historyIndex < 0) {
+      _setStatus('这条消息在上下文里对不上位置，改不了');
+      return;
+    }
+    final edited = _agent.history[historyIndex]
+        .copyWith(content: text, reasoning: reasoning);
+    setState(() {
+      _agent.history[historyIndex] = edited;
+      _visible[visibleIndex] = edited;
+    });
+    await _persist();
   }
 
   Future<bool> _confirm(String title, String body) async {
@@ -1350,44 +1530,74 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         ? call.args['command'] as String? ?? ''
         : '${call.name} ${call.args}';
 
+    // 「以后允许」只对 exec 给：写文件那几个工具没有稳定的命令前缀可存，
+    // 存了也匹配不上。
+    final allowKey = call.name == 'exec' ? ExecPolicy.allowKeyFor(detail) : '';
+    var remember = false;
+
     return await showDialog<bool>(
           context: context,
           barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            title: Row(children: [
-              Icon(verdict.scope == WriteScope.prefix
-                  ? Icons.inventory_2_outlined
-                  : Icons.warning_amber_outlined),
-              const SizedBox(width: 8),
-              const Text('需要确认'),
-            ]),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 命令原文用等宽字体、可选中。审批弹窗里最重要的就是让人
-                // 看清到底要跑什么 —— 截断或换字体都会让人下意识点同意。
-                SelectableText(detail,
-                    style: const TextStyle(fontFamily: 'monospace')),
-                const SizedBox(height: 12),
-                Text(verdict.reason,
-                    style: Theme.of(context).textTheme.bodySmall),
-                if (verdict.scope == WriteScope.prefix)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 8),
-                    child: Text('会在环境暂存副本里执行，失败自动丢弃',
-                        style: TextStyle(fontSize: 12)),
-                  ),
+          builder: (ctx) => StatefulBuilder(
+            builder: (ctx, setLocal) => AlertDialog(
+              title: Row(children: [
+                Icon(verdict.scope == WriteScope.prefix
+                    ? Icons.inventory_2_outlined
+                    : Icons.warning_amber_outlined),
+                const SizedBox(width: 8),
+                const Text('需要确认'),
+              ]),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // 命令原文用等宽字体、可选中。审批弹窗里最重要的就是让人
+                  // 看清到底要跑什么 —— 截断或换字体都会让人下意识点同意。
+                  SelectableText(detail,
+                      style: const TextStyle(fontFamily: 'monospace')),
+                  const SizedBox(height: 12),
+                  Text(verdict.reason,
+                      style: Theme.of(context).textTheme.bodySmall),
+                  if (verdict.scope == WriteScope.prefix)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8),
+                      child: Text('会在环境暂存副本里执行，失败自动丢弃',
+                          style: TextStyle(fontSize: 12)),
+                    ),
+                  // 关掉沙箱之后每条命令都要问。没有这个口子的话，人会被
+                  // 问烦然后去开 yolo —— 那等于把所有确认一次性全关掉，
+                  // 比放行单独一条命令危险得多。
+                  if (allowKey.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: CheckboxListTile(
+                        value: remember,
+                        onChanged: (v) => setLocal(() => remember = v ?? false),
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        title: Text('以后允许 $allowKey',
+                            style: const TextStyle(fontSize: 13)),
+                        subtitle: const Text('可以在设置 → 沙箱模式里撤销',
+                            style: TextStyle(fontSize: 11)),
+                      ),
+                    ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: const Text('拒绝')),
+                FilledButton(
+                    onPressed: () async {
+                      if (remember && allowKey.isNotEmpty) {
+                        await widget.settings.allowCommand(allowKey);
+                      }
+                      if (ctx.mounted) Navigator.pop(ctx, true);
+                    },
+                    child: const Text('允许')),
               ],
             ),
-            actions: [
-              TextButton(
-                  onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text('拒绝')),
-              FilledButton(
-                  onPressed: () => Navigator.pop(ctx, true),
-                  child: const Text('允许')),
-            ],
           ),
         ) ??
         false;
@@ -2026,9 +2236,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
               : '',
       showAvatar: widget.settings.showMessageAvatars,
       onRetry: isLastAssistant ? _retry : null,
-      // 编辑和回退只给用户消息：它们的语义都是「从这句重来」，
+      // 编辑对用户和助手都开放，但两者能做的事不同（见 _editMessage）：
+      // 用户消息可以「保存并重发」，助手消息只能就地改内容 —— 改完模型
+      // 看到的上下文也跟着变，这正是要改它的理由。
+      onEdit: (isUser || message.role == 'assistant') && !_busy
+          ? () => _editMessage(i)
+          : null,
+      // 回退仍然只给用户消息：它的语义是「从这句重来」，
       // 挂在助手消息上没有对应的动作。
-      onEdit: isUser && !_busy ? () => _editMessage(i) : null,
       onRewind: isUser && !_busy ? () => _rewindTo(i) : null,
       onDelete: !_busy ? () => _deleteFrom(i) : null,
     );

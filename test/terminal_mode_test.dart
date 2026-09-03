@@ -326,6 +326,16 @@ void main() {
       expect(session.canIsolate, isTrue);
       expect(argv, contains('/fake/proot'));
       expect(argv, contains(rootfs));
+      // 少了 -0，rootfs 里就不是 root，dpkg 会拒绝装包
+      // （requested operation requires superuser privilege），
+      // 而且是在 apt 已经下完几十 MB 之后才倒下。
+      expect(argv, contains('-0'));
+      // 少了 -l 同样装不上包：dpkg 备份 status 用的是 link()，
+      // 而 Android 的 SELinux 不让 app 数据区建硬链接。
+      expect(argv, contains('-l'));
+      // -L 和 -l 成对：硬链接都变成符号链接之后，lstat 的 st_size
+      // 必须是链接本身的长度，否则 tar / dpkg 校验尺寸时会翻车。
+      expect(argv, contains('-L'));
       // 环境也要跟着换成 rootfs 视角的 FHS 路径，否则命令找不到自己。
       expect(
           session.buildEnv(SandboxLevel.workspaceWrite)['HOME'], '/workspace');

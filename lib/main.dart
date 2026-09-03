@@ -354,7 +354,9 @@ Future<void> _boot({
       llm: llm,
       host: host,
       // 包管理器的名字随发行版变（apk / apt），策略表要跟着走。
-      policy: ExecPolicy(),
+      // 放行名单跟着设置走：用户在弹窗里点「以后允许」、或在设置里删掉
+      // 一条，下一次判定就得按新的来。
+      policy: ExecPolicy(allowed: () => settings.allowedCommands),
       sandbox: runtime.sandbox,
       snapshots: runtime.snapshots,
       prefixGens: gens,

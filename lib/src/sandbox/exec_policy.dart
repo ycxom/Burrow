@@ -109,11 +109,34 @@ class ExecPolicy {
   /// 规则表天然不可能穷尽，未知命令让用户看一眼比默默放行安全。
   final Decision fallback;
 
-  ExecPolicy({List<PrefixRule>? rules, this.fallback = Decision.prompt})
-      : rules = rules ?? defaultRules;
+  /// 用户自己点「以后允许」攒下来的命令前缀。可以在设置里删。
+  ///
+  /// **是个闭包而不是一份快照。** 策略对象是建会话时造的，而用户随时可能
+  /// 在弹窗里放行一条、或者进设置删掉一条；存快照的话，改动要等下次新建
+  /// 会话才生效 —— 那种"设置了但没反应"是最难自证的一类。
+  final List<String> Function() allowed;
+
+  ExecPolicy({
+    List<PrefixRule>? rules,
+    this.fallback = Decision.prompt,
+    List<String> Function()? allowed,
+  })  : rules = rules ?? defaultRules,
+        allowed = allowed ?? _noAllowances;
+
+  static List<String> _noAllowances() => const <String>[];
 
   /// 对一整条 shell 命令行判定。内部拆段后取最严结果。
-  PolicyVerdict evaluate(String commandLine) {
+  ///
+  /// [sandboxed] 是这里最重要的一个参数，它决定了整套判定的性质：
+  ///
+  ///   - **沙箱开着**：命令跑在 proot 里，够不着实体机。这一层就不再替
+  ///     用户否决任何东西了 —— 装包要 root、拉代码要联网，把这些拦下来
+  ///     只会让 Agent 什么都干不成（实测："禁止 sudo — 无法安装
+  ///     openssh-client"）。规则表仍然照跑，但只用来算 [WriteScope]：
+  ///     检查点和 `$PREFIX` 事务靠它，那才是真正的兜底。
+  ///   - **沙箱关了**：命令直接落在设备上，这时**每一条都要问**。
+  ///     用户点过"以后允许"的除外，那份名单在 [allowed] 里，随时可删。
+  PolicyVerdict evaluate(String commandLine, {bool sandboxed = true}) {
     final segments = _splitShell(commandLine);
     if (segments.isEmpty) {
       return const PolicyVerdict(
@@ -127,7 +150,65 @@ class ExecPolicy {
     for (final seg in segments.skip(1)) {
       verdict = verdict.merge(_evaluateSegment(seg));
     }
-    return verdict;
+
+    if (sandboxed) {
+      // 沙箱是边界，这一层不再拦。scope 原样留着 —— 检查点靠它。
+      return PolicyVerdict(
+        decision: Decision.allow,
+        scope: verdict.scope,
+        reason: verdict.reason,
+        matchedRule: verdict.matchedRule,
+      );
+    }
+
+    // 沙箱关了：默认全问，除非用户自己放行过。
+    if (segments.every(_isAllowedByUser)) {
+      return PolicyVerdict(
+        decision: Decision.allow,
+        scope: verdict.scope,
+        reason: '你已允许这条命令',
+        matchedRule: verdict.matchedRule,
+      );
+    }
+    return PolicyVerdict(
+      decision: Decision.max(verdict.decision, Decision.prompt),
+      scope: verdict.scope,
+      reason: verdict.decision == Decision.allow
+          ? '沙箱已关闭，命令直接在设备上执行'
+          : verdict.reason,
+      matchedRule: verdict.matchedRule,
+    );
+  }
+
+  bool _isAllowedByUser(List<String> argv) {
+    if (argv.isEmpty) return true;
+    for (final entry in allowed()) {
+      final pattern = entry.trim().split(RegExp(r'\s+'));
+      if (pattern.isEmpty || pattern.first.isEmpty) continue;
+      if (pattern.length > argv.length) continue;
+      var hit = true;
+      for (var i = 0; i < pattern.length; i++) {
+        if (pattern[i] != argv[i]) {
+          hit = false;
+          break;
+        }
+      }
+      if (hit) return true;
+    }
+    return false;
+  }
+
+  /// 把一条命令行折成可以存进放行名单的样子。
+  ///
+  /// 只取第一段的前两个词：`git push origin main` 存成 `git push`。
+  /// 存整行的话，参数换一个就再问一遍，"以后允许"等于没用；只存首词又
+  /// 太宽（允许了 `git status` 等于允许 `git push --force`）。
+  static String allowKeyFor(String commandLine) {
+    final segments = _splitShell(commandLine);
+    if (segments.isEmpty || segments.first.isEmpty) return commandLine.trim();
+    final argv = segments.first;
+    final words = argv.first.startsWith('-') ? argv.take(1) : argv.take(2);
+    return words.where((w) => !w.startsWith('-')).join(' ').trim();
   }
 
   PolicyVerdict _evaluateSegment(List<String> argv) {
@@ -332,24 +413,47 @@ class ExecPolicy {
         scope: WriteScope.workspace,
         justification: 'rm 删除文件'),
     const PrefixRule(['rm', '-rf', '/'],
-        decision: Decision.forbidden,
+        decision: Decision.prompt,
         scope: WriteScope.prefix,
         justification: 'rm -rf / 摧毁整个 rootfs'),
     const PrefixRule(['rm', '-rf', '/*'],
-        decision: Decision.forbidden,
+        decision: Decision.prompt,
         scope: WriteScope.prefix,
         justification: 'rm -rf /* 摧毁整个 rootfs'),
 
-    // ---- 直接禁掉的 ----
+    // ---- 危险但**不禁**的 ----
+    //
+    // 这几条以前是 `forbidden`，写死在代码里，用户删不掉。取消掉了，
+    // 理由有两条：
+    //
+    //   1. **沙箱里禁它们没有意义，只有代价。** 装包要 root，`sudo` 被
+    //      写死禁掉之后 Agent 在 Ubuntu 里连 openssh-client 都装不上，
+    //      而它伤不到实体机 —— 那正是沙箱存在的理由。
+    //   2. **沙箱关了的时候，该问的是用户，不是代码替他决定。** 现在关了
+    //      沙箱一律弹窗（见 evaluate），用户自己点允许或拒绝。
+    //
+    // 保留成 prompt 而不是 allow：它们确实值得多看一眼，`scope` 也还要
+    // 用来触发执行前检查点。
     const PrefixRule(['mkfs'],
-        decision: Decision.forbidden, justification: '格式化设备'),
+        decision: Decision.prompt,
+        scope: WriteScope.prefix,
+        justification: '格式化设备'),
     const PrefixRule(['dd'],
-        decision: Decision.forbidden, justification: 'dd 可绕过一切路径检查直写块设备'),
-    const PrefixRule(['su'], decision: Decision.forbidden, justification: '提权'),
+        decision: Decision.prompt,
+        scope: WriteScope.prefix,
+        justification: 'dd 可绕过一切路径检查直写块设备'),
+    const PrefixRule(['su'],
+        decision: Decision.prompt,
+        scope: WriteScope.prefix,
+        justification: '提权'),
     const PrefixRule(['sudo'],
-        decision: Decision.forbidden, justification: '提权'),
+        decision: Decision.prompt,
+        scope: WriteScope.prefix,
+        justification: '提权'),
     const PrefixRule(['chmod', '-R', '777', '/'],
-        decision: Decision.forbidden, justification: '递归放开根目录权限'),
+        decision: Decision.prompt,
+        scope: WriteScope.prefix,
+        justification: '递归放开根目录权限'),
 
     // ---- 网络：问，因为可能把 workspace 内容传出去 ----
     for (final cmd in const ['curl', 'wget', 'nc', 'ssh', 'scp', 'rsync'])

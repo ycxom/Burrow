@@ -144,6 +144,7 @@ class SettingsStore extends ChangeNotifier {
   static const _keyImageMode = 'burrow.llm.imageMode';
   static const _keySystemPrompt = 'burrow.llm.systemPrompt';
   static const _keyThinkingEffort = 'burrow.llm.thinkingEffort';
+  static const _keyAllowedCommands = 'burrow.sandbox.allowedCommands';
   static const _keyCachedModels = 'burrow.llm.cachedModels';
   static const _keyModelsByChannel = 'burrow.llm.modelsByChannel';
   static const _keySandboxLevel = 'burrow.sandbox.level';
@@ -240,6 +241,30 @@ class SettingsStore extends ChangeNotifier {
   /// 自己的事。
   ThinkingEffort get thinkingEffort => _thinkingEffort;
   ThinkingEffort _thinkingEffort = ThinkingEffort.auto;
+
+  /// 用户在审批弹窗里点过"以后允许"的命令前缀。
+  ///
+  /// **这份名单是用户自己的，随时能在设置里删。** 它存在的前提是：关掉
+  /// 沙箱之后每条命令都要问，而反复问同一条命令只会把人逼得去开 yolo，
+  /// 那反而更危险。
+  List<String> get allowedCommands => List.unmodifiable(_allowedCommands);
+  List<String> _allowedCommands = <String>[];
+
+  Future<void> allowCommand(String prefix) async {
+    final key = prefix.trim();
+    if (key.isEmpty || _allowedCommands.contains(key)) return;
+    _allowedCommands = <String>[..._allowedCommands, key];
+    notifyListeners();
+    await _prefs?.setStringList(_keyAllowedCommands, _allowedCommands);
+  }
+
+  Future<void> revokeCommand(String prefix) async {
+    if (!_allowedCommands.contains(prefix)) return;
+    _allowedCommands =
+        _allowedCommands.where((entry) => entry != prefix).toList();
+    notifyListeners();
+    await _prefs?.setStringList(_keyAllowedCommands, _allowedCommands);
+  }
 
   Future<void> setThinkingEffort(ThinkingEffort value) async {
     if (_thinkingEffort == value) return;
@@ -446,8 +471,13 @@ class SettingsStore extends ChangeNotifier {
       prefs.getString(_keySystemPrompt) ?? '',
       _decodeModels(prefs.getString(_keyModelsByChannel)),
       prefs.getStringList(_keyCachedModels),
-      _byName(SandboxLevel.values, prefs.getString(_keySandboxLevel),
-          SandboxLevel.workspaceWrite),
+      _byName(
+          SandboxLevel.values,
+          prefs.getString(_keySandboxLevel),
+          // 默认放通网络。断网档看着更安全，实际后果是 Agent 一装东西就
+          // 卡住：apt/pip/git 全部要网，而沙箱本来就够不着实体机 ——
+          // 拦在这里换不到安全，只换来"什么都干不成"。
+          SandboxLevel.workspaceWriteNetwork),
       _byName(ApprovalMode.values, prefs.getString(_keyApprovalMode),
           ApprovalMode.onRequest),
       _byName(OverflowTrigger.values, prefs.getString(_keyOverflowTrigger),
@@ -487,6 +517,8 @@ class SettingsStore extends ChangeNotifier {
     );
     store._thinkingEffort =
         ThinkingEffort.fromStorage(prefs.getString(_keyThinkingEffort));
+    store._allowedCommands =
+        prefs.getStringList(_keyAllowedCommands) ?? <String>[];
     return store;
   }
 

@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
-import '../sandbox/exec_policy.dart';
 import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../settings/settings_store.dart';
@@ -38,18 +37,21 @@ class SandboxSettingsPage extends StatefulWidget {
 
 const _levelLabels = <SandboxLevel, (String, String)>{
   SandboxLevel.readOnly: ('只读', '工作区也不可写，无网。适合"先让它看看"的阶段'),
-  SandboxLevel.workspaceWrite: ('工作区可写', '只有当前会话的 workspace 可写，环境只读，无网。推荐'),
+  SandboxLevel.workspaceWrite: ('工作区可写', '只有当前会话的 workspace 可写，环境只读，无网'),
   SandboxLevel.workspaceWriteNetwork: (
     '工作区可写 + 联网',
-    '装包、拉仓库时用。命令能访问网络，写入仍限制在 workspace'
+    '默认。装包、拉仓库都要网；写入仍限制在 workspace，够不着实体机'
   ),
-  SandboxLevel.dangerFullAccess: ('关闭沙箱', '不做任何路径和网络隔离，命令直接以 app 身份运行'),
+  SandboxLevel.dangerFullAccess: (
+    '关闭沙箱',
+    '不做任何路径和网络隔离，命令直接以 app 身份运行。此时每条命令都会问你'
+  ),
 };
 
 const _approvalLabels = <ApprovalMode, (String, String)>{
   ApprovalMode.readOnly: ('只读', '只读工具可用，任何写入和命令执行一律拒绝'),
-  ApprovalMode.onRequest: ('按需审批', '策略判定放行的自动执行，可疑的问你，禁止的拒绝。推荐'),
-  ApprovalMode.auto: ('自动执行', '放行和可疑的都自动执行，但强制打检查点；禁止的仍然拒绝'),
+  ApprovalMode.onRequest: ('按需审批', '沙箱开着时放手让它跑，可疑的问你。推荐'),
+  ApprovalMode.auto: ('自动执行', '沙箱开着时不打断，强制打检查点；关掉沙箱后仍然逐条问'),
   ApprovalMode.yolo: ('关闭沙箱', '不审批、不隔离。等同于把执行边界完全交给模型'),
 };
 
@@ -58,10 +60,7 @@ class _SandboxSettingsPageState extends State<SandboxSettingsPage> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final store = widget.store;
-    final forbidden = ExecPolicy()
-        .rules
-        .where((r) => r.decision == Decision.forbidden)
-        .toList();
+    final allowed = store.allowedCommands;
 
     return Scaffold(
       appBar: AppBar(title: const Text('沙箱模式')),
@@ -150,29 +149,49 @@ class _SandboxSettingsPageState extends State<SandboxSettingsPage> {
             ),
           ),
           const SizedBox(height: 16),
-          _SectionTitle('永远禁止的命令',
-              subtitle: '共 ${forbidden.length} 条，任何档位都拦，包括「关闭沙箱」'),
+          _SectionTitle(
+            '已允许的命令',
+            subtitle: allowed.isEmpty
+                ? '关闭沙箱后每条命令都会问。勾了「以后允许」的会记在这里'
+                : '共 ${allowed.length} 条，关闭沙箱时不再询问。可以随时撤销',
+          ),
           Card(
             clipBehavior: Clip.antiAlias,
-            child: Column(
-              children: <Widget>[
-                for (var i = 0; i < forbidden.length; i++) ...<Widget>[
-                  if (i > 0) const Divider(height: 1),
-                  ListTile(
+            child: allowed.isEmpty
+                ? const ListTile(
                     dense: true,
-                    leading: Icon(Icons.block, size: 20, color: scheme.error),
-                    title: Text(
-                      forbidden[i].pattern.join(' '),
-                      style: const TextStyle(
-                          fontFamily: 'monospace', fontSize: 13),
+                    title: Text('还没有', style: TextStyle(fontSize: 13)),
+                    subtitle: Text(
+                      '沙箱开着时这一层不拦任何命令 —— 边界是 proot，'
+                      '够不着实体机。这份名单只在关掉沙箱之后起作用。',
+                      style: TextStyle(fontSize: 11),
                     ),
-                    subtitle: forbidden[i].justification.isEmpty
-                        ? null
-                        : Text(forbidden[i].justification),
+                  )
+                : Column(
+                    children: <Widget>[
+                      for (var i = 0; i < allowed.length; i++) ...<Widget>[
+                        if (i > 0) const Divider(height: 1),
+                        ListTile(
+                          dense: true,
+                          leading: Icon(Icons.check_circle_outline,
+                              size: 20, color: scheme.primary),
+                          title: Text(
+                            allowed[i],
+                            style: const TextStyle(
+                                fontFamily: 'monospace', fontSize: 13),
+                          ),
+                          trailing: IconButton(
+                            tooltip: '撤销',
+                            icon: const Icon(Icons.delete_outline, size: 20),
+                            onPressed: () async {
+                              await store.revokeCommand(allowed[i]);
+                              if (mounted) setState(() {});
+                            },
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                ],
-              ],
-            ),
           ),
         ],
       ),

@@ -24,14 +24,19 @@ void main() {
     });
 
     test('复合命令按最严的那一段判定', () {
-      // 只看第一个词会判成 allow —— 这正是要拆段的理由
-      final v = policy.evaluate('ls && rm -rf /');
-      expect(v.decision, Decision.forbidden);
+      // 只看第一个词会判成 allow —— 这正是要拆段的理由。
+      // 判定要在**关掉沙箱**的前提下看：沙箱开着时这一层一律放行，
+      // 边界是 proot 而不是这张表。
+      final v = policy.evaluate('ls && rm -rf /', sandboxed: false);
+      expect(v.decision, Decision.prompt);
+      expect(v.scope, WriteScope.prefix, reason: '最严的那一段决定影响面');
     });
 
     test('管道也是段边界', () {
-      final v = policy.evaluate('cat x | sudo tee /etc/hosts');
-      expect(v.decision, Decision.forbidden);
+      final v =
+          policy.evaluate('cat x | sudo tee /etc/hosts', sandboxed: false);
+      expect(v.decision, Decision.prompt);
+      expect(v.matchedRule, 'sudo');
     });
 
     test('引号内的控制符不拆段', () {
@@ -51,8 +56,10 @@ void main() {
     });
 
     test('豁免前缀生效', () {
-      expect(policy.evaluate('git reset --hard').decision, Decision.prompt);
-      expect(policy.evaluate('git reset --keep').decision, Decision.prompt,
+      expect(policy.evaluate('git reset --hard', sandboxed: false).matchedRule,
+          'git reset --hard');
+      expect(policy.evaluate('git reset --keep', sandboxed: false).matchedRule,
+          isNot('git reset --hard'),
           reason: '--keep 不该命中 --hard 规则，落到 fallback');
     });
 
@@ -61,9 +68,74 @@ void main() {
     });
 
     test('未知命令默认 prompt 且当作会写盘', () {
-      final v = policy.evaluate('mycustomtool --do-something');
+      final v =
+          policy.evaluate('mycustomtool --do-something', sandboxed: false);
       expect(v.decision, Decision.prompt);
       expect(v.isMutating, isTrue, reason: '不确定时多存一次档');
+    });
+
+    test('沙箱开着时这一层不否决任何东西', () {
+      // 之前 sudo/dd/mkfs 是写死的 forbidden，用户删不掉，结果是 Agent
+      // 在沙箱里连包都装不上（实测："禁止 sudo — 无法安装 openssh-client"）。
+      // 沙箱够不着实体机，拦在这里换不到安全。
+      for (final cmd in const <String>[
+        'sudo apt install -y openssh-client',
+        'su -c whoami',
+        'dd if=/dev/zero of=/tmp/x',
+        'mkfs.ext4 /dev/null',
+        'rm -rf /',
+      ]) {
+        expect(policy.evaluate(cmd).decision, Decision.allow, reason: cmd);
+      }
+    });
+
+    test('沙箱开着也要照常算 scope —— 检查点靠它', () {
+      // 放行不等于不记账：写盘的命令仍然要在执行前打检查点。
+      expect(policy.evaluate('rm -rf build').isMutating, isTrue);
+      expect(policy.evaluate('apt install curl').scope, WriteScope.prefix);
+      expect(policy.evaluate('ls -la').isMutating, isFalse);
+    });
+
+    test('关掉沙箱之后，连只读命令都要问', () {
+      // 用户的原则：一旦关掉沙箱，任意命令都要弹窗。
+      final v = policy.evaluate('ls -la', sandboxed: false);
+      expect(v.decision, Decision.prompt);
+      expect(v.reason, contains('沙箱已关闭'));
+    });
+
+    test('用户放行过的命令不再问，且只在关沙箱时才用得上', () {
+      final allowed = ExecPolicy(allowed: () => const <String>['git status']);
+      expect(allowed.evaluate('git status', sandboxed: false).decision,
+          Decision.allow);
+      // 前缀匹配，不是整行相等 —— 否则加一个参数就要重新问一遍。
+      expect(allowed.evaluate('git status --short', sandboxed: false).decision,
+          Decision.allow);
+      // 放行 `git status` 不等于放行 `git push`。
+      expect(allowed.evaluate('git push', sandboxed: false).decision,
+          Decision.prompt);
+      // 复合命令里只要有一段没放行，就还是要问。
+      expect(
+          allowed.evaluate('git status && rm -rf x', sandboxed: false).decision,
+          Decision.prompt);
+    });
+
+    test('放行名单是实时读的，不是建对象时的快照', () {
+      // 用户在弹窗里点「以后允许」之后，当前会话就得立刻生效。
+      var list = <String>[];
+      final live = ExecPolicy(allowed: () => list);
+      expect(
+          live.evaluate('whoami', sandboxed: false).decision, Decision.prompt);
+      list = <String>['whoami'];
+      expect(
+          live.evaluate('whoami', sandboxed: false).decision, Decision.allow);
+    });
+
+    test('存进名单的键取到二级命令', () {
+      // 只存首词太宽（允许 git status 等于允许 git push），
+      // 存整行又太窄（换个参数就再问一遍）。
+      expect(ExecPolicy.allowKeyFor('git push origin main'), 'git push');
+      expect(ExecPolicy.allowKeyFor('ls -la /tmp'), 'ls');
+      expect(ExecPolicy.allowKeyFor('apt install -y curl'), 'apt install');
     });
   });
 
