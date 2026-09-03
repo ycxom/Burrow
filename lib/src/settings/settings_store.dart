@@ -346,11 +346,11 @@ class SettingsStore extends ChangeNotifier {
         ImageMode.auto => activeCapability.vision,
       };
 
-  /// 当前渠道 + 当前模型的能力。没有渠道时给一份保守的默认值：不认图
-  /// （图会走前置多模态，最坏是多花一次调用），但认工具（否则终端模式在
-  /// 还没配渠道时就显示成不可用，那是个会让人以为功能坏了的假象）。
-  ModelCapability get activeCapability =>
-      _channels?.active?.activeCapability ?? const ModelCapability();
+  /// 当前渠道 + 当前模型的能力。解析（手动 > 自动 > 渠道默认）在
+  /// ChannelStore 里做 —— 只有它同时拿得到渠道配置和 models.dev 那张表。
+  ResolvedCapability get activeCapability =>
+      _channels?.activeCapability ??
+      const ResolvedCapability(vision: false, tools: true, search: false);
 
   /// 当前模型支持工具调用。终端模式靠它决定能不能开。
   bool get supportsTools => activeCapability.tools;

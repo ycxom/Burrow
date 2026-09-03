@@ -79,6 +79,18 @@ class ChatMessage {
   /// 东西又坏掉了。
   final int reasoningMs;
 
+  /// 这条用户消息是一个**分支锚点**，值是它的稳定 id。null = 从没在这里
+  /// 分过支（绝大多数消息都是）。
+  ///
+  /// 「重新生成」和「编辑重发」都会在同一条用户消息下留下多个版本，这个 id
+  /// 就是把那些版本挂起来的钩子。
+  ///
+  /// **为什么是随机 id 而不是"第几条消息"**：位置会变。编辑第 3 轮会把
+  /// 第 4 轮往后整个换掉，如果之后又在新的第 4 轮上分支，按位置编号就会和
+  /// 旧分支里那个已经不在活动路径上的第 4 轮撞车 —— 两条毫无关系的分支
+  /// 共用一个编号，切换时会取到另一条分支的内容。随机 id 没有这个问题。
+  final String? branchId;
+
   const ChatMessage({
     required this.role,
     required this.content,
@@ -90,6 +102,7 @@ class ChatMessage {
     this.usage,
     this.reasoning = '',
     this.reasoningMs = 0,
+    this.branchId,
   });
 
   bool get hasImages => images.isNotEmpty;
@@ -100,6 +113,7 @@ class ChatMessage {
     TokenUsage? usage,
     String? reasoning,
     int? reasoningMs,
+    String? branchId,
   }) =>
       ChatMessage(
         role: role,
@@ -112,6 +126,7 @@ class ChatMessage {
         usage: usage ?? this.usage,
         reasoning: reasoning ?? this.reasoning,
         reasoningMs: reasoningMs ?? this.reasoningMs,
+        branchId: branchId ?? this.branchId,
       );
 }
 

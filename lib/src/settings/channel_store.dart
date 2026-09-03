@@ -21,10 +21,12 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../llm/llm_client.dart';
+import '../llm/model_registry.dart';
 import '../llm/system_prompt.dart';
 import '../llm/thinking_effort.dart';
 
 @immutable
+
 /// 一个**具体模型**的能力。
 ///
 /// ## 为什么挂在模型上而不是渠道上
@@ -47,23 +49,26 @@ import '../llm/thinking_effort.dart';
 /// 转售名可能叫 `azure-4o-0806-hk`），靠名字猜必然会猜错，而猜错的代价上面
 /// 已经列过了。真要探测只能发一次真实请求去试，那要花用户的钱。
 class ModelCapability {
-  /// 能直接接收图片。
-  final bool vision;
+  /// 三个字段都是**三态**：true / false / null。
+  ///
+  /// **null 是「用户没表过态」，不是 false。** 少了这个区分，用户为某个模型
+  /// 打开一次「能看图」，就等于把同一条记录里的「支持工具」也按当时的渠道
+  /// 默认值冻住了 —— 之后自动探测再也纠正不了它，而用户压根不知道自己
+  /// 顺手关掉了什么。
+  const ModelCapability({this.vision, this.tools, this.search});
 
-  /// 支持 function calling / tool use。**默认 true** —— 现在绝大多数模型都支持，
-  /// 默认 false 会让所有人一装上就发现终端模式用不了，而那才是需要解释的意外。
-  final bool tools;
+  /// 能直接接收图片。null = 跟着自动探测 / 渠道默认走。
+  final bool? vision;
+
+  /// 支持 function calling / tool use。
+  final bool? tools;
 
   /// 让模型自己联网搜索。**只有 Gemini 原生协议有这个东西**，别的协议上它是
-  /// 死的（界面上也不显示）。默认 false —— 搜索是要额外计费的，而且 Gemini 3
-  /// 之前的模型开了它就不能再用工具调用。
-  final bool search;
+  /// 死的（界面上也不显示）。models.dev 也没有这个标注 —— 它不是模型的属性，
+  /// 是 Gemini 那套协议的内置工具，所以这一项永远没有自动值。
+  final bool? search;
 
-  const ModelCapability({
-    this.vision = false,
-    this.tools = true,
-    this.search = false,
-  });
+  bool get isEmpty => vision == null && tools == null && search == null;
 
   ModelCapability copyWith({bool? vision, bool? tools, bool? search}) =>
       ModelCapability(
@@ -72,13 +77,20 @@ class ModelCapability {
         search: search ?? this.search,
       );
 
-  Map<String, Object?> toJson() =>
-      {'vision': vision, 'tools': tools, 'search': search};
+  /// 只写用户真正表过态的字段。null 的不落盘 —— 落了就分不清
+  /// 「显式设成 false」和「没设过」了。
+  Map<String, Object?> toJson() => <String, Object?>{
+        if (vision != null) 'vision': vision,
+        if (tools != null) 'tools': tools,
+        if (search != null) 'search': search,
+      };
 
+  /// 老版本存下来的记录三个字段都有值，读出来就是三个显式选择 ——
+  /// 那是对的：用户当初确实在那个界面上把它们都定过一遍。
   static ModelCapability fromJson(Map<String, Object?> j) => ModelCapability(
-        vision: j['vision'] as bool? ?? false,
-        tools: j['tools'] as bool? ?? true,
-        search: j['search'] as bool? ?? false,
+        vision: j['vision'] as bool?,
+        tools: j['tools'] as bool?,
+        search: j['search'] as bool?,
       );
 
   @override
@@ -90,6 +102,28 @@ class ModelCapability {
 
   @override
   int get hashCode => Object.hash(vision, tools, search);
+}
+
+/// 最终生效的能力，以及每一项是**从哪来的**。
+///
+/// 来源要带出来，界面才能把"官方标注"和"你自己勾的"显示成两回事 ——
+/// 一个自动来的开关和一个用户亲手打开的开关长得一样时，用户不敢动它。
+class ResolvedCapability {
+  const ResolvedCapability({
+    required this.vision,
+    required this.tools,
+    required this.search,
+    this.visionFromRegistry = false,
+    this.toolsFromRegistry = false,
+  });
+
+  final bool vision;
+  final bool tools;
+  final bool search;
+
+  /// 这一项是自动探测来的（而不是用户勾的、也不是渠道默认值）。
+  final bool visionFromRegistry;
+  final bool toolsFromRegistry;
 }
 
 class Channel {
@@ -182,23 +216,47 @@ class Channel {
     return uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
   }
 
-  /// 渠道默认能力。没被单独标过的模型用它。
-  ModelCapability get defaultCapability =>
-      ModelCapability(
+  /// 渠道默认能力。没被单独标过、自动也查不到的模型用它。
+  ModelCapability get defaultCapability => ModelCapability(
         vision: visionCapable,
         tools: toolsCapable,
         search: searchCapable,
       );
 
-  /// 某个模型的能力。没单独标过就返回渠道默认值。
-  ModelCapability capabilityOf(String? model) {
-    final key = model?.trim() ?? '';
-    if (key.isEmpty) return defaultCapability;
-    return modelCapabilities[key] ?? defaultCapability;
+  /// 用户为某个模型单独设过的那部分。没设过返回空。
+  ModelCapability overrideOf(String? model) =>
+      modelCapabilities[model?.trim() ?? ''] ?? const ModelCapability();
+
+  /// 某个模型最终生效的能力。
+  ///
+  /// 优先级：**用户手动设的 > models.dev 的官方标注 > 渠道默认值**。
+  ///
+  /// 手动排第一是刻意的：自动那份覆盖不全（实测 gemini-2.0-flash 和
+  /// gemini-3 都不在表里），而且转售网关的标注时有出入。用户为了让某个
+  /// 模型能用而亲手调过的开关，不该被一次后台刷新悄悄改回去。
+  ResolvedCapability capabilityOf(String? model, [ModelRegistry? registry]) {
+    final manual = overrideOf(model);
+    final auto = registry?.lookup(model?.trim() ?? '');
+
+    bool pick(bool? manualValue, bool? autoValue, bool fallback) =>
+        manualValue ?? autoValue ?? fallback;
+
+    return ResolvedCapability(
+      vision: pick(manual.vision, auto?.vision, visionCapable),
+      tools: pick(manual.tools, auto?.tools, toolsCapable),
+      // 搜索没有自动值：它不是模型属性，是 Gemini 协议的内置工具。
+      search: manual.search ?? searchCapable,
+      visionFromRegistry: manual.vision == null && auto?.vision != null,
+      toolsFromRegistry: manual.tools == null && auto?.tools != null,
+    );
   }
 
-  /// 当前选中的那个模型的能力。绝大多数调用方要的是这个。
-  ModelCapability get activeCapability => capabilityOf(model);
+  /// 当前选中模型的能力，**不含自动探测**。
+  ///
+  /// 带自动值的那份在 [ChannelStore.activeCapability] —— 只有它拿得到
+  /// models.dev 那张表。这里留一个是因为「能力跟着模型走、不是跟着渠道走」
+  /// 本身就是个需要单独说清楚的性质。
+  ResolvedCapability get activeCapability => capabilityOf(model);
 
   /// 这个模型被单独标过（而不是在吃渠道默认值）。UI 用它区分显示。
   bool hasExplicitCapability(String model) =>
@@ -363,6 +421,30 @@ class ChannelStore extends ChangeNotifier {
 
   final List<Channel> _channels;
   String? _activeId;
+
+  /// models.dev 的能力表。默认空 —— 拉不到 / 还没加载时一切照旧，
+  /// 全部退回渠道默认值，和加这个功能之前的行为完全一样。
+  ModelRegistry _registry = ModelRegistry.empty();
+
+  set registry(ModelRegistry value) {
+    _registry = value;
+    // 能力提示变了，界面上那些图标要跟着刷。
+    notifyListeners();
+  }
+
+  ModelRegistry get registry => _registry;
+
+  /// 某个渠道下某个模型最终生效的能力。
+  ResolvedCapability capabilityOf(Channel? channel, String? model) =>
+      channel?.capabilityOf(model, _registry) ??
+      // 没有渠道时给一份保守默认：不认图（图走前置多模态，最坏多花一次
+      // 调用），但认工具 —— 否则终端模式在还没配渠道时就显示成不可用，
+      // 那是个会让人以为功能坏了的假象。
+      const ResolvedCapability(vision: false, tools: true, search: false);
+
+  /// 当前渠道 + 当前模型的能力。绝大多数调用方要的是这个。
+  ResolvedCapability get activeCapability =>
+      capabilityOf(active, active?.model);
 
   /// 渠道 id → API key。启动时一次性读出来，之后在内存里用 ——
   /// 每次请求都去 secure storage 取会明显拖慢首字延迟。
@@ -561,7 +643,7 @@ class ChannelStore extends ChangeNotifier {
       // 只在原生协议下打开。别的协议上服务端会把 `google_search` 当成一个
       // 未知的函数声明，整轮请求 400 —— 一个开着没用的开关不算无害。
       webSearch: channel.apiFormat == 'geminiNative' &&
-          channel.capabilityOf(channel.model).search,
+          channel.capabilityOf(channel.model, _registry).search,
       thinkingEffort: thinkingEffort,
     );
   }

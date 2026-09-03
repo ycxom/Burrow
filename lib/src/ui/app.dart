@@ -21,6 +21,7 @@ import '../context/overflow_manager.dart';
 import '../data/chat_store.dart';
 import '../data/task_runtime.dart';
 import '../sandbox/exec_policy.dart';
+import '../sandbox/interactive_shell.dart';
 import '../sandbox/prefix_generations.dart';
 import '../sandbox/pty_channel.dart';
 import '../sandbox/sandbox_session.dart';
@@ -42,6 +43,7 @@ import 'skin_parts.dart';
 import 'skin_store.dart';
 import 'skin_style.dart';
 import 'chat_theme.dart';
+import 'interactive_terminal.dart';
 import 'chat_view.dart';
 import 'image_attachments.dart';
 import 'model_bar.dart';
@@ -205,7 +207,8 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
           const SizedBox(height: 8),
           if (_sourceFor(_installing!) case final source?)
             Text('下载源：${_sourceLabel(source)}',
-                style: TextStyle(fontSize: 12, color: context.chat.tintSecondary)),
+                style:
+                    TextStyle(fontSize: 12, color: context.chat.tintSecondary)),
           const SizedBox(height: 40),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -215,10 +218,12 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(_progress.stage,
-                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+                        style: const TextStyle(
+                            fontSize: 12, fontWeight: FontWeight.w500)),
                     if (_progress.fraction >= 0)
                       Text('${(_progress.fraction * 100).toInt()}%',
-                          style: TextStyle(fontSize: 12, color: context.chat.brand)),
+                          style: TextStyle(
+                              fontSize: 12, color: context.chat.brand)),
                   ],
                 ),
                 const SizedBox(height: 12),
@@ -228,7 +233,8 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
                     value: _progress.fraction < 0 ? null : _progress.fraction,
                     minHeight: 8,
                     backgroundColor: context.chat.bgTertiary,
-                    valueColor: AlwaysStoppedAnimation<Color>(context.chat.brand),
+                    valueColor:
+                        AlwaysStoppedAnimation<Color>(context.chat.brand),
                   ),
                 ),
               ],
@@ -284,7 +290,8 @@ class _DistroSetupScreenState extends State<DistroSetupScreen> {
               ),
               child: Column(children: [
                 ListTile(
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                   enabled: d.isAvailableOn(widget.abi),
                   title: Row(children: [
                     Text(d.displayName),
@@ -700,10 +707,26 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   /// [AgentLoop] 那份量出来的定值。
   DateTime? _thinkStartedAt;
 
+  /// branchId → 这个分支点有几个版本、正在看第几个。
+  ///
+  /// 缓存而不是画的时候现查：`build` 里不能等异步结果，而每条消息都去查一次
+  /// 数据库，滚动时会变成几十次查询。
+  final Map<String, BranchState> _branches = <String, BranchState>{};
+
+  /// 「编辑重发」按下之后、真正发出去之前的挂账。
+  ///
+  /// 编辑那一刻只是把旧的一段收进版本库并清空正文，新版本要等用户真的按下
+  /// 发送才存在。记着这笔账，发送时才知道这条新消息属于哪个分支点。
+  ({String branchId, int anchorIndex})? _pendingBranch;
+
   /// 用户手动敲命令的那个 shell。**和 Agent 用的是两个不同的会话** ——
   /// 共用一个的话，Agent 的 cd 会污染用户的会话，用户的 export 会污染
   /// Agent 的可复现性（见 ARCHITECTURE.md §3）。
   PtyHandle? _shell;
+
+  /// 终端选区。要自己拿一份而不是让 TerminalView 内部默认造一份——
+  /// 默认那份是它自己私有的，外面拿不到 selection，也就没法实现复制。
+  final _terminalController = TerminalController();
 
   @override
   void initState() {
@@ -803,6 +826,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       _visible.addAll(messages.where((message) => message.role != 'tool'));
     }
     if (mounted) setState(() => _loadingHistory = false);
+    await _refreshBranches();
+    // 打开会话直接停在最新消息——和其他聊天应用一致，也是上面"是否跟随
+    // 底部"判断成立的前提：不跳过去的话，长对话默认停在顶部，流式回复
+    // 永远判定成"用户在看历史"，无声无息地不跟随。
+    _scrollToEnd();
   }
 
   Future<void> _startShell() async {
@@ -818,8 +846,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 用联网档而不是 workspaceWrite：用户手动敲命令时会想 `apk add`，
     // 断网档会让他对着一个没有解释的失败发呆。Agent 才需要默认断网。
     const level = SandboxLevel.workspaceWriteNetwork;
+    final shellCommand = await interactiveShellCommand(_distro?.rootfs);
     final argv = _runtime.sandbox.buildArgv(
-      _distro != null ? 'exec /bin/sh -l' : 'exec sh',
+      shellCommand,
       level,
     );
     final env = _runtime.sandbox.buildEnv(level);
@@ -919,7 +948,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             children: <Widget>[
               ListTile(
                 leading: Icon(
-                  suspended ? Icons.palette_outlined : Icons.format_paint_outlined,
+                  suspended
+                      ? Icons.palette_outlined
+                      : Icons.format_paint_outlined,
                   color: tokens.tintPrimary,
                 ),
                 title: Text(
@@ -934,7 +965,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
               ),
               ListTile(
                 leading: Icon(Icons.tune_rounded, color: tokens.tintPrimary),
-                title: Text('聊天外观', style: TextStyle(color: tokens.tintPrimary)),
+                title:
+                    Text('聊天外观', style: TextStyle(color: tokens.tintPrimary)),
                 onTap: () => Navigator.of(sheetContext).pop('appearance'),
               ),
             ],
@@ -1008,9 +1040,30 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   /// 「回到这里」是同一个动作，只是多了一步把原文填回输入框。
   Future<void> _editMessage(int visibleIndex) async {
     if (_busy) return;
+    final id = _threadId;
     final text = _visible[visibleIndex].content;
+    final historyIndex = _historyIndexOf(visibleIndex);
+    if (historyIndex < 0) return;
+
+    // 分支 id 要在截断**之前**拿到并存下旧的一段 —— 截断之后那段就没了。
+    final branchId = id == null ? null : _ensureBranchId(historyIndex);
+    final oldTail =
+        branchId == null ? null : _agent.history.sublist(historyIndex);
+
     final ok = await _rewind(visibleIndex, confirmTitle: '编辑并重发');
     if (!ok) return;
+
+    if (id != null && branchId != null && oldTail != null) {
+      await widget.chats.saveVariant(
+        threadId: id,
+        branchId: branchId,
+        tail: oldTail,
+        active: false,
+      );
+      // 新版本要等用户真的按下发送才存在，先把账记着。
+      _pendingBranch = (branchId: branchId, anchorIndex: historyIndex);
+    }
+
     _input.text = text;
     _input.selection = TextSelection.collapsed(offset: text.length);
   }
@@ -1082,6 +1135,77 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     if (visibleIndex < 0 || visibleIndex >= _visible.length) return -1;
     final target = _visible[visibleIndex];
     return _agent.history.indexWhere((m) => identical(m, target));
+  }
+
+  /// 重新读一遍当前可见消息涉及的分支状态。
+  Future<void> _refreshBranches() async {
+    final ids = <String>{
+      for (final message in _visible)
+        if (message.branchId != null) message.branchId!,
+    };
+    final next = <String, BranchState>{};
+    for (final id in ids) {
+      final state = await widget.chats.branchStateOf(id);
+      if (state != null) next[id] = state;
+    }
+    if (!mounted) return;
+    setState(() {
+      _branches
+        ..clear()
+        ..addAll(next);
+    });
+  }
+
+  /// 给某条用户消息拿到分支 id，第一次分支时现生成一个。
+  ///
+  /// **两个列表里换的必须是同一个对象**：`_historyIndexOf` 用 `identical`
+  /// 做匹配，换成两个内容相同但不同一的实例，之后的「回到这里」会找不到位置。
+  String _ensureBranchId(int historyIndex) {
+    final anchor = _agent.history[historyIndex];
+    final existing = anchor.branchId;
+    if (existing != null) return existing;
+
+    final id = 'b${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    final tagged = anchor.copyWith(branchId: id);
+    final visibleIndex =
+        _visible.indexWhere((message) => identical(message, anchor));
+    _agent.history[historyIndex] = tagged;
+    if (visibleIndex >= 0) _visible[visibleIndex] = tagged;
+    return id;
+  }
+
+  /// 切到这个分支点的另一个版本。
+  ///
+  /// 换掉的是**从锚点那条用户消息开始的一整段**，不只是助手那一条 ——
+  /// 编辑重发会连问话本身一起变，只换回答的话两边就对不上了。
+  Future<void> _switchVariant(String branchId, int target) async {
+    if (_busy) return;
+    final id = _threadId;
+    if (id == null) return;
+
+    final tail = await widget.chats.loadVariant(branchId, target);
+    if (tail == null || !mounted) return;
+
+    final anchorIndex =
+        _agent.history.indexWhere((message) => message.branchId == branchId);
+    if (anchorIndex < 0) return;
+    final anchor = _agent.history[anchorIndex];
+    final visibleAnchor =
+        _visible.indexWhere((message) => identical(message, anchor));
+    if (visibleAnchor < 0) return;
+
+    setState(() {
+      _agent.history
+        ..removeRange(anchorIndex, _agent.history.length)
+        ..addAll(tail);
+      _visible
+        ..removeRange(visibleAnchor, _visible.length)
+        ..addAll(tail.where((message) => message.role != 'tool'));
+    });
+    await _persist();
+    await widget.chats.setActiveVariant(branchId, target);
+    await _refreshBranches();
+    HapticFeedback.selectionClick();
   }
 
   Future<void> _persist() async {
@@ -1214,6 +1338,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     _scroll.removeListener(_onScroll);
     _scroll.dispose();
     _streamPaintTimer?.cancel();
+    _terminalController.dispose();
     super.dispose();
   }
 
@@ -1291,7 +1416,10 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       _streamPaintTimer = null;
       if (mounted) {
         setState(() {});
-        _scrollToEnd(animated: true);
+        // 用户主动往上翻看历史时不该被拽回底部——那样连一次完整的滚动
+        // 手势都做不完，表现就是"生成时屏幕滑不动"。只有本来就跟在底部
+        // 的才继续跟；翻上去之后，输出照样在后台流，翻回底部会自动接上。
+        if (!_scrolledAway) _scrollToEnd(animated: true);
       }
     });
   }
@@ -1358,6 +1486,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         at: DateTime.now(),
         images: images,
       ));
+      // 发消息是主动动作：不管发送前翻到对话哪个位置，都该跳到底部去看
+      // 这句话和接下来的回复——用户没有理由发了消息却还盯着旧历史。
+      _scrolledAway = false;
       _attachments.clear();
       _streaming.clear();
       _reasoning.clear();
@@ -1365,8 +1496,30 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     });
     await widget.chats.append(id, _visible.last);
 
+    // 编辑重发：这条新消息其实是某个分支点上的新版本，把账接上。
+    final pending = _pendingBranch;
+    _pendingBranch = null;
+
+    await _runTurn(
+      id,
+      () => _agent.send(text, images: images),
+      branchId: pending?.branchId,
+      anchorIndex: pending?.anchorIndex,
+    );
+  }
+
+  /// 跑一个回合：发请求、收流、把结果落成一条助手消息。
+  ///
+  /// [branchId] 非空时，这一轮的产物会作为该分支点的新版本存下来并设为当前
+  /// 版本 —— 「重新生成」和「编辑重发」都靠它留下可切回的旧版本。
+  Future<void> _runTurn(
+    String id,
+    Future<void> Function() body, {
+    String? branchId,
+    int? anchorIndex,
+  }) async {
     try {
-      await _agent.send(text, images: images);
+      await body();
     } catch (e) {
       if (!_cancelRequested) {
         final error = ChatMessage(
@@ -1378,6 +1531,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         setState(() => _visible.add(error));
       }
     } finally {
+      // 整轮期间用户可能翻上去看历史；那种情况下结束时也不该把人拽回
+      // 底部——和流式过程中的道理一样，是不是"跟着"要在内容落地前判断。
+      final wasFollowingBottom = !_scrolledAway;
       setState(() {
         if (_streaming.isNotEmpty) {
           _visible.add(ChatMessage(
@@ -1406,8 +1562,30 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         }
         _busy = false;
       });
+      // 分支点上的新版本要先挂上 id 再存，否则重开 App 之后这条消息
+      // 就找不到自己属于哪个分支了。
+      if (branchId != null &&
+          anchorIndex != null &&
+          anchorIndex < _agent.history.length) {
+        final anchor = _agent.history[anchorIndex];
+        if (anchor.branchId != branchId) {
+          final tagged = anchor.copyWith(branchId: branchId);
+          final visibleIndex =
+              _visible.indexWhere((message) => identical(message, anchor));
+          _agent.history[anchorIndex] = tagged;
+          if (visibleIndex >= 0) _visible[visibleIndex] = tagged;
+        }
+      }
       await widget.chats.replaceMessages(id, _agent.history);
-      _scrollToEnd();
+      if (branchId != null && anchorIndex != null) {
+        await widget.chats.saveVariant(
+          threadId: id,
+          branchId: branchId,
+          tail: _agent.history.sublist(anchorIndex),
+        );
+        await _refreshBranches();
+      }
+      if (wasFollowingBottom) _scrollToEnd();
     }
   }
 
@@ -1417,31 +1595,65 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     _setStatus('正在停止当前请求和命令…');
   }
 
+  /// 重新生成最后一条回复。
+  ///
+  /// **那条问话原样留着**，只把它之后的内容重跑一遍。之前的做法是把用户
+  /// 那条也删掉、把原文塞回输入框再发一次，有两个毛病：每重新生成一次
+  /// 时间戳就变一次，而且它只带走了文本 —— 带图的消息重新生成之后图会
+  /// 静默消失。
+  ///
+  /// 旧回复不会被丢掉，而是存成这个分支点的一个版本，可以切回去。
   Future<void> _retry() async {
     if (_busy) return;
-    final userIndex =
-        _visible.lastIndexWhere((message) => message.role == 'user');
-    if (userIndex < 0) return;
-    final text = _visible[userIndex].content;
-    setState(() {
-      _visible.removeRange(userIndex, _visible.length);
-      _input.text = text;
-    });
+    final id = _threadId;
+    if (id == null) return;
     final historyIndex =
         _agent.history.lastIndexWhere((message) => message.role == 'user');
-    if (historyIndex >= 0) {
-      _agent.history.removeRange(historyIndex, _agent.history.length);
-    }
-    final id = _threadId;
-    if (id != null) await widget.chats.replaceMessages(id, _agent.history);
-    await _send();
+    final visibleIndex =
+        _visible.lastIndexWhere((message) => message.role == 'user');
+    if (historyIndex < 0 || visibleIndex < 0) return;
+
+    HapticFeedback.mediumImpact();
+    // `_busy` 要在第一个 await 之前同步落地：这里到 saveVariant 落盘之间
+    // 有一段异步空档，_ensureBranchId 是同步的没问题，但下面 saveVariant
+    // 要等库。锁晚一步的话，两次快速点击「重新生成」会在锁生效前都通过
+    // 顶部那句 `if (_busy) return`，各自存一份旧版本、各自截断历史。
+    final branchId = _ensureBranchId(historyIndex);
+    setState(() {
+      _visible.removeRange(visibleIndex + 1, _visible.length);
+      _busy = true;
+      _cancelRequested = false;
+      _streaming.clear();
+      _reasoning.clear();
+      _thinkStartedAt = null;
+      _scrolledAway = false;
+    });
+
+    // 先把即将被替换的这一段收进版本库，再动它。
+    await widget.chats.saveVariant(
+      threadId: id,
+      branchId: branchId,
+      tail: _agent.history.sublist(historyIndex),
+      active: false,
+    );
+    _agent.history.removeRange(historyIndex + 1, _agent.history.length);
+
+    await _runTurn(
+      id,
+      () => _agent.regenerate(),
+      branchId: branchId,
+      anchorIndex: historyIndex,
+    );
   }
 
   void _onScroll() {
     if (!_scroll.hasClients) return;
-    // 往下滚一段距离后再显示“回到最底”按钮。12px 是用来触发 AppBar 投影的，
-    // 对按钮来说太小了，会一直跳。
-    final away = _scroll.offset > 300;
+    // 量的是「离底部还有多远」，不是绝对 offset —— 长对话正常停在底部时
+    // offset 本身就很大，拿它当「往上翻过」的判据从一开始就是错的，会让
+    // 流式输出在任何有点长度的对话里都判成"用户在看历史"，从而不跟随。
+    final distanceFromBottom =
+        _scroll.position.maxScrollExtent - _scroll.offset;
+    final away = distanceFromBottom > 120;
     if (away != _scrolledAway && mounted) setState(() => _scrolledAway = away);
   }
 
@@ -1582,14 +1794,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                         if (_distro == null)
                           Container(
                             width: double.infinity,
-                            color:
-                                context.chat.tintWarning.withOpacity(0.16),
+                            color: context.chat.tintWarning.withOpacity(0.16),
                             padding: const EdgeInsets.all(8),
                             child: Text(
                               '降级模式：未安装发行版基座，当前是 Android 自带的 '
                               '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
                               style: TextStyle(
-                                  fontSize: 11, color: context.chat.tintPrimary),
+                                  fontSize: 11,
+                                  color: context.chat.tintPrimary),
                             ),
                           ),
                         Expanded(
@@ -1605,9 +1817,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
                                 ),
                               ),
                               clipBehavior: Clip.antiAlias,
-                              child: TerminalView(
-                                _terminal,
-                                backgroundOpacity: 0,
+                              child: InteractiveTerminal(
+                                terminal: _terminal,
+                                controller: _terminalController,
                               ),
                             ),
                           ),
@@ -1770,6 +1982,19 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     final isLastAssistant =
         i == _visible.length - 1 && message.role == 'assistant' && !_busy;
     final isUser = message.role == 'user';
+
+    // 这条消息该不该带版本切换器：它自己就是锚点（用户消息），或者它是
+    // 某个锚点下这一轮的最后一条回复。
+    String? branchOwner = message.branchId;
+    if (branchOwner == null && isLastAssistant) {
+      for (var j = i - 1; j >= 0; j--) {
+        if (_visible[j].role == 'user') {
+          branchOwner = _visible[j].branchId;
+          break;
+        }
+      }
+    }
+    final branch = branchOwner == null ? null : _branches[branchOwner];
     return ChatBubble(
       role: message.role,
       text: message.content,
@@ -1783,6 +2008,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       showTokens: widget.settings.showTokenUsage,
       reasoning: message.reasoning,
       reasoningMs: message.reasoningMs,
+      // 切换器画在两个地方：分支锚点那条问话下面，以及这一轮最后一条回复
+      // 下面。它们背后是同一个分支状态 —— 点「重新生成」的人会去回复那边
+      // 找，点「编辑」的人会去问话那边找，两处都放才不会有人找不到。
+      variantCount: branch?.total ?? 0,
+      variantIndex: branch?.active ?? 0,
+      onSwitchVariant: branch == null || _busy
+          ? null
+          : (target) => _switchVariant(branchOwner!, target),
       isError: isError,
       lastInGroup: row.lastInGroup,
       firstInGroup: row.firstInGroup,
@@ -1921,7 +2154,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
             host: c.host,
             models: widget.settings.modelsOf(c.id),
             configuredModel: c.model,
-            capabilityOf: c.capabilityOf,
+            // 带上能力表：手动没设过的那些项由它来填。
+            capabilityOf: (model) => widget.channels.capabilityOf(c, model),
           ),
       ];
 

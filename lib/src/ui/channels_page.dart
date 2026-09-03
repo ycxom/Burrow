@@ -443,12 +443,6 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
       );
     }
 
-    final fallback = ModelCapability(
-      vision: _visionCapable,
-      tools: _toolsCapable,
-      search: _searchCapable,
-    );
-
     return Container(
       decoration: BoxDecoration(
         border: Border.all(color: t.borderPrimary),
@@ -470,8 +464,7 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
                     ),
                   ),
                 ),
-                Text(
-                    _apiFormat == 'geminiNative' ? '看图 / 工具 / 搜索' : '看图 / 工具',
+                Text(_apiFormat == 'geminiNative' ? '看图 / 工具 / 搜索' : '看图 / 工具',
                     style: TextStyle(fontSize: 11, color: t.tintTertiary)),
               ],
             ),
@@ -486,8 +479,19 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
               separatorBuilder: (_, __) => const Divider(height: 1),
               itemBuilder: (context, i) {
                 final name = names[i];
-                final explicit = _modelCapabilities.containsKey(name);
-                final cap = _modelCapabilities[name] ?? fallback;
+                // 三份东西要分清楚：用户手动设过的（可能只设了其中一项）、
+                // models.dev 标的、以及渠道默认值。开关显示的是最终结果，
+                // 但"这一项是谁定的"决定了它显不显示成实心。
+                final manual =
+                    _modelCapabilities[name] ?? const ModelCapability();
+                final auto = widget.channels.registry.lookup(name);
+                bool pick(bool? m, bool? a, bool fallbackValue) =>
+                    m ?? a ?? fallbackValue;
+                final visionOn =
+                    pick(manual.vision, auto?.vision, _visionCapable);
+                final toolsOn = pick(manual.tools, auto?.tools, _toolsCapable);
+                final searchOn = manual.search ?? _searchCapable;
+                final explicit = !manual.isEmpty;
                 final isCurrent = name == current;
                 return Padding(
                   padding: const EdgeInsets.fromLTRB(12, 4, 6, 4),
@@ -510,12 +514,19 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
                                 color: isCurrent ? t.brand : t.tintPrimary,
                               ),
                             ),
-                            // 说清它现在是"跟着默认值"还是"单独标过"——
-                            // 两者看起来一样，但改默认值时只有前者会跟着变。
+                            // 说清这一行的能力是谁定的。三种来源改起来的后果
+                            // 完全不同：改渠道默认值只影响"跟随默认"那些，
+                            // 而"官方标注"会随着能力表刷新自己变。
                             Text(
-                              explicit
-                                  ? (isCurrent ? '当前模型 · 已单独设置' : '已单独设置')
-                                  : (isCurrent ? '当前模型 · 跟随默认' : '跟随默认'),
+                              <String>[
+                                if (isCurrent) '当前模型',
+                                if (explicit)
+                                  '已单独设置'
+                                else if (auto != null)
+                                  '官方标注'
+                                else
+                                  '跟随默认',
+                              ].join(' · '),
                               style: TextStyle(
                                 fontSize: 10.5,
                                 color: t.tintTertiary,
@@ -524,39 +535,42 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
                           ],
                         ),
                       ),
+                      // dimmed 现在按**单项**算：只勾过"能看图"的模型，
+                      // 它的"支持工具"仍然是自动值，该显示成淡的。
                       _CapabilityToggle(
                         icon: Icons.visibility_outlined,
-                        tooltip: '能直接看图',
-                        value: cap.vision,
-                        dimmed: !explicit,
-                        onChanged: (v) => _setCapability(
-                          name,
-                          cap.copyWith(vision: v),
-                          fallback,
-                        ),
+                        tooltip: manual.vision != null
+                            ? '能直接看图（你设的）'
+                            : auto != null
+                                ? '能直接看图（官方标注，点一下改成你自己的）'
+                                : '能直接看图',
+                        value: visionOn,
+                        dimmed: manual.vision == null,
+                        onChanged: (v) =>
+                            _setCapability(name, manual.copyWith(vision: v)),
                       ),
                       _CapabilityToggle(
                         icon: Icons.build_outlined,
-                        tooltip: '支持工具调用',
-                        value: cap.tools,
-                        dimmed: !explicit,
-                        onChanged: (v) => _setCapability(
-                          name,
-                          cap.copyWith(tools: v),
-                          fallback,
-                        ),
+                        tooltip: manual.tools != null
+                            ? '支持工具调用（你设的）'
+                            : auto != null
+                                ? '支持工具调用（官方标注，点一下改成你自己的）'
+                                : '支持工具调用',
+                        value: toolsOn,
+                        dimmed: manual.tools == null,
+                        onChanged: (v) =>
+                            _setCapability(name, manual.copyWith(tools: v)),
                       ),
                       if (_apiFormat == 'geminiNative')
                         _CapabilityToggle(
                           icon: Icons.travel_explore_outlined,
+                          // 搜索没有官方标注：它不是模型属性，是 Gemini
+                          // 协议的内置工具。
                           tooltip: '可以联网搜索',
-                          value: cap.search,
-                          dimmed: !explicit,
-                          onChanged: (v) => _setCapability(
-                            name,
-                            cap.copyWith(search: v),
-                            fallback,
-                          ),
+                          value: searchOn,
+                          dimmed: manual.search == null,
+                          onChanged: (v) =>
+                              _setCapability(name, manual.copyWith(search: v)),
                         ),
                       IconButton(
                         tooltip: explicit ? '改回跟随默认' : '当前就是跟随默认',
@@ -586,13 +600,13 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
   /// 改一个模型的能力。和默认值一致时**移除**这条记录而不是存一份相同的值 ——
   /// 存下来的话，以后改渠道默认值这个模型不会跟着变，而用户并没有表达过
   /// "这个模型要钉死在这个值上"的意思。
-  void _setCapability(
-    String model,
-    ModelCapability next,
-    ModelCapability fallback,
-  ) {
+  /// 记下用户对某个模型的手动选择。
+  ///
+  /// 三个字段全空就把整条记录删掉 —— 留一条空记录会让这个模型永远显示成
+  /// "已单独设置"，而它其实什么都没设。
+  void _setCapability(String model, ModelCapability next) {
     setState(() {
-      if (next == fallback) {
+      if (next.isEmpty) {
         _modelCapabilities.remove(model);
       } else {
         _modelCapabilities[model] = next;
@@ -1364,7 +1378,6 @@ const _promptStyleLabels = <SystemPromptStyle, ({String label, String hint})>{
   ),
 };
 
-
 /// 回跳登录页。
 ///
 /// 和 [DeviceLoginPage] 的形状完全不同：那边是"显示一串码、轮询等结果"，
@@ -1426,9 +1439,7 @@ class _RedirectLoginPageState extends State<RedirectLoginPage> {
       if (!mounted) return;
       setState(() {
         _browserOpened = opened;
-        _status = opened
-            ? '已在浏览器里打开，授权完成后会自动回到这里'
-            : '没能自动打开浏览器，请手动复制下面的地址';
+        _status = opened ? '已在浏览器里打开，授权完成后会自动回到这里' : '没能自动打开浏览器，请手动复制下面的地址';
       });
     } catch (e) {
       if (mounted) setState(() => _error = e);
@@ -1488,8 +1499,7 @@ class _RedirectLoginPageState extends State<RedirectLoginPage> {
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(_status,
-                        style:
-                            TextStyle(fontSize: 13, color: t.tintSecondary)),
+                        style: TextStyle(fontSize: 13, color: t.tintSecondary)),
                   ),
                 ],
               ),
@@ -1529,8 +1539,7 @@ class _RedirectLoginPageState extends State<RedirectLoginPage> {
                 OutlinedButton.icon(
                   icon: const Icon(Icons.open_in_browser, size: 18),
                   label: const Text('重新打开浏览器'),
-                  onPressed: () =>
-                      SystemBrowser.open(session.authorizationUrl),
+                  onPressed: () => SystemBrowser.open(session.authorizationUrl),
                 ),
               const Spacer(),
               Text(
@@ -1638,7 +1647,9 @@ class _OAuthFamilyPageState extends State<OAuthFamilyPage> {
                   )
                 : Column(
                     children: <Widget>[
-                      for (var i = 0; i < family.accounts.length; i++) ...<Widget>[
+                      for (var i = 0;
+                          i < family.accounts.length;
+                          i++) ...<Widget>[
                         if (i > 0) const Divider(height: 1),
                         _accountTile(family, family.accounts[i]),
                       ],
@@ -1648,9 +1659,8 @@ class _OAuthFamilyPageState extends State<OAuthFamilyPage> {
           const SizedBox(height: 24),
           _SectionTitle(
             family.isMultiMode ? '登录方式' : '登录',
-            subtitle: family.isMultiMode
-                ? '同一个 Google 账号，登完之后打的是两个不同的后端'
-                : null,
+            subtitle:
+                family.isMultiMode ? '同一个 Google 账号，登完之后打的是两个不同的后端' : null,
           ),
           Card(
             clipBehavior: Clip.antiAlias,

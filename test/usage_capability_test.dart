@@ -1,4 +1,5 @@
 import 'package:burrow/src/agent/agent_loop.dart';
+import 'package:burrow/src/llm/model_registry.dart';
 import 'package:burrow/src/settings/channel_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -84,6 +85,7 @@ void main() {
       String model = 'gpt-4o',
       bool vision = false,
       bool tools = true,
+      bool search = false,
       Map<String, ModelCapability> overrides = const {},
     }) =>
         Channel(
@@ -93,6 +95,7 @@ void main() {
           model: model,
           visionCapable: vision,
           toolsCapable: tools,
+          searchCapable: search,
           modelCapabilities: overrides,
         );
 
@@ -128,6 +131,65 @@ void main() {
       );
       expect(c.activeCapability.vision, isFalse);
       expect(c.copyWith(model: 'gpt-4o').activeCapability.vision, isTrue);
+    });
+
+    test('老记录里缺的字段算"没表过态"，不是算 false', () {
+      // 很老的版本存下来的逐模型记录只有 vision 一项（那时还没有 tools）。
+      // 缺的那些应该让位给自动/默认值，而不是被当成用户显式关掉了。
+      final partial =
+          ModelCapability.fromJson(<String, Object?>{'vision': true});
+      expect(partial.vision, isTrue);
+      expect(partial.tools, isNull);
+      expect(partial.search, isNull);
+
+      // 存回去时也只写表过态的那一项，不补空值。
+      expect(partial.toJson(), <String, Object?>{'vision': true});
+    });
+
+    test('优先级：手动 > 官方标注 > 渠道默认', () {
+      final registry = ModelRegistry(<String, ModelMeta>{
+        'gpt-4o': const ModelMeta(vision: true, tools: true),
+      });
+      // 渠道默认说不认图，但 models.dev 说认 —— 用户没表过态，听自动的。
+      final c = channel(vision: false, tools: false);
+      final auto = c.capabilityOf('gpt-4o', registry);
+      expect(auto.vision, isTrue);
+      expect(auto.tools, isTrue);
+      expect(auto.visionFromRegistry, isTrue, reason: '要能告诉界面这一项是自动来的');
+
+      // 用户亲手关掉之后，自动值不许再翻回去 —— 那是他为了让这个模型
+      // 能用而调的，一次后台刷新不该悄悄改回来。
+      final manual = channel(
+        vision: false,
+        tools: false,
+        overrides: <String, ModelCapability>{
+          'gpt-4o': const ModelCapability(vision: false),
+        },
+      ).capabilityOf('gpt-4o', registry);
+      expect(manual.vision, isFalse);
+      expect(manual.visionFromRegistry, isFalse);
+      // 只手动设了 vision，tools 仍然吃自动值 —— 按单项算，不是整条冻住。
+      expect(manual.tools, isTrue);
+      expect(manual.toolsFromRegistry, isTrue);
+    });
+
+    test('表里没有的模型退回渠道默认值', () {
+      // registry 的覆盖是有洞的（实测 gemini-2.0-flash 就不在里面），
+      // 查不到必须老老实实退回默认，不能当成"不支持"。
+      final c = channel(vision: true, tools: true);
+      final r = c.capabilityOf('某个内网自研模型', ModelRegistry.empty());
+      expect(r.vision, isTrue);
+      expect(r.tools, isTrue);
+      expect(r.visionFromRegistry, isFalse);
+    });
+
+    test('搜索没有自动值 —— 它不是模型属性', () {
+      final registry = ModelRegistry(<String, ModelMeta>{
+        'gpt-4o': const ModelMeta(vision: true, tools: true),
+      });
+      final c = channel(search: true);
+      expect(c.capabilityOf('gpt-4o', registry).search, isTrue,
+          reason: '只能来自手动或渠道默认');
     });
 
     test('空模型名回落默认值而不是崩', () {

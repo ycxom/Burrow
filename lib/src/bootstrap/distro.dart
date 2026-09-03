@@ -433,6 +433,54 @@ class InstalledDistro {
   const InstalledDistro(this.distro, this.rootfs);
 }
 
+/// 把要写进沙箱包管理器配置的地址降成 http。
+///
+/// **这不是安全性倒退。** apt / apk 从来就不靠 TLS 保证软件包没被篡改——
+/// 校验靠的是 Release 文件的 GPG 签名（apt）或内嵌公钥（apk），HTTPS
+/// 从设计上就是这套模型的可选加分项，不是它的地基，Debian/Ubuntu 用
+/// 明文 HTTP 镜像跑了二十年都是这么过来的。
+///
+/// 而这里用的基座是刻意裁剪到最小的 `ubuntu-base`/docker rootfs，
+/// 没有预置 CA 证书链（真机上 `apt update` 直接报证书错误，装不了任何
+/// 东西）。装一份维护中的 CA 包进沙箱是可以做但更重的另一件事；这里先
+/// 把在 apt/apk 那套模型里本就不必要的那道 TLS 握手去掉，问题从根上不
+/// 存在。**只影响沙箱内部装包的地址，不影响下载 rootfs 本身**——
+/// 那一步是 Burrow 自己在宿主机上用 Dart 的 http 客户端发起的，
+/// 走的是系统级证书信任，没有这个问题。
+String sandboxPackageUrl(String url) => url.replaceFirst('https://', 'http://');
+
+/// 把 Ubuntu 的仓库地址修正到当前 CPU 架构真正存在的那条路径。
+///
+/// **Ubuntu 把 arm64 和 amd64 放在两套完全不同的路径下。** 主线归档
+/// （`archive.ubuntu.com/ubuntu`，以及各家镜像的 `/ubuntu`）只有
+/// amd64/i386；arm64 全部在 `ubuntu-ports` 下。搞错的表现不是报错说
+/// "不支持这个架构"，而是 `dists/noble/main/binary-arm64/Packages` 404 ——
+/// 一条要对着镜像目录结构才能读懂的信息。
+///
+/// 实测：`mirrors.ustc.edu.cn/ubuntu/.../binary-arm64/Packages.gz` 是 404，
+/// 同一台镜像的 `.../ubuntu-ports/.../binary-arm64/Packages.gz` 是 200。
+/// USTC / NJU / TUNA / MIT 四家都提供 ubuntu-ports。
+///
+/// Debian 没有这个问题（所有架构同一套路径），所以只对 Ubuntu 用。
+String ubuntuRepoUrlForAbi(String url, String abi) {
+  final wantsPorts = abi != 'x86_64';
+  if (!wantsPorts) return url;
+  if (url.contains('ubuntu-ports')) return url;
+
+  // 官方主线归档压根不提供 ports，得整个换主机名，不是换路径。
+  final official = RegExp(r'https?://(archive|security)\.ubuntu\.com/ubuntu');
+  if (official.hasMatch(url)) {
+    return url.replaceAll(official, 'http://ports.ubuntu.com/ubuntu-ports');
+  }
+
+  // 镜像站是同一台主机下的另一个目录。只认作为路径末段的 `/ubuntu`，
+  // 免得把 `mirrors.ubuntu.example/ubuntu` 里的主机名也改了。
+  return url.replaceAllMapped(
+    RegExp(r'(https?://[^\s]*?)/ubuntu(?=[/\s]|$)'),
+    (m) => '${m.group(1)}/ubuntu-ports',
+  );
+}
+
 class DistroManager {
   /// 所有发行版的父目录。
   final Directory root;
@@ -463,9 +511,120 @@ class DistroManager {
   Future<List<InstalledDistro>> listInstalled() async {
     final out = <InstalledDistro>[];
     for (final d in DistroCatalog.all) {
-      if (await isInstalled(d)) out.add(InstalledDistro(d, rootfsDirFor(d)));
+      if (!await isInstalled(d)) continue;
+      final installed = InstalledDistro(d, rootfsDirFor(d));
+      await _repairLegacyAptTls(installed);
+      await _repairAptArchPath(installed);
+      out.add(installed);
     }
     return out;
+  }
+
+  /// Makes pre-fix Ubuntu installs usable without forcing a rootfs reinstall.
+  ///
+  /// New installs already receive HTTP package sources in [_postInstall]. An
+  /// existing rootfs never enters that path again, though, so its old HTTPS
+  /// entries keep failing when Ubuntu Base has no `ca-certificates` package.
+  /// `main()` loads installed distros through [listInstalled], making this a
+  /// small, idempotent startup migration at the exact seam old installs use.
+  ///
+  /// Once the user installs a CA bundle we preserve HTTPS. Without one, apt's
+  /// Release-file signatures still authenticate repository metadata and
+  /// packages; only the unavailable transport layer is removed.
+  Future<void> _repairLegacyAptTls(InstalledDistro installed) async {
+    if (installed.distro.packageManager != 'apt') return;
+
+    final rootfs = installed.rootfs;
+    final caBundle = File('${rootfs.path}/etc/ssl/certs/ca-certificates.crt');
+    if (await caBundle.exists() && await caBundle.length() > 0) return;
+
+    final apt = Directory('${rootfs.path}/etc/apt');
+    final sources = <File>[File('${apt.path}/sources.list')];
+    final fragments = Directory('${apt.path}/sources.list.d');
+    if (await fragments.exists()) {
+      await for (final entity in fragments.list(followLinks: false)) {
+        if (entity.path.endsWith('.list') || entity.path.endsWith('.sources')) {
+          sources.add(File(entity.path));
+        }
+      }
+    }
+
+    for (final source in sources) {
+      if (!await source.exists()) continue;
+      final before = await source.readAsString();
+      final after = _aptSourcesWithoutTls(before);
+      if (after != before) await source.writeAsString(after, flush: true);
+    }
+  }
+
+  /// 把已装好的 Ubuntu 仓库地址修到当前架构真正存在的那条路径上。
+  ///
+  /// 和 [_repairLegacyAptTls] 是两件独立的事，所以分开写：证书那条以
+  /// "没有 CA 包"为前提，而架构路径错了是**跟证书无关的 404**，装没装
+  /// CA 都一样错。合到一个函数里就会被那个前提挡掉。
+  ///
+  /// 触发条件很窄：只有 Ubuntu、只有非 x86_64、只有地址里还写着主线
+  /// 归档路径时才动。已经是 ubuntu-ports 的原样不改。
+  Future<void> _repairAptArchPath(InstalledDistro installed) async {
+    if (installed.distro.packageManager != 'apt') return;
+    if (installed.distro.id.startsWith('debian')) return;
+    if (abi == 'x86_64') return;
+
+    for (final source in await _aptSourceFiles(installed.rootfs)) {
+      if (!await source.exists()) continue;
+      final before = await source.readAsString();
+      final after = _aptSourcesForAbi(before, abi);
+      if (after != before) await source.writeAsString(after, flush: true);
+    }
+  }
+
+  /// apt 的配置分散在 sources.list 和 sources.list.d/ 两处，两处都要看。
+  Future<List<File>> _aptSourceFiles(Directory rootfs) async {
+    final apt = Directory('${rootfs.path}/etc/apt');
+    final sources = <File>[File('${apt.path}/sources.list')];
+    final fragments = Directory('${apt.path}/sources.list.d');
+    if (await fragments.exists()) {
+      await for (final entity in fragments.list(followLinks: false)) {
+        if (entity.path.endsWith('.list') || entity.path.endsWith('.sources')) {
+          sources.add(File(entity.path));
+        }
+      }
+    }
+    return sources;
+  }
+
+  /// 只改真正生效的仓库声明行，注释原样保留。
+  static String _aptSourcesForAbi(String content, String abi) {
+    final traditional = RegExp(r'^\s*deb(?:-src)?\s', caseSensitive: false);
+    final deb822 = RegExp(r'^\s*URIs\s*:', caseSensitive: false);
+
+    return content.split('\n').map((line) {
+      final commentAt = line.indexOf('#');
+      final active = commentAt < 0 ? line : line.substring(0, commentAt);
+      if (!traditional.hasMatch(active) && !deb822.hasMatch(active)) {
+        return line;
+      }
+      final repaired = ubuntuRepoUrlForAbi(active, abi);
+      return commentAt < 0 ? repaired : '$repaired${line.substring(commentAt)}';
+    }).join('\n');
+  }
+
+  /// Downgrades URLs only on enabled apt source declarations. Comments and
+  /// unrelated URLs in the same config files remain byte-for-byte unchanged.
+  static String _aptSourcesWithoutTls(String content) {
+    final traditional = RegExp(r'^\s*deb(?:-src)?\s', caseSensitive: false);
+    final deb822 = RegExp(r'^\s*URIs\s*:', caseSensitive: false);
+    final https = RegExp(r'https://', caseSensitive: false);
+
+    return content.split('\n').map((line) {
+      final commentAt = line.indexOf('#');
+      final active = commentAt < 0 ? line : line.substring(0, commentAt);
+      if (!traditional.hasMatch(active) && !deb822.hasMatch(active)) {
+        return line;
+      }
+      final repaired = active.replaceAll(https, 'http://');
+      return commentAt < 0 ? repaired : '$repaired${line.substring(commentAt)}';
+    }).join('\n');
   }
 
   /// 下载并解压一个发行版。
@@ -756,8 +915,8 @@ class DistroManager {
       if (!await repos.exists() ||
           (await repos.readAsString()).trim().isEmpty) {
         final ver = d.id.split('-').last;
-        final base =
-            source?.packageBaseUrl ?? 'https://dl-cdn.alpinelinux.org/alpine';
+        final base = sandboxPackageUrl(
+            source?.packageBaseUrl ?? 'https://dl-cdn.alpinelinux.org/alpine');
         await repos.writeAsString(
           '$base/v$ver/main\n'
           '$base/v$ver/community\n',
@@ -770,16 +929,19 @@ class DistroManager {
       await sources.parent.create(recursive: true);
       final isDebian = d.id.startsWith('debian');
       final suite = isDebian ? 'bookworm' : 'noble';
-      final packageBase =
+      var packageBase = sandboxPackageUrl(
           !isDebian && source.id == 'ubuntu-official' && abi == 'x86_64'
               ? 'https://archive.ubuntu.com/ubuntu'
-              : source.packageBaseUrl;
+              : source.packageBaseUrl);
+      // 镜像目录里 arm64 和 amd64 不在同一条路径下，见 ubuntuRepoUrlForAbi。
+      if (!isDebian) packageBase = ubuntuRepoUrlForAbi(packageBase, abi);
       final components = isDebian
           ? 'main contrib non-free non-free-firmware'
           : 'main restricted universe multiverse';
-      final debianSecurity = source.packageBaseUrl.contains('tuna.tsinghua')
-          ? 'https://mirrors.tuna.tsinghua.edu.cn/debian-security'
-          : 'https://security.debian.org/debian-security';
+      final debianSecurity = sandboxPackageUrl(
+          source.packageBaseUrl.contains('tuna.tsinghua')
+              ? 'https://mirrors.tuna.tsinghua.edu.cn/debian-security'
+              : 'https://security.debian.org/debian-security');
       await sources.writeAsString(isDebian
           ? 'deb $packageBase $suite $components\n'
               'deb $packageBase $suite-updates $components\n'

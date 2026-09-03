@@ -24,6 +24,7 @@ import 'src/data/chat_store.dart';
 import 'src/data/task_runtime.dart';
 import 'src/llm/embeddings.dart';
 import 'src/llm/llm_client.dart';
+import 'src/llm/model_registry_store.dart';
 import 'src/llm/vision.dart';
 import 'src/net/proxy_client.dart';
 import 'src/sandbox/exec_policy.dart';
@@ -220,6 +221,19 @@ Future<void> _boot({
   final legacyPrefs = await SharedPreferences.getInstance();
   final channels = await ChannelStore.load(prefs: legacyPrefs);
   settings.bindChannels(channels);
+
+  // 模型能力表：先用随包快照/本地缓存把界面撑起来，联网刷新放到后台。
+  //
+  // **不 await 刷新。** 这是启动路径，为了一份"提示性"的数据多等几秒网络
+  // 不划算；而且拉不到也完全不影响使用，只是少几个能力图标。
+  final modelRegistry = ModelRegistryStore(
+    cacheFile: File('${files.path}/model_registry.json'),
+  );
+  await modelRegistry.load();
+  channels.registry = modelRegistry.registry;
+  modelRegistry.changes
+      .listen((_) => channels.registry = modelRegistry.registry);
+  unawaited(modelRegistry.refresh());
   final chats = await ChatStore.open();
   final llm = ConfigurableLlmClient(config: settings.config);
 

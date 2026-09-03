@@ -201,8 +201,7 @@ class TokenUsage {
       value is num ? value.toInt() : int.tryParse('$value') ?? 0;
 
   @override
-  String toString() =>
-      'TokenUsage(in: $input, out: $output, cached: $cached'
+  String toString() => 'TokenUsage(in: $input, out: $output, cached: $cached'
       '${estimated ? ', 估算' : ''})';
 }
 
@@ -416,28 +415,57 @@ class AgentLoop {
       images: images,
     ));
 
-    // 用户提问里如果指向了被摘要挤出去的内容，先把它捞回来。
-    // 主动检索而不是等模型调 recall_memory：模型经常不知道自己忘了什么。
-    if (overflow.hasSummary) {
-      final corpus = _corpus();
-      // 先给新进入语料的消息补上向量。没配嵌入模型时这是个空操作。
-      await retrieval.index(corpus);
-      // 失败了不影响这一轮（检索会降级成两路词法），但必须说出来 ——
-      // 用户配了嵌入模型却一直没生效的话，界面上得看得见。
-      final embedError = retrieval.lastEmbeddingError;
-      if (embedError != null) host.onStatus('嵌入检索不可用：$embedError');
-      final hits = await retrieval.search(userInput, corpus, topK: 6);
-      if (hits.isNotEmpty) {
-        final injected = retrieval.format(hits, tokenBudget: 600);
-        if (injected.isNotEmpty) {
-          final note = ChatMessage(
-              role: 'system', content: injected, at: DateTime.now());
-          history.add(note);
-          host.onContextMessage(note);
-        }
-      }
-    }
+    await _retrieveInto(userInput);
+    await _runRounds(epoch);
+  }
 
+  /// 重新生成最后一条回复。
+  ///
+  /// 和 [send] 的差别只有一处：**不追加新的用户消息**，那条问话原样留着。
+  /// 之前的做法是把用户那条删掉、把原文重新发一遍，代价是每重新生成一次
+  /// 时间戳就变一次，而且[send] 的签名只收文本 —— 带图的那条消息重新生成
+  /// 之后图会**静默消失**。
+  ///
+  /// 调用前请先把历史截断到那条用户消息为止。截断意味着丢内容，而丢之前
+  /// 要不要先存成一个可切回的版本，是上层的决定，不该埋在这里。
+  ///
+  /// **不重新打检查点。** 「回到这条消息」要回到的是那一轮**开始之前**的
+  /// 状态，跟你重新生成过几次没有关系；重打一个只会让回滚点悄悄前移到
+  /// 第一次尝试改完文件之后。
+  Future<void> regenerate() async {
+    final epoch = _cancelEpoch;
+    final anchor = history.lastWhere(
+      (message) => message.role == 'user',
+      orElse: () => ChatMessage(role: 'user', content: '', at: DateTime.now()),
+    );
+    await _retrieveInto(anchor.content);
+    await _runRounds(epoch);
+  }
+
+  /// 把被摘要挤出去、但这次提问用得上的内容捞回来。
+  ///
+  /// 主动检索而不是等模型调 recall_memory：模型经常不知道自己忘了什么。
+  Future<void> _retrieveInto(String query) async {
+    if (!overflow.hasSummary) return;
+    final corpus = _corpus();
+    // 先给新进入语料的消息补上向量。没配嵌入模型时这是个空操作。
+    await retrieval.index(corpus);
+    // 失败了不影响这一轮（检索会降级成两路词法），但必须说出来 ——
+    // 用户配了嵌入模型却一直没生效的话，界面上得看得见。
+    final embedError = retrieval.lastEmbeddingError;
+    if (embedError != null) host.onStatus('嵌入检索不可用：$embedError');
+    final hits = await retrieval.search(query, corpus, topK: 6);
+    if (hits.isEmpty) return;
+    final injected = retrieval.format(hits, tokenBudget: 600);
+    if (injected.isEmpty) return;
+    final note =
+        ChatMessage(role: 'system', content: injected, at: DateTime.now());
+    history.add(note);
+    host.onContextMessage(note);
+  }
+
+  /// 一个回合：反复请求模型，直到它不再要工具为止。
+  Future<void> _runRounds(int epoch) async {
     // 整轮累加。工具循环里一个回合会打好几次请求，用户要看的是这一问一答的
     // 总账 —— 只记最后一次的话，一个跑了八轮工具的任务会显示成"几乎没花钱"。
     var spent = const TokenUsage();

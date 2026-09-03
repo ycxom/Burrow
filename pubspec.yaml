@@ -55,6 +55,7 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0
+  sqflite_common_ffi: ^2.4.2+1
 
 flutter:
   uses-material-design: true
@@ -62,3 +63,7 @@ flutter:
     # 最小 bootstrap（bash/coreutils/proot/git/python）。
     # 按 ABI 分开打包，构建时只保留目标 ABI 那一份，否则 APK 会大一倍。
     - assets/bootstrap/
+    # 模型能力快照（models.dev）。随包带一份是因为手机上第一次配渠道时
+    # 多半还没联网拉到，而那正是最需要它的时刻。
+    # 用 tool/generate_model_snapshot.dart 重新生成。
+    - assets/model_registry.json

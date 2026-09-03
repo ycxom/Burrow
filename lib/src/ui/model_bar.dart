@@ -43,7 +43,7 @@ class ModelSource {
   /// 摆在选择器里而不是只留在渠道设置里：能力标错的后果（图被当没看见、
   /// 终端模式静默失效）是在**换模型的那一刻**埋下的，而这里就是那一刻。
   /// 在别处解释一百遍，不如在这里显示两个图标。
-  final ModelCapability Function(String model)? capabilityOf;
+  final ResolvedCapability Function(String model)? capabilityOf;
 
   const ModelSource({
     required this.id,

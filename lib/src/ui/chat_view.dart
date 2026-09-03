@@ -384,8 +384,7 @@ class BubbleShape extends ShapeBorder {
 
     final p = Path()..moveTo(body.left + r, body.top);
     p.lineTo(body.right - r, body.top);
-    p.arcToPoint(Offset(body.right, body.top + r),
-        radius: Radius.circular(r));
+    p.arcToPoint(Offset(body.right, body.top + r), radius: Radius.circular(r));
 
     if (tail) {
       p.lineTo(body.right, body.bottom - corner);
@@ -418,8 +417,7 @@ class BubbleShape extends ShapeBorder {
     p.arcToPoint(Offset(body.left, body.bottom - r),
         radius: Radius.circular(r));
     p.lineTo(body.left, body.top + r);
-    p.arcToPoint(Offset(body.left + r, body.top),
-        radius: Radius.circular(r));
+    p.arcToPoint(Offset(body.left + r, body.top), radius: Radius.circular(r));
     return p..close();
   }
 
@@ -574,8 +572,8 @@ class _ServicePillState extends State<ServicePill> {
     final t = context.chat;
     final style = context.parts.datePill;
     final collapsible = widget.text.length > ServicePill._collapseAbove;
-    final color = style.text?.color ??
-        (widget.isError ? t.tintError : t.tintOnService);
+    final color =
+        style.text?.color ?? (widget.isError ? t.tintError : t.tintOnService);
     final showFull = _expanded || !collapsible;
 
     // 报错胶囊不让皮肤隐藏。日期分隔藏了只是少个提示，报错藏了就是
@@ -682,6 +680,15 @@ class ChatBubble extends StatelessWidget {
   /// 思考一共花了多久，毫秒。历史消息从库里读出来。
   final int reasoningMs;
 
+  /// 这条消息所在分支点一共有几个版本。1 或 0 = 没得选，不画切换器。
+  final int variantCount;
+
+  /// 正在看第几个版本，从 0 数。
+  final int variantIndex;
+
+  /// 切到第 n 个版本。null = 不可切换。
+  final ValueChanged<int>? onSwitchVariant;
+
   /// 这条是一组连续消息里的最后一条：画尾巴、显示头像。
   final bool lastInGroup;
 
@@ -715,6 +722,9 @@ class ChatBubble extends StatelessWidget {
     this.reasoningActive = false,
     this.reasoningStartedAt,
     this.reasoningMs = 0,
+    this.variantCount = 0,
+    this.variantIndex = 0,
+    this.onSwitchVariant,
     this.lastInGroup = true,
     this.firstInGroup = true,
     this.avatarPath = '',
@@ -856,17 +866,34 @@ class ChatBubble extends StatelessWidget {
       child: _buildBody(context, fg, inline ? footer : null, style),
     );
 
-    final Widget body = footer != null && !inline
+    // 版本切换器挂在气泡**外面**：用户气泡的时间戳是压在正文里的
+    // （见 _InlineTimeText），塞进去会把那套排版顶乱。
+    final switcher = variantCount > 1 && onSwitchVariant != null
+        ? _VariantSwitcher(
+            index: variantIndex,
+            total: variantCount,
+            color: timeColor,
+            onSwitch: onSwitchVariant!,
+          )
+        : null;
+
+    final Widget body = (footer != null && !inline) || switcher != null
         ? Column(
             crossAxisAlignment:
                 _outgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
               bubble,
-              Padding(
-                padding: const EdgeInsets.only(top: 2, left: 6, right: 6),
-                child: footer,
-              ),
+              if (footer != null && !inline)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2, left: 6, right: 6),
+                  child: footer,
+                ),
+              if (switcher != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 1, left: 4, right: 4),
+                  child: switcher,
+                ),
             ],
           )
         : bubble;
@@ -1162,7 +1189,8 @@ class ChatBubble extends StatelessWidget {
     final codeBg = t.tintPrimary.withValues(alpha: 0.06);
     // 正文字号跟着皮肤走，标题按比例缩放 —— 皮肤把正文调到 18 之后，
     // 标题还停在 20 会让层级看起来是平的。
-    final body = style.styled(TextStyle(fontSize: 15.5, height: 1.45, color: fg));
+    final body =
+        style.styled(TextStyle(fontSize: 15.5, height: 1.45, color: fg));
     final scale = (body.fontSize ?? 15.5) / 15.5;
     return base.copyWith(
       p: body,
@@ -1312,8 +1340,7 @@ class ComposerIconButton extends StatelessWidget {
     final style = context.parts.composerIcon;
     final fg = !enabled
         ? t.tintTertiary.withValues(alpha: 0.5)
-        : color ??
-            (active ? t.brand : style.icon?.color ?? t.tintTertiary);
+        : color ?? (active ? t.brand : style.icon?.color ?? t.tintTertiary);
     final dimension = style.size ?? 40;
 
     final child = SizedBox.square(
@@ -1413,17 +1440,14 @@ class _ChatComposerState extends State<ChatComposer> {
   Widget build(BuildContext context) {
     final t = context.chat;
     final parts = context.parts;
-    final field = (_focus.hasFocus
-            ? parts.composerField.on(SkinState.focused)
-            : null) ??
-        parts.composerField;
+    final field =
+        (_focus.hasFocus ? parts.composerField.on(SkinState.focused) : null) ??
+            parts.composerField;
     final docked = parts.composerMode == SkinComposerMode.docked;
     final content = Padding(
       // 贴底模式去掉外边距，输入区就从"浮在壁纸上的一滴"变成"钉在底边的一条"。
       padding: parts.composerDock.margined(
-        docked
-            ? EdgeInsets.zero
-            : const EdgeInsets.fromLTRB(10, 5, 10, 9),
+        docked ? EdgeInsets.zero : const EdgeInsets.fromLTRB(10, 5, 10, 9),
       ),
       child: _ComposerDock(
         docked: docked,
@@ -1464,12 +1488,14 @@ class _ChatComposerState extends State<ChatComposer> {
                               cursorColor: t.brand,
                               decoration: InputDecoration(
                                 hintText: widget.hintText,
-                                hintStyle: field.styled(
-                                  TextStyle(
-                                    fontSize: 16,
-                                    color: t.tintTertiary,
-                                  ),
-                                ).copyWith(color: t.tintTertiary),
+                                hintStyle: field
+                                    .styled(
+                                      TextStyle(
+                                        fontSize: 16,
+                                        color: t.tintTertiary,
+                                      ),
+                                    )
+                                    .copyWith(color: t.tintTertiary),
                                 // 药丸本身就是输入框的边界。
                                 border: InputBorder.none,
                                 enabledBorder: InputBorder.none,
@@ -1563,9 +1589,7 @@ class _ComposerDock extends StatelessWidget {
                   )),
         border: style.borderOr(
           Border.all(
-            color: focused
-                ? t.brand.withValues(alpha: 0.6)
-                : t.composerDockRim,
+            color: focused ? t.brand.withValues(alpha: 0.6) : t.composerDockRim,
             width: focused ? 1.2 : 0.8,
           ),
         ),
@@ -1874,6 +1898,89 @@ class _SendButton extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 「‹ 2/3 ›」——在同一个分支点的几个版本之间切换。
+///
+/// 重新生成和编辑重发都不会把旧的那份删掉，而是并排存着；这一小条就是
+/// 回到旧版本的入口。没有它的话，旧回复存了也等于没存。
+class _VariantSwitcher extends StatelessWidget {
+  const _VariantSwitcher({
+    required this.index,
+    required this.total,
+    required this.color,
+    required this.onSwitch,
+  });
+
+  final int index;
+  final int total;
+  final Color color;
+  final ValueChanged<int> onSwitch;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = color.withValues(alpha: 0.75);
+    final disabled = color.withValues(alpha: 0.25);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        _Arrow(
+          icon: Icons.chevron_left,
+          // 到头了就不给点。做成循环的话，用户分不清自己是往回翻了一版
+          // 还是绕了一圈回到最新的那版。
+          onTap: index > 0 ? () => onSwitch(index - 1) : null,
+          enabled: enabled,
+          disabled: disabled,
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2),
+          child: Text(
+            '${index + 1}/$total',
+            style: TextStyle(
+              fontSize: 11,
+              height: 1.2,
+              color: enabled,
+              fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
+            ),
+          ),
+        ),
+        _Arrow(
+          icon: Icons.chevron_right,
+          onTap: index < total - 1 ? () => onSwitch(index + 1) : null,
+          enabled: enabled,
+          disabled: disabled,
+        ),
+      ],
+    );
+  }
+}
+
+class _Arrow extends StatelessWidget {
+  const _Arrow({
+    required this.icon,
+    required this.onTap,
+    required this.enabled,
+    required this.disabled,
+  });
+
+  final IconData icon;
+  final VoidCallback? onTap;
+  final Color enabled;
+  final Color disabled;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkResponse(
+      onTap: onTap,
+      radius: 14,
+      child: Padding(
+        // 图标只有 16，但手指要的是 40 左右。上下留白同时也把这一条和
+        // 气泡拉开一点距离。
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+        child: Icon(icon, size: 16, color: onTap == null ? disabled : enabled),
       ),
     );
   }
