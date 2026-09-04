@@ -3,6 +3,7 @@
 .packages
 .flutter-plugins
 .flutter-plugins-dependencies
+.flutter-home/
 build/
 dist/
 
