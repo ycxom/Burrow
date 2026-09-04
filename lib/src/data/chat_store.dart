@@ -9,6 +9,7 @@ import 'package:sqflite/sqflite.dart';
 import '../agent/agent_loop.dart' show TokenUsage;
 import '../context/overflow_manager.dart';
 import '../settings/thread_lock.dart';
+import 'db_cipher.dart';
 
 class ChatThread {
   const ChatThread({
@@ -74,6 +75,28 @@ class ChatStore {
   ChatStore._(this._db);
 
   final Database _db;
+
+  /// 内容列的加解密。null = 不加密（单测、以及还没设过密码的旧库）。
+  ///
+  /// 装内容的列全都过它一遍；时间戳、角色、id 这些元数据不动 ——
+  /// 它们要参与 WHERE 和 ORDER BY，加了就没法查了。范围和理由见 db_cipher.dart。
+  DbCipher? _cipher;
+
+  /// 接上密钥。main 在开库之后、真正用它之前调一次。
+  void useCipher(DbCipher? value) => _cipher = value;
+
+  String? _seal(String? plain) => _cipher?.seal(plain) ?? plain;
+
+  /// 读出来的值。没有密钥时原样返回 —— 那时库里本来就是明文。
+  ///
+  /// **不能写成 `_cipher?.open(x) ?? x`。** 那样会把"解不开"（open 返回 null）
+  /// 和"没有密钥"混成一件事，于是密钥不对时界面上显示的是一串 base64 密文
+  /// —— 用户看到的不是"打不开"，是消息内容变成了乱码。
+  String? _open(String? sealed) {
+    final cipher = _cipher;
+    if (cipher == null) return sealed;
+    return cipher.open(sealed);
+  }
 
   /// 直接查表。**只给测试用** —— 回收干没干净只有直接数行数才看得见，
   /// 而上层 API 一律返回"没有了"，孤儿行恰恰是那种"查询看不见、空间一直
@@ -290,13 +313,13 @@ class ChatStore {
     return rows
         .map((row) => ChatThread(
               id: row['id']! as String,
-              title: row['title']! as String,
-              preview: row['preview']! as String,
+              title: _open(row['title'] as String?) ?? '',
+              preview: _open(row['preview'] as String?) ?? '',
               updatedAt: DateTime.fromMillisecondsSinceEpoch(
                 row['updated_at']! as int,
               ),
               terminalMode: (row['terminal_mode'] as int? ?? 0) != 0,
-              systemPrompt: row['system_prompt'] as String?,
+              systemPrompt: _open(row['system_prompt'] as String?),
             ))
         .toList();
   }
@@ -329,14 +352,14 @@ class ChatStore {
       limit: 1,
     );
     if (rows.isEmpty) return null;
-    return rows.first['system_prompt'] as String?;
+    return _open(rows.first['system_prompt'] as String?);
   }
 
   /// 设这个会话的提示词。null = 清掉，回退到全局。
   Future<void> setSystemPrompt(String threadId, String? prompt) async {
     await _db.update(
       'threads',
-      <String, Object?>{'system_prompt': prompt},
+      <String, Object?>{'system_prompt': _seal(prompt)},
       where: 'id = ?',
       whereArgs: <Object?>[threadId],
     );
@@ -356,7 +379,7 @@ class ChatStore {
       limit: 1,
     );
     if (rows.isEmpty) return null;
-    final summary = rows.first['summary'] as String?;
+    final summary = _open(rows.first['summary'] as String?);
     final checkpoint = rows.first['summary_checkpoint'] as int?;
     if (summary == null || summary.isEmpty || checkpoint == null) return null;
     return (summary: summary, checkpoint: checkpoint);
@@ -367,7 +390,7 @@ class ChatStore {
       _db.update(
         'threads',
         <String, Object?>{
-          'summary': summary,
+          'summary': _seal(summary),
           'summary_checkpoint': summary == null ? null : checkpoint,
         },
         where: 'id = ?',
@@ -409,8 +432,8 @@ class ChatStore {
       limit: 1,
     );
     if (rows.isEmpty) return null;
-    final raw = rows.first['lock_json'];
-    if (raw is! String || raw.isEmpty) return null;
+    final raw = _open(rows.first['lock_json'] as String?);
+    if (raw == null || raw.isEmpty) return null;
     try {
       return ThreadLock.fromJson(jsonDecode(raw));
     } catch (_) {
@@ -435,7 +458,8 @@ class ChatStore {
   Future<void> setLock(String threadId, ThreadLock? lock) => _db.update(
         'threads',
         <String, Object?>{
-          'lock_json': lock == null ? null : jsonEncode(lock.toJson()),
+          'lock_json':
+              lock == null ? null : _seal(jsonEncode(lock.toJson())),
         },
         where: 'id = ?',
         whereArgs: <Object?>[threadId],
@@ -460,8 +484,8 @@ class ChatStore {
     final now = DateTime.now().millisecondsSinceEpoch;
     await _db.insert('threads', <String, Object?>{
       'id': id,
-      'title': title,
-      'preview': firstMessage,
+      'title': _seal(title),
+      'preview': _seal(firstMessage),
       'updated_at': now,
       'terminal_mode': terminalMode ? 1 : 0,
     });
@@ -471,7 +495,7 @@ class ChatStore {
   Future<void> renameThread(String threadId, String title) async {
     await _db.update(
       'threads',
-      <String, Object?>{'title': title},
+      <String, Object?>{'title': _seal(title)},
       where: 'id = ?',
       whereArgs: <Object?>[threadId],
     );
@@ -548,8 +572,8 @@ class ChatStore {
     // 段里存的是整段消息的 JSON，图片路径埋在每条消息的 images 字段里。
     for (final row
         in await _db.query('segments', columns: <String>['messages_json'])) {
-      final raw = row['messages_json'];
-      if (raw is! String) continue;
+      final raw = _open(row['messages_json'] as String?);
+      if (raw == null) continue;
       try {
         for (final message in jsonDecode(raw) as List) {
           if (message is Map) collect(message['images']);
@@ -709,20 +733,20 @@ class ChatStore {
         .map((row) => ChatMessage(
               messageId: row['id']! as int,
               role: row['role']! as String,
-              content: row['content']! as String,
+              content: _open(row['content'] as String?) ?? '',
               at: DateTime.fromMillisecondsSinceEpoch(
                 row['created_at']! as int,
               ),
-              outputRef: row['output_ref'] as String?,
+              outputRef: _open(row['output_ref'] as String?),
               checkpoint: row['checkpoint'] as int?,
-              source: row['source'] as String?,
-              images: _decodeImages(row['images'] as String?),
+              source: _open(row['source'] as String?),
+              images: _decodeImages(_open(row['images'] as String?)),
               usage: _decodeUsage(row),
-              reasoning: row['reasoning'] as String? ?? '',
+              reasoning: _open(row['reasoning'] as String?) ?? '',
               reasoningMs: row['reasoning_ms'] as int? ?? 0,
               branchId: row['branch_id'] as String?,
               toolName: row['tool_name'] as String?,
-              toolTitle: row['tool_title'] as String?,
+              toolTitle: _open(row['tool_title'] as String?),
               // 老消息这一列是 NULL。默认成功 —— 给一条没记过结果的历史
               // 记录画个红叉，比不画更误导。
               toolOk: (row['tool_ok'] as int? ?? 1) == 1,
@@ -744,33 +768,38 @@ class ChatStore {
     final keyword = query.trim();
     if (keyword.isEmpty) return const <ChatMessageSearchHit>[];
 
-    final escaped = keyword
-        .replaceAll(r'\', r'\\')
-        .replaceAll('%', r'\%')
-        .replaceAll('_', r'\_');
     final hits = <ChatMessageSearchHit>[];
-    final threadFilter = threadId == null ? '' : 'AND m.thread_id = ? ';
+    final threadFilter = threadId == null ? '' : 'WHERE m.thread_id = ? ';
+    // **不能再用 SQL 的 LIKE 了。** 内容是密文，`LIKE '%nginx%'` 匹配的是
+    // base64，永远命中不了。所以改成"取出来、解开、在 Dart 里筛"。
+    //
+    // 代价是要扫过这个范围里的每一行。可接受的理由：搜索是用户主动发起的
+    // 偶发动作，而不是每帧都跑的东西；扫的又是本地 sqlite，几千行是毫秒级。
+    // 加一个硬上限兜住极端情况 —— 一个攒了几十万条的库不该让搜索卡死。
     final rows = await _db.rawQuery(
       'SELECT m.id AS message_id, m.thread_id, m.role, m.content, '
       'm.created_at, t.title AS thread_title '
       'FROM messages m '
       'INNER JOIN threads t ON t.id = m.thread_id '
-      "WHERE m.content LIKE ? ESCAPE '\\' "
       '$threadFilter'
       'ORDER BY m.id DESC LIMIT ?',
       <Object?>[
-        '%$escaped%',
         if (threadId != null) threadId,
-        limit,
+        _searchScanLimit,
       ],
     );
+    final needle = keyword.toLowerCase();
     for (final row in rows) {
-      final content = row['content']! as String;
-      if (!content.toLowerCase().contains(keyword.toLowerCase())) continue;
+      if (hits.length >= limit) break;
+      final content = _open(row['content'] as String?);
+      // 解不开的行跳过，不要当成"内容为空"塞进结果里 —— 一条空搜索结果
+      // 点进去什么都没有，比不出现更让人困惑。
+      if (content == null) continue;
+      if (!content.toLowerCase().contains(needle)) continue;
       hits.add(ChatMessageSearchHit(
         threadId: row['thread_id']! as String,
         messageId: row['message_id']! as int,
-        threadTitle: row['thread_title']! as String,
+        threadTitle: _open(row['thread_title'] as String?) ?? '',
         role: row['role']! as String,
         message: content,
         createdAt: DateTime.fromMillisecondsSinceEpoch(
@@ -779,6 +808,94 @@ class ChatStore {
       ));
     }
     return hits;
+  }
+
+  /// 清空全部对话。
+  ///
+  /// 只在"忘了数据库密码"那一条路上用：那些密文再也解不开了，留着只是占地方
+  /// 和让人误以为还有救。**只清对话相关的四张表** —— 渠道、皮肤、设置都在
+  /// prefs 里，和这把钥匙无关，不该被连坐。
+  Future<void> wipeConversations() async {
+    await _db.transaction((txn) async {
+      for (final table in const <String>[
+        'branches',
+        'segments',
+        'messages',
+        'threads',
+      ]) {
+        await txn.delete(table);
+      }
+    });
+    // 删完把空间还给文件系统。这一步之后旧密文才真的从磁盘上消失 ——
+    // 光删行的话它们还躺在空闲页里。
+    await _db.execute('VACUUM');
+  }
+
+  /// 一次搜索最多扫多少行。见 [searchMessages]。
+  static const _searchScanLimit = 20000;
+
+  /// 把库里还是明文的那些内容列就地加密。
+  ///
+  /// ## 为什么可以中途断电
+  ///
+  /// 一行一行走，每行**先看它是不是已经加密过**（[DbCipher.isSealed]），
+  /// 是就跳过。所以断在任何一步，库里都是"一部分密文 + 一部分明文"，而
+  /// [_open] 对明文原样放行 —— app 照常能读，下次启动接着搬没搬完的那些。
+  ///
+  /// 没有"迁移完成"这个标记，也不需要：判据是每一行自己的状态，不是一个
+  /// 可能和现实对不上的开关。
+  ///
+  /// 返回改写了多少行。
+  Future<int> encryptExisting() async {
+    final cipher = _cipher;
+    if (cipher == null) return 0;
+    var changed = 0;
+
+    Future<void> sweep(
+      String table,
+      List<String> columns,
+      String idColumn,
+    ) async {
+      final rows = await _db.query(table, columns: <String>[idColumn, ...columns]);
+      for (final row in rows) {
+        final update = <String, Object?>{};
+        for (final column in columns) {
+          final raw = row[column];
+          // 已经是密文的跳过 —— 再 seal 一次就是双层加密，读出来是一段
+          // base64 而不是正文，而且**不可逆地**错下去。
+          if (raw is! String || DbCipher.isSealed(raw)) continue;
+          update[column] = cipher.seal(raw);
+        }
+        if (update.isEmpty) continue;
+        await _db.update(
+          table,
+          update,
+          where: '$idColumn = ?',
+          whereArgs: <Object?>[row[idColumn]],
+        );
+        changed++;
+      }
+    }
+
+    await sweep(
+      'threads',
+      <String>['title', 'preview', 'system_prompt', 'summary', 'lock_json'],
+      'id',
+    );
+    await sweep(
+      'messages',
+      <String>[
+        'content',
+        'reasoning',
+        'tool_title',
+        'images',
+        'source',
+        'output_ref',
+      ],
+      'id',
+    );
+    await sweep('segments', <String>['messages_json'], 'hash');
+    return changed;
   }
 
   /// 三列合成一个 [TokenUsage]。全为 NULL（老消息、或服务端没回报）时返回
@@ -799,28 +916,28 @@ class ChatStore {
     await _db.insert('messages', <String, Object?>{
       'thread_id': threadId,
       'role': message.role,
-      'content': message.content,
+      'content': _seal(message.content),
       'created_at': message.at.millisecondsSinceEpoch,
-      'output_ref': message.outputRef,
+      'output_ref': _seal(message.outputRef),
       'checkpoint': message.checkpoint,
-      'source': message.source,
-      'images': _encodeImages(message.images),
+      'source': _seal(message.source),
+      'images': _seal(_encodeImages(message.images)),
       'tokens_in': message.usage?.input,
       'tokens_out': message.usage?.output,
       'tokens_cached': message.usage?.cached,
       'tokens_estimated': (message.usage?.estimated ?? false) ? 1 : 0,
-      'reasoning': message.reasoning.isEmpty ? null : message.reasoning,
+      'reasoning': _seal(message.reasoning.isEmpty ? null : message.reasoning),
       'reasoning_ms': message.reasoningMs == 0 ? null : message.reasoningMs,
       'branch_id': message.branchId,
       'tool_name': message.toolName,
-      'tool_title': message.toolTitle,
+      'tool_title': _seal(message.toolTitle),
       'tool_ok': message.toolOk ? 1 : 0,
       'tool_ms': message.toolMs == 0 ? null : message.toolMs,
     });
     await _db.update(
       'threads',
       <String, Object?>{
-        'preview': message.content,
+        'preview': _seal(message.content),
         'updated_at': message.at.millisecondsSinceEpoch,
       },
       where: 'id = ?',
@@ -932,7 +1049,7 @@ class ChatStore {
         if (known.isEmpty) {
           await txn.insert('segments', <String, Object?>{
             'hash': hash,
-            'messages_json': json,
+            'messages_json': _seal(json),
             'ref_count': 1,
           });
         } else {
@@ -996,7 +1113,9 @@ class ChatStore {
       <Object?>[branchId, index],
     );
     if (rows.isEmpty) return null;
-    return _decodeSegment(rows.first['json']! as String);
+    final json = _open(rows.first['json'] as String?);
+    if (json == null || json.isEmpty) return const <ChatMessage>[];
+    return _decodeSegment(json);
   }
 
   /// 把某个版本标成当前正在看的那个。只记账，不动 messages 表 ——
@@ -1026,21 +1145,22 @@ class ChatStore {
         final id = await txn.insert('messages', <String, Object?>{
           'thread_id': threadId,
           'role': message.role,
-          'content': message.content,
+          'content': _seal(message.content),
           'created_at': message.at.millisecondsSinceEpoch,
-          'output_ref': message.outputRef,
+          'output_ref': _seal(message.outputRef),
           'checkpoint': message.checkpoint,
-          'source': message.source,
-          'images': _encodeImages(message.images),
+          'source': _seal(message.source),
+          'images': _seal(_encodeImages(message.images)),
           'tokens_in': message.usage?.input,
           'tokens_out': message.usage?.output,
           'tokens_cached': message.usage?.cached,
           'tokens_estimated': (message.usage?.estimated ?? false) ? 1 : 0,
-          'reasoning': message.reasoning.isEmpty ? null : message.reasoning,
+          'reasoning':
+              _seal(message.reasoning.isEmpty ? null : message.reasoning),
           'reasoning_ms': message.reasoningMs == 0 ? null : message.reasoningMs,
           'branch_id': message.branchId,
           'tool_name': message.toolName,
-          'tool_title': message.toolTitle,
+          'tool_title': _seal(message.toolTitle),
           'tool_ok': message.toolOk ? 1 : 0,
           'tool_ms': message.toolMs == 0 ? null : message.toolMs,
         });

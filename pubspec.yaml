@@ -25,6 +25,12 @@ dependencies:
   # SnapshotStore 的 content-addressed 对象名；
   # DistroManager 校验下载的 rootfs
   crypto: ^3.0.3
+
+  # 数据库列的 AES-GCM 加密（见 data/db_cipher.dart）。
+  # 纯 Dart —— 这一点是刻意的：SQLCipher 那条路要原生库，而桌面上没有
+  # Windows 版，等于整套数据库测试都跑不了。宁可范围窄一点，也不能
+  # 交一个自己验证不了的加密改动。
+  pointycastle: ^3.9.1
   # AccumulatorSink —— 分块算 sha256，130MB 的 rootfs 不整包进内存
   convert: ^3.1.1
 

@@ -1,8 +1,9 @@
 /// 会话锁的三个界面：设锁、开锁、找回。
 ///
 /// 三个都在这一个文件里，因为它们共用同一套措辞和同一条底线 ——
-/// **这道锁不是加密**（见 thread_lock.dart 开头）。措辞散到三个文件里，
-/// 迟早有一处会写成"已加密"，而那正是最不该说错的地方。
+/// **这道锁不另建一把钥匙**（见 thread_lock.dart 开头）。措辞散到三个文件
+/// 里，迟早有一处会把它说成"这段对话被单独加密了"，而那正是最不该说错的
+/// 地方：说错了，用户会按一个不存在的保证来决定往里面放什么。
 library;
 
 import 'package:flutter/material.dart';
@@ -175,7 +176,8 @@ class _ThreadLockSetupPageState extends State<ThreadLockSetupPage> {
           const SizedBox(height: 4),
           Text(
             '内置的几道不够用、或者你想问一件只有自己知道的事，就自己写。'
-            '这一类的答案会存下来（模糊匹配要拿原文比），别写敏感内容。',
+            '这一类的答案会**原样存下来**（模糊匹配要拿原文比）——'
+            '跟着数据库一起加密，但知道 app 密码的人读得到，别拿它当保险箱。',
             style: TextStyle(fontSize: 11.5, color: t.tintTertiary),
           ),
           const SizedBox(height: 10),
@@ -621,8 +623,10 @@ class _Disclaimer extends StatelessWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              '这是一道锁，不是加密。它挡的是别人拿起你的手机点进来；'
-              '消息在数据库里仍然是明文，能读到手机文件的人照样看得到。',
+              '对话记录本来就是加密存的（用你的 app 密码），拿到手机文件的人'
+              '读不到。这道锁多挡一层：手机已经解锁、app 已经打开的时候 —— '
+              '比如把手机借出去的那几分钟。\n'
+              '它不是第二把钥匙：知道 app 密码的人仍然读得到。',
               style: TextStyle(fontSize: 11.5, color: t.tintPrimary),
             ),
           ),

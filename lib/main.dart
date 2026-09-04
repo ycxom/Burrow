@@ -21,6 +21,7 @@ import 'src/context/memory_retrieval.dart';
 import 'src/context/output_distiller.dart';
 import 'src/context/overflow_manager.dart';
 import 'src/data/chat_store.dart';
+import 'src/data/db_cipher.dart';
 import 'src/data/task_runtime.dart';
 import 'src/llm/embeddings.dart';
 import 'src/llm/llm_client.dart';
@@ -39,6 +40,7 @@ import 'src/settings/settings_store.dart';
 import 'src/settings/thread_lock.dart';
 import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
+import 'src/ui/database_gate.dart';
 import 'src/ui/liquid_glass.dart';
 import 'src/ui/skin_store.dart';
 
@@ -101,6 +103,80 @@ Future<void> main() async {
       native: native,
     ),
   ));
+}
+
+/// prefs 里存密钥材料的两个键。
+///
+/// **盐和校验值都跟着备份走**，密钥本身不落盘 —— 那正是"换手机能读、
+/// 拿到备份不能读"的分界线。
+const _dbSaltKey = 'burrow.db.salt';
+const _dbCheckKey = 'burrow.db.check';
+
+/// 安全存储里缓存的那把钥匙。
+///
+/// 由系统（Android Keystore）保管，**不跟着备份走** —— 所以到了新手机上
+/// 它自然是空的，于是会问一次密码。这不是缺陷，是这套方案成立的原因。
+const _dbKeyCache = 'burrow.db.key';
+
+/// 拿到数据库密钥。拿不到就弹一道门问用户。
+Future<DbCipher> _unlockDatabase(
+  SharedPreferences prefs,
+  ChatStore chats,
+) async {
+  const secure = FlutterSecureStorage();
+  var salt = prefs.getString(_dbSaltKey);
+  var check = prefs.getString(_dbCheckKey);
+
+  // 日常这条路：钥匙在安全存储里，一句都不用问。
+  if (salt != null && check != null) {
+    try {
+      final cached = DbCipher.fromHex(await secure.read(key: _dbKeyCache));
+      if (cached != null && DbKeyCheck.verify(cached, check)) return cached;
+    } catch (_) {
+      // 安全存储读不出来（换过设备、系统重置过密钥库）就当没有，走下面问密码。
+    }
+  }
+
+  final creating = salt == null || check == null;
+  if (creating) {
+    salt = DbCipher.newSalt();
+    await prefs.setString(_dbSaltKey, salt);
+  }
+
+  final completer = Completer<DbCipher>();
+  runApp(DatabaseGateApp(
+    mode: creating ? DatabaseGateMode.create : DatabaseGateMode.unlock,
+    salt: salt,
+    check: check,
+    onUnlocked: (cipher) async {
+      // 校验值只在第一次写。之后它是"密码对不对"的唯一判据，
+      // 每次启动重写一遍等于把任何一个输错的密码都变成正确答案。
+      if (creating) {
+        await prefs.setString(_dbCheckKey, DbKeyCheck.make(cipher));
+      }
+      try {
+        await secure.write(key: _dbKeyCache, value: cipher.keyHex);
+      } catch (_) {
+        // 缓存不上只是以后每次启动都要输一遍，不影响能不能用。
+      }
+      if (!completer.isCompleted) completer.complete(cipher);
+    },
+    onReset: () async {
+      // 忘了密码 = 那些密文永远打不开了。清掉重来，并且**换一份新的盐** ——
+      // 沿用旧盐的话，新密码派生出来的钥匙会去撞一堆解不开的旧数据。
+      await chats.wipeConversations();
+      final fresh = DbCipher.newSalt();
+      await prefs.setString(_dbSaltKey, fresh);
+      await prefs.remove(_dbCheckKey);
+      try {
+        await secure.delete(key: _dbKeyCache);
+      } catch (_) {}
+      // 重新走一遍这道门，这次是"设一个新密码"。
+      final again = await _unlockDatabase(prefs, chats);
+      if (!completer.isCompleted) completer.complete(again);
+    },
+  ));
+  return completer.future;
 }
 
 /// APK 里随包出厂的原生件。
@@ -242,6 +318,15 @@ Future<void> _boot({
       .listen((_) => channels.registry = modelRegistry.registry);
   unawaited(modelRegistry.refresh());
   final chats = await ChatStore.open();
+
+  // 数据库密钥。拿不到就先弹一道门问密码，拿到了才往下走。
+  final cipher = await _unlockDatabase(legacyPrefs, chats);
+  chats.useCipher(cipher);
+  // 还是明文的那些行就地搬成密文。**不 await 之前不能让用户开始用** ——
+  // 边写边搬会让新写进去的行和正在搬的行撞在一起。它一行一行走，
+  // 中途断了下次接着搬（见 ChatStore.encryptExisting）。
+  final migrated = await chats.encryptExisting();
+  if (migrated > 0) debugPrint('burrow: 加密了 $migrated 行历史数据');
 
   // 会话锁的"这次运行开过哪些"。只活在内存里 —— 落盘的话开过一次就一直
   // 开着，这道锁只在第一次有用。
