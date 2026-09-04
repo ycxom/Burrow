@@ -193,6 +193,17 @@ Map<String, String> geminiAuthHeaders(String apiKey, {String apiFormat = 'openAI
 }
 
 /// 协议在界面上的名字。报错信息要跟界面上的按钮对得上，否则用户不知道该点哪。
+/// Code Assist 能用的模型。**写死的，不是拉回来的。**
+///
+/// 那个接口没有列表端点（见 [fetchModels] 里的说明），所以只能给一份已知
+/// 可用的。列少了不影响使用：选择器允许手填，填什么就发什么 —— 而列一堆
+/// 猜出来的名字才是真麻烦，用户挑中一个不存在的，得到的是一次莫名其妙的
+/// 400，还看不出是自己挑错了。
+const codeAssistModels = <String>[
+  'gemini-2.5-pro',
+  'gemini-2.5-flash',
+];
+
 String geminiProtocolLabel(String apiFormat) => switch (apiFormat) {
       'geminiNative' => 'Gemini 原生',
       'gemini' => 'Code Assist',
@@ -376,6 +387,21 @@ Future<List<FetchedModel>> fetchModels({
   http.Client? client,
   Duration timeout = const Duration(seconds: 15),
 }) async {
+  // Code Assist 没有列模型这个接口。
+  //
+  // `v1internal` 是个 RPC 面：只有 `:loadCodeAssist`、`:generateContent`
+  // 这种带冒号的方法，没有 REST 的 `/models` 集合。照 OpenAI 那套去猜路径，
+  // 结果只能是两条 404 —— 而用户看到的是"获取模型列表失败"，会以为登录或者
+  // 地址配错了，跑去反复重登。
+  //
+  // 所以这一档直接给一份内置清单，不发请求。清单不全没关系：选择器允许
+  // 手填，填的名字会原样发给服务端。
+  if (apiFormat == 'gemini') {
+    return <FetchedModel>[
+      for (final id in codeAssistModels) FetchedModel(id, ownedBy: 'google'),
+    ];
+  }
+
   final candidates = buildModelsUrlCandidates(
     baseUrl,
     override: override,

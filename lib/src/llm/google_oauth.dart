@@ -10,11 +10,12 @@
 ///
 /// 所以这一家走回跳。文件头那三条顾虑分别是这么处理的：
 ///
-///   - **不用注册自定义 scheme。** 回跳目标是 `http://127.0.0.1:<随机端口>`，
+///   - **不用注册自定义 scheme。** 回跳目标是
+///     `http://localhost:51121/oauth-callback`，
 ///     不是 `burrow://`。Android 不保证 scheme 唯一，谁都能注册一个同名的把
 ///     授权码抢走；回环地址没有这个问题，它只可能回到本机。
-///   - **端口随机取，不写死。** `bind(port: 0)` 让内核挑一个空闲的，
-///     不会和别的 app 撞。服务器只活到收到那一次回跳为止。
+///   - **端口固定为 51121。** 这是 Antigravity OAuth 客户端登记的回跳地址；
+///     服务器只监听回环网卡，并且只活到收到本次登录的有效回跳为止。
 ///   - **换设备登不了。** 这是回跳相对设备码真实的损失：授权必须在这台机器的
 ///     浏览器里完成。接受它，因为另一条路根本到不了终点。
 ///
@@ -27,35 +28,15 @@
 /// 登录拿到的是同一个 Google 账号，但之后打哪个接口是两回事：
 ///
 ///   - [GoogleCodeAssistFlow]：`cloudcode-pa.googleapis.com/v1internal`，
-///     gemini-cli 用的那套。**这是个未公开的内部接口**，而"随时可以改"这件事
-///     已经发生了 —— 见下面那段。
+///     Antigravity / Code Assist 使用的内部接口。
 ///   - [GoogleVertexFlow]：Vertex AI 的 OpenAI 兼容端点。有正式文档、稳定，
 ///     但要用户自己的 GCP 项目和区域，而且要开通计费。
 ///
-/// ## Code Assist 的免费额度已经关了（2026-09 实测）
+/// ## Antigravity 兼容
 ///
-/// 拿一个 Google AI Pro 账号登录后，`:loadCodeAssist` 返回的是：
-///
-/// ```json
-/// {
-///   "allowedTiers":   [{ "id": "standard-tier",
-///                        "userDefinedCloudaicompanionProject": true }],
-///   "ineligibleTiers":[{ "tierId": "free-tier",
-///                        "reasonCode": "UNSUPPORTED_CLIENT",
-///                        "reasonMessage": "This client is no longer supported
-///                          for Gemini Code Assist for individuals…" }]
-/// }
-/// ```
-///
-/// 也就是说 Google 把 gemini-cli 这类客户端从"个人免费额度"里切掉了，唯一放行
-/// 的 `standard-tier` 还要求绑自己的 GCP 项目 —— 恰好是这条路原本宣称不需要的
-/// 那个东西。**和用户是不是 Pro 无关**：AI Pro 是消费级订阅，Code Assist 的
-/// 档位是另一套。
-///
-/// 这条路**没有删掉**，因为：这是拿一个账号 + 内嵌客户端测出来的结论，换个
-/// 账号或换成自己注册的客户端未必一样；而且 Google 收紧过也可能放开。但界面
-/// 上的文案必须说实话，不能继续承诺一个已经拿不到的东西 —— 见 [modeName]
-/// 和 [hint]。想用 Gemini，现在能走通的是 API Key（OpenAI 兼容层）或 Vertex。
+/// 这里使用 Antigravity 的 OAuth 客户端、固定回跳地址和完整 scope 集合。授权码
+/// 换成 token 后还会走 `tokeninfo` 与 `userinfo`，验证客户端归属、scope、有效期
+/// 和账号邮箱；只有这些检查全部通过，UI 才会显示登录成功。
 ///
 /// 做成两个 provider 而不是一个带开关的：它们的 `apiBaseUrl` 和 `apiFormat`
 /// 都不一样，而这两样正是 provider 存在的意义。合成一个的话，每个用到
@@ -77,9 +58,9 @@ import 'oauth.dart';
 
 /// OAuth 客户端凭据。
 ///
-/// Google 不发公共客户端，必须注册一个。内嵌的是 gemini-cli 的公开凭据 ——
-/// 它随 gemini-cli 一起分发，本来就是公开的（"installed application" 类型的
-/// secret 按 OAuth 规范就不是秘密），但那毕竟是 Google 发给 gemini-cli 的，
+/// Google 不发公共客户端，必须注册一个。内嵌的是 Antigravity 桌面端公开凭据 ——
+/// 它随 Antigravity 一起分发，本来就是公开的（"installed application" 类型的
+/// secret 按 OAuth 规范就不是秘密），但那毕竟是 Google 发给 Antigravity 的，
 /// **我们属于借用**：Google 可以吊销它，届时所有人的登录会同时失效。
 ///
 /// 所以留了覆盖口子：介意的人可以在 Google Cloud Console 建自己的
@@ -90,7 +71,7 @@ class GoogleOAuthClient {
   final String id;
   final String secret;
 
-  /// gemini-cli 随包分发的公开凭据。
+  /// Antigravity 随包分发的公开凭据。
   ///
   /// 这些值来自 lib/secrets/google_oauth.dart，它不被 git 追踪。
   /// 用户可以编辑那个文件切换到自己注册的 Google Cloud 项目凭据。
@@ -119,17 +100,48 @@ const googleFamily = 'google';
 
 /// Google 的 OAuth 端点。写死而不是走 discovery：Google 的这几个地址十年没动过，
 /// 而多一次 discovery 请求就多一个登录会卡住的地方。
-const _authEndpoint = 'https://accounts.google.com/o/oauth2/v2/auth';
+const _authEndpoint = 'https://accounts.google.com/o/oauth2/auth';
 const _tokenEndpoint = 'https://oauth2.googleapis.com/token';
+const _tokenInfoEndpoint = 'https://www.googleapis.com/oauth2/v3/tokeninfo';
+const _userInfoEndpoint = 'https://www.googleapis.com/oauth2/v2/userinfo';
 
-/// 两个后端都要 `cloud-platform`：Code Assist 和 Vertex 都认这个 scope。
-/// email / profile 只为了在界面上显示"登录为谁" —— 没有它账号列表里
-/// 只有一串数字 id。
-const _scopes = <String>[
+/// Antigravity 的 OAuth 客户端只登记了这个回跳地址，不能再让内核随机挑端口。
+const _redirectPort = 51121;
+const _redirectPath = '/oauth-callback';
+
+/// 实际用的回跳端口。**生产环境必须是 [_redirectPort]** —— 那是登记在
+/// Antigravity 客户端名下的地址，换一个 Google 直接 `redirect_uri_mismatch`。
+///
+/// 留这个口子只为测试：51121 落在 Windows 的 Hyper-V 保留端口段里
+/// （`netsh int ipv4 show excludedportrange` 能看到 51113–51212），在 Windows
+/// 上 bind 直接 `WSAEACCES`，整组回跳测试一个都跑不了。测试里换成 0 让内核
+/// 挑一个 —— 那一组测的是"授权地址拼得对不对、state 校不校"，和具体端口无关。
+@visibleForTesting
+int googleRedirectPort = _redirectPort;
+
+/// 把端口还原成生产值。测试的 tearDown 用。
+@visibleForTesting
+void resetGoogleRedirectPort() => googleRedirectPort = _redirectPort;
+
+/// Antigravity 当前请求的完整 scope 集合。
+const _antigravityScopes = <String>[
+  'email',
+  'profile',
+  'openid',
+  'https://www.googleapis.com/auth/aicode',
   'https://www.googleapis.com/auth/cloud-platform',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/cclog',
+  'https://www.googleapis.com/auth/experimentsandconfigs',
+];
+
+/// Vertex 不需要 Antigravity 的日志、实验配置和 AI Code 权限。
+const _vertexScopes = <String>[
   'openid',
+  'https://www.googleapis.com/auth/cloud-platform',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
 /// 本地回环服务器等回跳的上限。
@@ -140,24 +152,43 @@ const _redirectTimeout = Duration(minutes: 5);
 
 /// 回跳登录的共同部分。两个后端只是登录后打的接口不同，登录本身一模一样。
 class _GoogleAuthCore {
-  _GoogleAuthCore({required this.client, http.Client? httpClient})
-      : _http = httpClient ?? http.Client();
+  _GoogleAuthCore({
+    required this.client,
+    required List<String> scopes,
+    http.Client? httpClient,
+  })  : _scopes = scopes,
+        _http = httpClient ?? http.Client();
 
   final GoogleOAuthClient client;
+  final List<String> _scopes;
   final http.Client _http;
 
   static const _userAgent = 'burrow-google-oauth';
 
   Future<RedirectAuthSession> start() async {
-    // 端口交给内核挑。写死一个端口在手机上迟早撞上别的 app，
-    // 而撞上的表现是"登录页打开了，回来却卡住" —— 极难归因。
-    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-    final redirectUri = 'http://127.0.0.1:${server.port}/oauth2callback';
+    // Antigravity 的 OAuth 客户端把回跳 URI 固定在 localhost:51121。
+    // 只监听 IPv4 回环，不把这个临时端口暴露给局域网。
+    late final HttpServer server;
+    try {
+      server = await HttpServer.bind(
+        InternetAddress.loopbackIPv4,
+        googleRedirectPort,
+      );
+    } on SocketException catch (e) {
+      // 说人话。用户看到的原文是一句 `SocketException: ... errno = 98`，
+      // 而他真正需要知道的是"有别的程序占着这个端口"以及"该去关掉谁" ——
+      // 这个端口是 Antigravity 系客户端共用的，冲突的多半就是它们。
+      throw OAuthException(
+        'Google 登录要用本机的 $_redirectPort 端口接收回跳，但它被占用了。'
+        '常见原因是 Antigravity 或别的同系客户端正开着 —— 关掉再试。'
+        '（原始错误：${e.osError?.message ?? e.message}）',
+      );
+    }
+    final redirectUri = 'http://localhost:${server.port}$_redirectPath';
 
     final verifier = _randomUrlSafe(64);
-    final challenge = base64Url
-        .encode(_sha256(utf8.encode(verifier)))
-        .replaceAll('=', '');
+    final challenge =
+        base64Url.encode(_sha256(utf8.encode(verifier))).replaceAll('=', '');
     // state 防的是别的本机进程往我们的回环端口上塞一个它自己拿到的授权码。
     final state = _randomUrlSafe(24);
 
@@ -189,7 +220,7 @@ class _GoogleAuthCore {
         await for (final request in server) {
           final query = request.uri.queryParameters;
           // 浏览器还会请求 /favicon.ico 之类的，别把它当回跳。
-          if (!request.uri.path.startsWith('/oauth2callback')) {
+          if (request.method != 'GET' || request.uri.path != _redirectPath) {
             request.response.statusCode = HttpStatus.notFound;
             await request.response.close();
             continue;
@@ -199,44 +230,75 @@ class _GoogleAuthCore {
           final code = query['code'];
           final returned = query['state'];
 
-          String page;
-          if (error != null) {
-            page = _resultPage('登录被取消或失败', error);
-          } else if (returned != state) {
+          if (returned != state) {
             // 不把这次回跳当数：state 对不上意味着这个码不是我们发起的那次
             // 授权换来的。继续监听，真正的回跳可能还在路上。
-            page = _resultPage('这次回跳不属于本次登录', '已忽略');
-          } else if (code == null || code.isEmpty) {
-            page = _resultPage('回跳里没有授权码', '请重试');
-          } else {
-            page = _resultPage('登录成功', '可以关掉这个页面回到 Burrow 了');
+            request.response
+              ..statusCode = HttpStatus.badRequest
+              ..headers.contentType = ContentType.html
+              ..write(_resultPage('这次回跳不属于本次登录', '已忽略'));
+            await request.response.close();
+            continue;
           }
 
-          request.response
-            ..statusCode = HttpStatus.ok
-            ..headers.contentType = ContentType.html
-            ..write(page);
-          await request.response.close();
+          if (completer.isCompleted) {
+            request.response
+              ..statusCode = HttpStatus.conflict
+              ..headers.contentType = ContentType.html
+              ..write(_resultPage('本次登录已经结束', '请回到 Burrow 查看结果'));
+            await request.response.close();
+            continue;
+          }
 
-          if (completer.isCompleted) continue;
           if (error != null) {
-            completer.completeError(OAuthException('授权失败：$error'));
+            final description = query['error_description'];
+            final detail = description == null || description.isEmpty
+                ? error
+                : '$error：$description';
+            request.response
+              ..statusCode = HttpStatus.badRequest
+              ..headers.contentType = ContentType.html
+              ..write(_resultPage('登录被取消或失败', detail));
+            await request.response.close();
+            completer.completeError(OAuthException('授权失败：$detail'));
             await shutdown();
-          } else if (returned == state && code != null && code.isNotEmpty) {
-            try {
-              final credential = await _exchange(
-                code: code,
-                verifier: verifier,
-                redirectUri: redirectUri,
-              );
-              completer.complete(credential);
-            } catch (e) {
-              completer.completeError(
-                e is OAuthException ? e : OAuthException('$e'),
-              );
-            }
-            await shutdown();
+            continue;
           }
+
+          if (code == null || code.isEmpty) {
+            request.response
+              ..statusCode = HttpStatus.badRequest
+              ..headers.contentType = ContentType.html
+              ..write(_resultPage('回跳里没有授权码', '请重试'));
+            await request.response.close();
+            continue;
+          }
+
+          // 收到授权码还不等于登录成功。和 Antigravity 的 AuthResult 流程一样，
+          // 必须先让 Google 验证 access token、客户端归属、scope 和账号身份。
+          try {
+            final credential = await _exchange(
+              code: code,
+              verifier: verifier,
+              redirectUri: redirectUri,
+            );
+            request.response
+              ..statusCode = HttpStatus.ok
+              ..headers.contentType = ContentType.html
+              ..write(_resultPage('登录成功', '身份已经验证，可以回到 Burrow 了'));
+            await request.response.close();
+            completer.complete(credential);
+          } catch (e) {
+            final failure =
+                e is OAuthException ? e : OAuthException('验证登录失败：$e');
+            request.response
+              ..statusCode = HttpStatus.unauthorized
+              ..headers.contentType = ContentType.html
+              ..write(_resultPage('登录验证失败', failure.message));
+            await request.response.close();
+            completer.completeError(failure);
+          }
+          await shutdown();
         }
       } catch (e) {
         if (!completer.isCompleted) {
@@ -278,28 +340,31 @@ class _GoogleAuthCore {
     required String verifier,
     required String redirectUri,
   }) async {
-    final response = await _http.post(
-      Uri.parse(_tokenEndpoint),
-      headers: const {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': _userAgent,
-      },
-      body: {
-        'code': code,
-        'client_id': client.id,
-        // Google 的「桌面应用」客户端仍然要求带 secret，哪怕用了 PKCE。
-        // 这不符合 OAuth 对公共客户端的建议，但服务端就是这么校验的。
-        if (client.secret.isNotEmpty) 'client_secret': client.secret,
-        'code_verifier': verifier,
-        'grant_type': 'authorization_code',
-        'redirect_uri': redirectUri,
-      },
-    );
+    final response = await _describeNetworkFailure(() => _http.post(
+          Uri.parse(_tokenEndpoint),
+          headers: const {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': _userAgent,
+          },
+          body: {
+            'code': code,
+            'client_id': client.id,
+            // Google 的「桌面应用」客户端仍然要求带 secret，哪怕用了 PKCE。
+            // 这不符合 OAuth 对公共客户端的建议，但服务端就是这么校验的。
+            if (client.secret.isNotEmpty) 'client_secret': client.secret,
+            'code_verifier': verifier,
+            'grant_type': 'authorization_code',
+            'redirect_uri': redirectUri,
+          },
+        ));
     if (response.statusCode != 200) {
       throw OAuthException(
           '换取 token 失败：HTTP ${response.statusCode} ${_brief(response.body)}');
     }
-    return _credentialFrom(_decode(response), previousRefresh: null);
+    return _validateCredential(
+      _decode(response),
+      previousRefresh: null,
+    );
   }
 
   /// 问一次 Code Assist 的档位。
@@ -319,8 +384,18 @@ class _GoogleAuthCore {
           'Authorization': 'Bearer ${credential.accessToken}',
           'User-Agent': _userAgent,
         },
+        // 不再自称 `pluginType: GEMINI`。
+        //
+        // 那是 gemini-cli 的身份，而 Burrow 不是 gemini-cli —— 这个字段在
+        // Antigravity 的 proto 里也已经标了 `[deprecated = true]`，正是
+        // 「This client is no longer supported」指的那一个。填一个不属于自己的
+        // 身份既不诚实，也没让闸放行。
         body: jsonEncode(<String, Object?>{
-          'metadata': <String, Object?>{'pluginType': 'GEMINI'},
+          'metadata': <String, Object?>{
+            'ideType': 'ANTIGRAVITY',
+            'pluginType': 'PLUGIN_UNSPECIFIED',
+          },
+          'mode': 'FULL_ELIGIBILITY_CHECK',
         }),
       );
       if (response.statusCode != 200) {
@@ -348,51 +423,142 @@ class _GoogleAuthCore {
     if (token == null) {
       throw const OAuthException('没有 refresh_token，需要重新登录');
     }
-    final response = await _http.post(
-      Uri.parse(_tokenEndpoint),
-      headers: const {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': _userAgent,
-      },
-      body: {
-        'client_id': client.id,
-        if (client.secret.isNotEmpty) 'client_secret': client.secret,
-        'refresh_token': token,
-        'grant_type': 'refresh_token',
-      },
-    );
+    final response = await _describeNetworkFailure(() => _http.post(
+          Uri.parse(_tokenEndpoint),
+          headers: const {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': _userAgent,
+          },
+          body: {
+            'client_id': client.id,
+            if (client.secret.isNotEmpty) 'client_secret': client.secret,
+            'refresh_token': token,
+            'grant_type': 'refresh_token',
+          },
+        ));
     if (response.statusCode != 200) {
       throw OAuthException(
           '刷新失败，需要重新登录：HTTP ${response.statusCode} ${_brief(response.body)}');
     }
     // 刷新响应里**没有** refresh_token，要把旧的接着用。不接的话下一次
     // 刷新就没有凭据了，表现成"登录一小时后必掉线"。
-    return _credentialFrom(_decode(response), previousRefresh: token);
+    return _validateCredential(
+      _decode(response),
+      previousRefresh: token,
+    );
   }
 
-  static OAuthCredential _credentialFrom(
-    Map<String, Object?> json, {
+  /// 验证 token 端点返回的凭据。
+  ///
+  /// 不能只检查 JSON 里有没有 access_token：任何成功返回 JSON 的中间层都能
+  /// 塞进一个别的客户端、scope 不足或已经临近过期的 token。Antigravity 的
+  /// 后端同样会调用 tokeninfo/userinfo，再以 AuthResult.has_valid_auth 告诉 UI
+  /// 是否真的登录成功。
+  Future<OAuthCredential> _validateCredential(
+    Map<String, Object?> tokenJson, {
     required String? previousRefresh,
-  }) {
-    final accessToken = json['access_token'] as String?;
+  }) async {
+    final accessToken = _nonEmptyString(tokenJson['access_token']);
     if (accessToken == null) {
       throw const OAuthException('响应缺少 access_token');
     }
-    String? email;
-    final idToken = json['id_token'];
-    if (idToken is String) {
-      final claims = decodeJwtClaims(idToken) ?? const {};
-      final value = claims['email'];
-      if (value is String && value.isNotEmpty) email = value;
+
+    final tokenInfoResponse = await _describeNetworkFailure(() => _http.get(
+          Uri.parse(_tokenInfoEndpoint).replace(
+            queryParameters: <String, String>{'access_token': accessToken},
+          ),
+          headers: const {'User-Agent': _userAgent},
+        ));
+    if (tokenInfoResponse.statusCode != 200) {
+      throw OAuthException(
+        'Google 未接受 access token：HTTP ${tokenInfoResponse.statusCode} '
+        '${_brief(tokenInfoResponse.body)}',
+      );
     }
+    final tokenInfo = _decode(tokenInfoResponse);
+
+    // tokeninfo 的新格式用 azp，旧格式用 issued_to。它们表示拿到这个 token 的
+    // OAuth 客户端；不核对就可能把签给另一个应用的 token 当成 Burrow 登录。
+    final authorizedParty = _nonEmptyString(tokenInfo['azp']) ??
+        _nonEmptyString(tokenInfo['issued_to']);
+    if (authorizedParty == null) {
+      throw const OAuthException('Google tokeninfo 没有返回客户端标识');
+    }
+    if (authorizedParty != client.id) {
+      throw const OAuthException('access token 不是签发给当前 OAuth 客户端的');
+    }
+
+    final grantedScopes = _scopeSet(tokenInfo['scope']);
+    final missingScopes = _scopes
+        .where((scope) => !grantedScopes.contains(scope))
+        .toList(growable: false);
+    if (missingScopes.isNotEmpty) {
+      throw OAuthException('Google 授权缺少必要 scope：${missingScopes.join(', ')}');
+    }
+
+    final expiresIn = _int(
+      tokenInfo['expires_in'],
+      _int(tokenJson['expires_in'], 0),
+    );
+    if (expiresIn <= 0) {
+      throw const OAuthException('access token 已过期或没有有效期');
+    }
+
+    // 不再从未验证签名的 id_token payload 读取邮箱。userinfo 使用刚刚经过
+    // tokeninfo 验证的 access token，账号身份和实际授权令牌保持一致。
+    final userInfoResponse = await _describeNetworkFailure(() => _http.get(
+          Uri.parse(_userInfoEndpoint),
+          headers: <String, String>{
+            'Authorization': 'Bearer $accessToken',
+            'User-Agent': _userAgent,
+          },
+        ));
+    if (userInfoResponse.statusCode != 200) {
+      throw OAuthException(
+        '读取 Google 账号信息失败：HTTP ${userInfoResponse.statusCode} '
+        '${_brief(userInfoResponse.body)}',
+      );
+    }
+    final userInfo = _decode(userInfoResponse);
+    final email = _nonEmptyString(userInfo['email']);
+    if (email == null) {
+      throw const OAuthException('Google userinfo 没有返回邮箱');
+    }
+    final verified = userInfo['verified_email'] ?? userInfo['email_verified'];
+    if (verified == false || verified == 'false') {
+      throw const OAuthException('Google 账号邮箱尚未验证');
+    }
+
     return OAuthCredential(
       accessToken: accessToken,
-      refreshToken: json['refresh_token'] as String? ?? previousRefresh,
-      expiresAt: DateTime.now().add(
-        Duration(seconds: _int(json['expires_in'], 3600)),
-      ),
+      refreshToken:
+          _nonEmptyString(tokenJson['refresh_token']) ?? previousRefresh,
+      expiresAt: DateTime.now().add(Duration(seconds: expiresIn)),
       email: email,
     );
+  }
+
+  static String? _nonEmptyString(Object? value) {
+    if (value is! String) return null;
+    final trimmed = value.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
+  static Set<String> _scopeSet(Object? value) {
+    if (value is String) {
+      return value
+          .split(RegExp(r'\s+'))
+          .where((scope) => scope.isNotEmpty)
+          .toSet();
+    }
+    if (value is List) {
+      return value
+          .whereType<String>()
+          .map((scope) => scope.trim())
+          .where((scope) => scope.isNotEmpty)
+          .toSet();
+    }
+    return const <String>{};
   }
 
   static Map<String, Object?> _decode(http.Response response) {
@@ -436,9 +602,9 @@ class _GoogleAuthCore {
 AccountQuota parseCodeAssistTier(Map<String, Object?> json) {
   String? nameOf(Object? tier) {
     if (tier is! Map) return null;
-    final value = (tier['name'] ?? tier['tierName'] ?? tier['id'] ??
-            tier['tierId'])
-        ?.toString();
+    final value =
+        (tier['name'] ?? tier['tierName'] ?? tier['id'] ?? tier['tierId'])
+            ?.toString();
     return value == null || value.isEmpty ? null : value;
   }
 
@@ -460,9 +626,7 @@ AccountQuota parseCodeAssistTier(Map<String, Object?> json) {
         first is Map && first['userDefinedCloudaicompanionProject'] == true;
     return AccountQuota(
       plan: name,
-      detail: needsProject
-          ? '这个档位要绑定你自己的 GCP 项目才能用；$noUsage'
-          : noUsage,
+      detail: needsProject ? '这个档位要绑定你自己的 GCP 项目才能用；$noUsage' : noUsage,
     );
   }
 
@@ -494,16 +658,52 @@ AccountQuota parseCodeAssistTier(Map<String, Object?> json) {
 /// 必须有：不给页面的话浏览器会停在一个空白或报错的标签上，用户不知道该不该
 /// 切回 app。内联样式而不是外链，因为这一页是从回环服务器上发出来的，
 /// 拉不到任何外部资源。
-String _resultPage(String title, String detail) => '''
+/// 把网络层那些异常翻成一句用户能照着做的话。
+///
+/// 原样抛出去的是
+/// `ClientException with SocketException: Failed host lookup:
+/// 'oauth2.googleapis.com' (OS Error: No address associated with hostname,
+/// errno = 7)` —— 里面每个字都对，但它没告诉用户下一步该干什么。
+///
+/// 而这一类失败**几乎只有一个原因**：授权页是交给系统浏览器打开的（浏览器
+/// 可能挂着 VPN、走着自己的 DNS），而换 token 这一步是 **app 自己发的请求**，
+/// 走的是另一条路。浏览器打得开、这里连不上，是这两条路不一样造成的，
+/// 而修法就一个：把登录代理配上。
+Future<T> _describeNetworkFailure<T>(Future<T> Function() request) async {
+  try {
+    return await request();
+  } on OAuthException {
+    rethrow;
+  } on SocketException catch (e) {
+    throw OAuthException(_networkHint(e.osError?.message ?? e.message));
+  } on http.ClientException catch (e) {
+    throw OAuthException(_networkHint(e.message));
+  } on HandshakeException catch (e) {
+    throw OAuthException(_networkHint(e.message));
+  }
+}
+
+String _networkHint(String detail) => '连不上 Google 的认证服务器。\n\n'
+    '换 token 这一步是 Burrow 自己发的请求，不经过刚才那个浏览器 —— '
+    '所以浏览器能打开、这里却连不上，通常是没配登录代理。\n'
+    '到「渠道管理 → Google → 登录代理」填一个（比如 127.0.0.1:7890），'
+    '再登一次。\n\n'
+    '原始错误：$detail';
+
+String _resultPage(String title, String detail) {
+  final safeTitle = const HtmlEscape().convert(title);
+  final safeDetail = const HtmlEscape().convert(detail);
+  return '''
 <!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Burrow</title></head>
 <body style="margin:0;display:flex;align-items:center;justify-content:center;
 height:100vh;font-family:system-ui,-apple-system,sans-serif;background:#17212b;color:#fff">
 <div style="text-align:center;padding:24px">
-<div style="font-size:20px;font-weight:600;margin-bottom:8px">$title</div>
-<div style="font-size:14px;opacity:.7">$detail</div>
+<div style="font-size:20px;font-weight:600;margin-bottom:8px">$safeTitle</div>
+<div style="font-size:14px;opacity:.7">$safeDetail</div>
 </div></body></html>''';
+}
 
 String _randomUrlSafe(int bytes) {
   final random = Random.secure();
@@ -517,7 +717,7 @@ String _randomUrlSafe(int bytes) {
 /// 它），不必为 PKCE 再引一个。
 List<int> _sha256(List<int> data) => crypto.sha256.convert(data).bytes;
 
-/// Google 账号 + Code Assist 免费额度。
+/// Google 账号 + Antigravity / Code Assist。
 ///
 /// 这条路不需要用户有 GCP 项目：`:loadCodeAssist` 会返回一个 Google 替这个
 /// 账号托管的项目号，之后所有请求都用它。**代价是它是个未公开接口** ——
@@ -526,7 +726,11 @@ class GoogleCodeAssistFlow implements RedirectFlowProvider {
   GoogleCodeAssistFlow({
     GoogleOAuthClient client = GoogleOAuthClient.bundled,
     http.Client? httpClient,
-  }) : _core = _GoogleAuthCore(client: client, httpClient: httpClient);
+  }) : _core = _GoogleAuthCore(
+          client: client,
+          scopes: _antigravityScopes,
+          httpClient: httpClient,
+        );
 
   final _GoogleAuthCore _core;
 
@@ -536,16 +740,10 @@ class GoogleCodeAssistFlow implements RedirectFlowProvider {
   String get id => providerId;
 
   @override
-  String get displayName => 'Google 账号（Gemini Code Assist）';
+  String get displayName => 'Google 账号（Antigravity）';
 
-  /// 说实话，不承诺拿不到的东西。
-  ///
-  /// 原来这里写的是"登录即可用，不需要 API key 或 GCP 项目" —— 那句话现在是
-  /// 假的（见文件头）。留着它的代价是用户白登一次，然后撞上一个只说"参数无效"
-  /// 的错误；而这一行字本来就是他决定要不要点进去的唯一依据。
   @override
-  String get hint => '2026-09 实测：Google 已把这类客户端从个人免费额度里切掉，'
-      '多半登了也用不了。想用 Gemini 建议走 API Key 或 Vertex';
+  String get hint => '使用 Antigravity OAuth 登录；账号资格和可用档位由 Google 返回';
 
   @override
   String get family => googleFamily;
@@ -554,7 +752,7 @@ class GoogleCodeAssistFlow implements RedirectFlowProvider {
   String get familyName => 'Google 账号';
 
   @override
-  String get modeName => 'Code Assist（额度已受限）';
+  String get modeName => 'Antigravity / Code Assist';
 
   /// 问一次 `:loadCodeAssist` 拿档位。
   ///
@@ -589,7 +787,11 @@ class GoogleVertexFlow implements RedirectFlowProvider {
   GoogleVertexFlow({
     GoogleOAuthClient client = GoogleOAuthClient.bundled,
     http.Client? httpClient,
-  }) : _core = _GoogleAuthCore(client: client, httpClient: httpClient);
+  }) : _core = _GoogleAuthCore(
+          client: client,
+          scopes: _vertexScopes,
+          httpClient: httpClient,
+        );
 
   final _GoogleAuthCore _core;
 

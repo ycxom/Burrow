@@ -6,6 +6,7 @@ import 'package:burrow/src/agent/tools.dart';
 import 'package:burrow/src/context/overflow_manager.dart';
 import 'package:burrow/src/llm/gemini_protocol.dart';
 import 'package:burrow/src/llm/google_oauth.dart';
+import 'package:burrow/src/llm/model_catalog.dart';
 import 'package:burrow/src/llm/image_parts.dart';
 import 'package:burrow/src/llm/oauth.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -85,22 +86,78 @@ void main() {
   });
 
   group('回跳登录', () {
+    // 51121 落在 Windows 的 Hyper-V 保留端口段里（51113–51212），在 Windows
+    // 上 bind 直接 WSAEACCES —— 整组测试一个都跑不了。这里换成 0 让内核挑
+    // 一个：这一组测的是"授权地址拼得对不对、state 校不校、回跳解析对不对"，
+    // 和具体哪个端口无关。**端口本身固定在 51121 由下面单独一条钉住。**
+    setUp(() => googleRedirectPort = 0);
+    tearDown(resetGoogleRedirectPort);
+
+    const grantedGoogleScopes =
+        'email profile openid '
+        'https://www.googleapis.com/auth/aicode '
+        'https://www.googleapis.com/auth/cloud-platform '
+        'https://www.googleapis.com/auth/userinfo.email '
+        'https://www.googleapis.com/auth/userinfo.profile '
+        'https://www.googleapis.com/auth/cclog '
+        'https://www.googleapis.com/auth/experimentsandconfigs';
+
+    http.Client validatedGoogleClient({
+      String clientId = 'test-client',
+      String scopes = grantedGoogleScopes,
+      String email = 'user@example.com',
+      bool emailVerified = true,
+      String accessToken = 'at-1',
+      String? refreshToken = 'rt-1',
+      void Function(http.Request request)? onTokenRequest,
+    }) =>
+        MockClient((request) async {
+          if (request.url.host == 'oauth2.googleapis.com' &&
+              request.url.path == '/token') {
+            onTokenRequest?.call(request);
+            return http.Response(
+              jsonEncode(<String, Object?>{
+                'access_token': accessToken,
+                if (refreshToken != null) 'refresh_token': refreshToken,
+                'expires_in': 3600,
+              }),
+              200,
+            );
+          }
+          if (request.url.host == 'www.googleapis.com' &&
+              request.url.path == '/oauth2/v3/tokeninfo') {
+            expect(request.url.queryParameters['access_token'], accessToken);
+            return http.Response(
+              jsonEncode(<String, Object?>{
+                'azp': clientId,
+                'scope': scopes,
+                'expires_in': 3500,
+              }),
+              200,
+            );
+          }
+          if (request.url.host == 'www.googleapis.com' &&
+              request.url.path == '/oauth2/v2/userinfo') {
+            expect(request.headers['authorization'], 'Bearer $accessToken');
+            return http.Response(
+              jsonEncode(<String, Object?>{
+                'email': email,
+                'verified_email': emailVerified,
+              }),
+              200,
+            );
+          }
+          return http.Response('unexpected request: ${request.url}', 500);
+        });
+
     /// 走完整条路：起会话 → 解析授权地址 → 真的往回环端口发一次回跳 →
-    /// 拿到凭据。token 端点用 MockClient 顶掉，其余都是真的。
+    /// tokeninfo / userinfo 也走 MockClient，回环 HTTP 则是真的。
     Future<(RedirectAuthSession, Uri)> startSession({
       http.Client? tokenClient,
     }) async {
       final flow = GoogleCodeAssistFlow(
         client: const GoogleOAuthClient(id: 'test-client', secret: 'test-secret'),
-        httpClient: tokenClient ??
-            MockClient((request) async => http.Response(
-                  jsonEncode(<String, Object?>{
-                    'access_token': 'at-1',
-                    'refresh_token': 'rt-1',
-                    'expires_in': 3600,
-                  }),
-                  200,
-                )),
+        httpClient: tokenClient ?? validatedGoogleClient(),
       );
       final session = await flow.start();
       return (session, Uri.parse(session.authorizationUrl));
@@ -124,17 +181,27 @@ void main() {
       // 不强制同意屏的话，重复登录不会再下发 refresh_token。
       expect(q['prompt'], 'consent');
       expect(q['scope'], contains('cloud-platform'));
+      expect(q['scope'], contains('auth/aicode'));
+      expect(q['scope'], contains('auth/cclog'));
+      expect(q['scope'], contains('auth/experimentsandconfigs'));
 
       final redirect = Uri.parse(q['redirect_uri']!);
-      expect(redirect.host, '127.0.0.1');
-      expect(redirect.port, greaterThan(0));
-      expect(redirect.path, '/oauth2callback');
+      expect(redirect.host, 'localhost');
+      expect(redirect.path, '/oauth-callback');
+    });
+
+    test('生产环境的回跳端口固定是 51121', () {
+      // 这个值不能动：它是登记在 Antigravity OAuth 客户端名下的回跳地址，
+      // 换一个 Google 直接 redirect_uri_mismatch。上面那组为了能在 Windows
+      // 上跑把它改成了 0，所以真正的默认值必须在这里单独钉一次。
+      resetGoogleRedirectPort();
+      expect(googleRedirectPort, 51121);
     });
 
     test('每次登录的 verifier 和 state 都不一样', () async {
       final (a, uriA) = await startSession();
+      await a.cancel();
       final (b, uriB) = await startSession();
-      addTearDown(a.cancel);
       addTearDown(b.cancel);
       expect(
         uriA.queryParameters['code_challenge'],
@@ -149,17 +216,9 @@ void main() {
     test('带对 state 的回跳换出凭据', () async {
       late http.Request captured;
       final (session, uri) = await startSession(
-        tokenClient: MockClient((request) async {
-          captured = request;
-          return http.Response(
-            jsonEncode(<String, Object?>{
-              'access_token': 'at-1',
-              'refresh_token': 'rt-1',
-              'expires_in': 3600,
-            }),
-            200,
-          );
-        }),
+        tokenClient: validatedGoogleClient(
+          onTokenRequest: (request) => captured = request,
+        ),
       );
 
       final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
@@ -174,6 +233,7 @@ void main() {
       final credential = await session.result;
       expect(credential.accessToken, 'at-1');
       expect(credential.refreshToken, 'rt-1');
+      expect(credential.email, 'user@example.com');
       expect(credential.isExpired, isFalse);
 
       // 换 token 时必须带 verifier 和 secret —— Google 的桌面客户端
@@ -208,12 +268,99 @@ void main() {
       expect(done, isFalse);
     });
 
-    test('授权被拒时以 OAuthException 结束', () async {
+    test('带 error 但 state 不对的回跳也不能取消登录', () async {
+      final (session, uri) = await startSession();
+      addTearDown(session.cancel);
+      final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
+
+      final page = await http.get(
+        redirect.replace(
+          queryParameters: <String, String>{
+            'error': 'access_denied',
+            'error_description': '<script>not trusted</script>',
+            'state': 'wrong-state',
+          },
+        ),
+      );
+      expect(page.statusCode, 400);
+      expect(page.body, contains('不属于本次登录'));
+      expect(page.body, isNot(contains('<script>')));
+
+      var done = false;
+      unawaited(session.result.then(
+        (_) => done = true,
+        onError: (_) => done = true,
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(done, isFalse);
+    });
+
+    test('授权被拒时以 OAuthException 结束，错误描述会被转义', () async {
       final (session, uri) = await startSession();
       final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
-      await http.get(
-        redirect.replace(queryParameters: {'error': 'access_denied'}),
+      final page = await http.get(
+        redirect.replace(queryParameters: <String, String>{
+          'error': 'access_denied',
+          'error_description': '<script>not trusted</script>',
+          'state': uri.queryParameters['state']!,
+        }),
       );
+      expect(page.statusCode, 400);
+      // 断言的是**性质**，不是某一串确切的实体编码：`HtmlEscape` 默认那一档
+      // 连 `/` 都转（`&#47;`），所以 `&lt;/script&gt;` 这种写法永远对不上。
+      // 真正要保证的是"注入进不去、原文还看得见"。
+      expect(page.body, isNot(contains('<script>')));
+      expect(page.body, contains('&lt;script&gt;'));
+      expect(page.body, contains('not trusted'));
+      await expectLater(session.result, throwsA(isA<OAuthException>()));
+    });
+
+    test('token 属于别的 OAuth 客户端时不算登录成功', () async {
+      final (session, uri) = await startSession(
+        tokenClient: validatedGoogleClient(clientId: 'another-client'),
+      );
+      final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
+      final page = await http.get(redirect.replace(queryParameters: {
+        'code': 'auth-code',
+        'state': uri.queryParameters['state']!,
+      }));
+
+      expect(page.statusCode, 401);
+      expect(page.body, contains('登录验证失败'));
+      await expectLater(session.result, throwsA(isA<OAuthException>()));
+    });
+
+    test('token 缺少 cloud-platform scope 时不算登录成功', () async {
+      final (session, uri) = await startSession(
+        tokenClient: validatedGoogleClient(
+          scopes: grantedGoogleScopes.replaceAll(
+            'https://www.googleapis.com/auth/cloud-platform ',
+            '',
+          ),
+        ),
+      );
+      final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
+      final page = await http.get(redirect.replace(queryParameters: {
+        'code': 'auth-code',
+        'state': uri.queryParameters['state']!,
+      }));
+
+      expect(page.statusCode, 401);
+      expect(page.body, contains('缺少必要 scope'));
+      await expectLater(session.result, throwsA(isA<OAuthException>()));
+    });
+
+    test('userinfo 返回未验证邮箱时不算登录成功', () async {
+      final (session, uri) = await startSession(
+        tokenClient: validatedGoogleClient(emailVerified: false),
+      );
+      final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
+      final page = await http.get(redirect.replace(queryParameters: {
+        'code': 'auth-code',
+        'state': uri.queryParameters['state']!,
+      }));
+
+      expect(page.statusCode, 401);
       await expectLater(session.result, throwsA(isA<OAuthException>()));
     });
 
@@ -233,16 +380,12 @@ void main() {
       late http.Request captured;
       final flow = GoogleVertexFlow(
         client: const GoogleOAuthClient(id: 'cid', secret: 'sec'),
-        httpClient: MockClient((request) async {
-          captured = request;
-          return http.Response(
-            jsonEncode(<String, Object?>{
-              'access_token': 'at-2',
-              'expires_in': 3600,
-            }),
-            200,
-          );
-        }),
+        httpClient: validatedGoogleClient(
+          clientId: 'cid',
+          accessToken: 'at-2',
+          refreshToken: null,
+          onTokenRequest: (request) => captured = request,
+        ),
       );
       final refreshed = await flow.refresh(OAuthCredential(
         accessToken: 'old',
@@ -523,6 +666,43 @@ void main() {
       expect(decodeSseData('data: [DONE]'), isNull);
       expect(decodeSseData(': heartbeat'), isNull);
       expect(decodeSseData('data: not-json'), isNull);
+    });
+  });
+
+  group('Code Assist 的模型列表', () {
+    test('不发请求，直接给内置清单', () async {
+      var called = false;
+      final models = await fetchModels(
+        baseUrl: 'https://cloudcode-pa.googleapis.com/v1internal',
+        apiKey: 'token',
+        apiFormat: 'gemini',
+        client: MockClient((_) async {
+          called = true;
+          return http.Response('{}', 404);
+        }),
+      );
+
+      // v1internal 是个 RPC 面，没有 REST 的 /models 集合。照 OpenAI 那套猜
+      // 路径只会得到两条 404，而用户看到"获取模型列表失败"会以为是登录或
+      // 地址配错了，跑去反复重登。
+      expect(called, isFalse, reason: '这一档不该发任何请求');
+      expect(models.map((m) => m.id), containsAll(codeAssistModels));
+      expect(models, isNotEmpty);
+    });
+
+    test('别的协议照旧走网络', () async {
+      // 短路只能落在 Code Assist 这一档上 —— 顺手把别人也短路了的话，
+      // 那些渠道会永远列不出自己的模型。
+      var called = false;
+      await fetchModels(
+        baseUrl: 'http://gw:3000/v1',
+        apiKey: 'k',
+        client: MockClient((_) async {
+          called = true;
+          return http.Response('{"data":[{"id":"glm-5"}]}', 200);
+        }),
+      );
+      expect(called, isTrue);
     });
   });
 }
