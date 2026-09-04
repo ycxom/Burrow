@@ -102,4 +102,59 @@ void main() {
       expect(historyIndexOfVisible(<ChatMessage>[], list, 0), -1);
     });
   });
+
+  group('摘要分隔线的位置', () {
+    test('没摘过就不画 —— 返回 0，而不是"画在第 0 条前面"', () {
+      // 这条钉的是一个 release 才看得见的 bug：0 被当成位置用，于是列表
+      // 最前面插了一条没有对应消息的空行，画的时候取 visible[-1] 抛异常，
+      // 而 release 构建把抛异常的 widget 渲染成一块纯灰色方块 ——
+      // 表现是「聊天记录上方多出一大片灰色」，看不出和摘要有任何关系。
+      final a = msg('user', '你好');
+      final b = msg('assistant', '你好呀');
+      expect(summaryBoundaryIndex(<ChatMessage>[a, b], <ChatMessage>[a, b], 0),
+          0);
+    });
+
+    test('线画在被覆盖的最后一条之后', () {
+      final all = <ChatMessage>[
+        msg('user', '第一句'),
+        msg('assistant', '第一答'),
+        msg('user', '第二句'),
+        msg('assistant', '第二答'),
+      ];
+      // 前两条被摘要覆盖 → 线画在界面上第 2 条之前。
+      expect(summaryBoundaryIndex(all, all, 2), 2);
+    });
+
+    test('history 里夹着只给模型看的东西时，位置仍然对得上', () {
+      final u1 = msg('user', '第一句');
+      final a1 = msg('assistant', '第一答');
+      final injected = msg('system', '[检索到的记忆片段]');
+      final u2 = msg('user', '第二句');
+      // 注入的那条在界面上没有气泡（这里模拟界面把它滤掉的情况）。
+      final visible = <ChatMessage>[u1, a1, u2];
+      final history = <ChatMessage>[u1, a1, injected, u2];
+      // checkpoint 落在注入那条之后 —— 往前退一步才找到界面上有的 a1。
+      expect(summaryBoundaryIndex(visible, history, 3), 2);
+    });
+
+    test('整段都被覆盖时不画 —— 线下面什么都没有', () {
+      final all = <ChatMessage>[msg('user', '就一句'), msg('assistant', '就一答')];
+      // 画出来的话，用户看到一条线下面空空如也，只会以为消息没了。
+      expect(summaryBoundaryIndex(all, all, 2), 0);
+    });
+
+    test('两个列表对不上时宁可不画', () {
+      final visible = <ChatMessage>[msg('user', '甲'), msg('assistant', '乙')];
+      final history = <ChatMessage>[msg('user', '丙'), msg('assistant', '丁')];
+      // 猜一个位置画条线，比不画更糟。
+      expect(summaryBoundaryIndex(visible, history, 1), 0);
+    });
+
+    test('checkpoint 越界不抛', () {
+      final all = <ChatMessage>[msg('user', '甲'), msg('assistant', '乙')];
+      expect(summaryBoundaryIndex(all, all, 99), 0);
+      expect(summaryBoundaryIndex(<ChatMessage>[], all, 1), 0);
+    });
+  });
 }

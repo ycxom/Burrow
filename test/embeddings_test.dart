@@ -304,6 +304,45 @@ void main() {
       expect(hits.first.doc.source, 'h:0');
     });
 
+    test('换了嵌入后端就把旧向量全丢掉', () async {
+      // 不同模型的向量不在同一个空间里，混着算余弦得到的是无意义的数 ——
+      // 而且**不会报错**，只会一直召回莫名其妙的东西。
+      var backend = 'c1::bge-m3';
+      final retrieval = MemoryRetrieval(
+        embedder: (texts) async => [
+          for (final _ in texts) [1.0, 0.0]
+        ],
+        fingerprint: () => backend,
+      );
+
+      await retrieval.index([doc('h:0', 'a')]);
+      expect(retrieval.vectorIndex.keys, ['h:0']);
+
+      // 同名模型换了个渠道也算换 —— 那同样是两个空间。
+      backend = 'c2::bge-m3';
+      await retrieval.index([doc('h:0', 'a')]);
+      expect(retrieval.vectorIndex.keys, ['h:0']);
+      // 旧的那条是被重嵌过的，不是留下来的：清干净了才会再嵌一次。
+      expect(retrieval.lastEmbeddingError, isNull);
+    });
+
+    test('后端没变时不重嵌', () async {
+      var calls = 0;
+      final retrieval = MemoryRetrieval(
+        embedder: (texts) async {
+          calls++;
+          return [
+            for (final _ in texts) [1.0, 0.0]
+          ];
+        },
+        fingerprint: () => 'c1::bge-m3',
+      );
+      await retrieval.index([doc('h:0', 'a')]);
+      await retrieval.index([doc('h:0', 'a')]);
+      // 每轮全量重嵌等于每轮多付一次全量的钱。
+      expect(calls, 1);
+    });
+
     test('嵌入后端返回空列表（未配置）时不加向量路，也不报错', () async {
       final retrieval = MemoryRetrieval(embedder: (_) async => const []);
       await retrieval.index([doc('h:0', '安装 torch')]);

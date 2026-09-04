@@ -1382,59 +1382,70 @@ class ConfigurableLlmClient
   ///
   /// 非流式、低温度、不带工具 —— 摘要不该调用工具，带上 tools 只会诱导
   /// 某些模型在摘要任务里发起工具调用，产出一坨没法用的东西。
-  /// 摘要**永远不抛**。
+  /// 压缩历史用的一次性调用。
   ///
-  /// 它是一个尽力而为的优化：成功了上下文更短，失败了无非是窗口更满一点，
-  /// 下一轮 ContextLimitGuard 会接手。而它是在用户的对话回合中间被调用的
-  /// —— 让它抛出去等于「摘要服务抽风 → 用户这句话直接失败」，
-  /// 那是把一个可降级的问题升级成了不可用。
+  /// **走 [complete] 那条已经分好协议的路，不自己再拼一遍请求体。**
   ///
-  /// 实测踩过一次：接口地址少了 `/v1`，打到网关前端页面，
-  /// 这里 `jsonDecode('<!doctype html>')` 抛 FormatException，
-  /// 整个回合挂掉，而用户看到的错误信息和真正的原因毫无关系。
+  /// 原来这里是手写的 OpenAI 请求，只特判了 ChatGPT OAuth。于是 Anthropic、
+  /// Gemini 原生、Vertex 三种渠道的摘要请求全打到了一个不存在的
+  /// `/chat/completions` 上 —— 404，然后被 catch 掉返回空串。表现是
+  /// 「滚动摘要一次都不生效」，而界面上没有任何迹象。
+  ///
+  /// 一份协议分派就够了。第二份迟早会跟不上，而它已经漏了三种。
+  ///
+  /// **失败会抛**（这一点也是改过的）。静默返回空串的话，[OverflowManager]
+  /// 分不清「摘出来是空的」和「根本没摘成」，而它对这两件事的处置完全不同：
+  /// 后者绝不能推进 checkpoint，否则那批消息被踢出窗口而没有摘要顶上 ——
+  /// 上下文凭空少一截，界面上还写着"还没有触发过摘要"。
+  ///
+  /// 降级仍然发生，只是挪了地方：由 [OverflowManager] 接住并保留原文。
+  /// 那里才分得清该怎么降级，这里只知道"请求没成功"。
   Future<String> summarize(String systemPrompt, String payload) async {
-    if (!config.isConfigured) return '';
+    if (!config.isConfigured) {
+      throw const SummarizeException('尚未配置模型服务');
+    }
+
+    // 同一个接入点、另一个模型。**共用底层 http 客户端** —— 连接和代理都是
+    // 现成的，另起一个只会多一次 TLS 握手；而且 _ownsClient 为假，
+    // 这个临时客户端不会去关掉别人的连接。
+    final aide = ConfigurableLlmClient(
+      config: config.copyWith(
+        model: config.summaryModelOrDefault,
+        // 摘要要的是稳定复述，不是发挥。
+        temperature: 0.1,
+        streamOutput: false,
+        // 载荷是纯文本。历史里的图片路径不该在这里被重新读一遍盘 ——
+        // 几张手机照片就是几 MB 的 IO，读出来只为了在下一步扔掉。
+        sendImagesInline: false,
+        // 联网搜索会让它跑去查资料而不是复述；思考会让它为一次压缩额外
+        // 烧一大截 token。两者都不该跟着主对话的设置走。
+        webSearch: false,
+        thinkingEffort: ThinkingEffort.auto,
+      ),
+      httpClient: _http,
+    )
+      ..bearerProvider = bearerProvider
+      ..chatGptAccountIdProvider = chatGptAccountIdProvider;
+
+    final now = DateTime.now();
     try {
-      if (config.isChatGptOAuth) {
-        final result = await _completeChatGpt(
-          messages: [
-            ChatMessage(
-                role: 'system', content: systemPrompt, at: DateTime.now()),
-            ChatMessage(role: 'user', content: payload, at: DateTime.now()),
-          ],
-          tools: const [],
-          onDelta: (_) {},
-          // 摘要只要正文。思考丢掉 —— 它是给用户看的过程，不是摘要的素材。
-          onReasoning: (_) {},
-          model: config.summaryModelOrDefault,
-        );
-        return result.text.trim();
-      }
-      final auth = await _authValue();
-      final response = await _http.post(
-        _endpoint(config.baseUrl, '/chat/completions'),
-        headers: {
-          'Content-Type': 'application/json',
-          if (auth.isNotEmpty) 'Authorization': 'Bearer $auth',
-        },
-        body: jsonEncode({
-          'model': config.summaryModelOrDefault,
-          'temperature': 0.1,
-          'messages': [
-            {'role': 'system', 'content': systemPrompt},
-            {'role': 'user', 'content': payload},
-          ],
-        }),
+      final turn = await aide.complete(
+        messages: <ChatMessage>[
+          ChatMessage(role: 'system', content: systemPrompt, at: now),
+          ChatMessage(role: 'user', content: payload, at: now),
+        ],
+        tools: const <ToolSpec>[],
+        onDelta: (_) {},
+        // 摘要只要正文。思考丢掉 —— 它是给用户看的过程，不是摘要的素材。
+        onReasoning: (_) {},
       );
-      if (response.statusCode >= 400) return '';
-      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
-      if (decoded is! Map<String, Object?>) return '';
-      final choices = decoded['choices'] as List?;
-      if (choices == null || choices.isEmpty) return '';
-      final msg = (choices.first as Map)['message'] as Map<String, Object?>?;
-      return (msg?['content'] as String?)?.trim() ?? '';
-    } catch (_) {
-      return '';
+      return turn.text.trim();
+    } on SummarizeException {
+      rethrow;
+    } catch (e) {
+      // 原样带上原因。这一条最终会显示给用户，而「404」和「密钥过期」
+      // 要做的事完全不同 —— 换成一句"摘要失败"就等于把唯一的线索丢了。
+      throw SummarizeException('$e');
     }
   }
 
@@ -1467,6 +1478,20 @@ class ConfigurableLlmClient
 
   static String _brief(String s) =>
       s.length > 300 ? '${s.substring(0, 300)}…' : s;
+}
+
+/// 压缩历史那次调用失败了。
+///
+/// 单独一个类型而不是复用 [LlmConnectionException]：调用方
+/// （[OverflowManager]）要按"摘要没成"来降级，而不是按"网络坏了"——
+/// 后者还包括地址填错、模型不认、密钥过期这些。
+class SummarizeException implements Exception {
+  final String message;
+
+  const SummarizeException(this.message);
+
+  @override
+  String toString() => message;
 }
 
 class LlmConnectionException implements Exception {

@@ -345,7 +345,7 @@ class AgentLoop {
     final preprocessor = vision;
     if (preprocessor == null) {
       throw const VisionUnavailableException('当前渠道的对话模型不认图，也没有配前置视觉模型。'
-          '到「渠道管理」里给某个渠道填一个视觉模型，'
+          '到「设置 → 模型分工」里指一个「图片转文字」模型，'
           '或者勾上「对话模型能直接看图」。');
     }
     host.onStatus('正在识别图片…');
@@ -434,8 +434,26 @@ class AgentLoop {
       images: images,
     ));
 
+    // 压缩排在检索**前面**：检索是把"被摘要挤出去的东西"捞回来，
+    // 而这一刻可能刚好有一批消息被挤出去。顺序反了的话，那一批要等到
+    // 下一轮才捞得到。
+    await _compact();
     await _retrieveInto(userInput);
     await _runRounds(epoch);
+  }
+
+  /// 发请求**之前**先压一次。
+  ///
+  /// 只在回合结束后压是不够的：那样「该被压缩的那一次请求」恰恰是没被
+  /// 压缩的那一次。任何一个刚从库里读回来的长会话都会撞上这个 ——
+  /// 摘要状态是 v12 才开始存的，在那之前的会话读回来一律是"还没摘过"，
+  /// 于是第一次发送就把整段历史原样发出去，而那正是最贵、也最容易直接
+  /// 撞上窗口上限的一刻。
+  ///
+  /// 回合结束后那一次仍然留着：一轮工具循环能往历史里塞进几十条消息，
+  /// 不在结束时压一次的话，它们要一直等到下一次发送。
+  Future<void> _compact() async {
+    _reportCompaction(await overflow.onMessageAdded(history));
   }
 
   /// 重新生成最后一条回复。
@@ -457,6 +475,7 @@ class AgentLoop {
       (message) => message.role == 'user',
       orElse: () => ChatMessage(role: 'user', content: '', at: DateTime.now()),
     );
+    await _compact();
     await _retrieveInto(anchor.content);
     await _runRounds(epoch);
   }
@@ -555,9 +574,7 @@ class AgentLoop {
         host.onToolEnd(done);
       }
 
-      if (await overflow.onMessageAdded(history)) {
-        host.onStatus('已整理长期记忆（摘要覆盖到第 ${overflow.checkpoint} 条）');
-      }
+      await _compact();
     }
 
     // 循环里那次**只有调用了工具的回合才走得到** —— 没有工具调用时
@@ -568,9 +585,21 @@ class AgentLoop {
     // 场景 —— 它没有工具输出可蒸馏，全是原文。
     //
     // 实测发现的：终端模式关掉后连聊十几轮，`overflow.checkpoint` 一直是 0。
-    if (await overflow.onMessageAdded(history)) {
+    await _compact();
+  }
+
+  /// 把压缩的结果说出来 —— **成功和失败都要说**。
+  ///
+  /// 失败原来是全静默的：摘要请求 404 了，用户看到的只是"聊久了越来越慢"，
+  /// 而设置页里那一行还写着「还没有触发过摘要」。两句话都对，合起来却指不到
+  /// 任何一个能查的方向。
+  void _reportCompaction(bool summarized) {
+    if (summarized) {
       host.onStatus('已整理长期记忆（摘要覆盖到第 ${overflow.checkpoint} 条）');
+      return;
     }
+    final why = overflow.takeUnreportedError();
+    if (why != null) host.onStatus('长期记忆整理失败，已保留原文：$why');
   }
 
   void cancel() {
@@ -587,6 +616,9 @@ class AgentLoop {
     if (index < 0) return;
     final input = history[index].content;
     history.removeRange(index, history.length);
+    // 历史短了，摘要的 checkpoint 要跟着收 —— 它是个下标，落在末尾之后的话
+    // 窗口里一条消息都不剩，模型当场失忆。
+    overflow.clampTo(history.length);
     await send(input);
   }
 
@@ -604,6 +636,7 @@ class AgentLoop {
     final target = history[index];
     final dropped = history.sublist(index).toList(growable: false);
     history.removeRange(index, history.length);
+    overflow.clampTo(history.length);
 
     // 老会话的消息没有检查点记录（v3 之前的库）。这时只截对话，
     // 并让调用方知道文件没回滚 —— 假装回滚过才是危险的。

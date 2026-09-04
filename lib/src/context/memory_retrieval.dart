@@ -174,6 +174,19 @@ class MemoryRetrieval {
   /// 手机上这很常见 —— 本地 embedding 模型要额外几十 MB。
   final Embedder? embedder;
 
+  /// 嵌入后端的身份：**渠道 + 模型**。变了就把已建的向量全丢掉。
+  ///
+  /// 不同模型的向量不在同一个空间里，混着算余弦得到的是无意义的数 ——
+  /// 而且**不会报错**，只会一直召回莫名其妙的东西。同名模型在两家服务商
+  /// 那里同样是两个空间，所以渠道也得进指纹。
+  ///
+  /// 做成这里自己检查，而不是让改设置的那个界面去 clear：换嵌入模型的入口
+  /// 不止一个（模型分工表、删掉那个渠道），漏掉任何一个都是同一种静默错误。
+  final String Function()? fingerprint;
+
+  /// 上一次建索引用的是哪个后端。null = 还没建过。
+  String? _indexedWith;
+
   /// 已建好索引的文档向量。键是 [MemoryDoc.source]。
   final Map<String, List<double>> vectorIndex;
 
@@ -183,8 +196,11 @@ class MemoryRetrieval {
   /// 上层拿这个把原因报到界面上 —— 静默失败已经坑过一次了（见 README 的 /v1）。
   String? lastEmbeddingError;
 
-  MemoryRetrieval({this.embedder, Map<String, List<double>>? vectorIndex})
-      : vectorIndex = vectorIndex ?? {};
+  MemoryRetrieval({
+    this.embedder,
+    this.fingerprint,
+    Map<String, List<double>>? vectorIndex,
+  }) : vectorIndex = vectorIndex ?? {};
 
   /// 给还没有向量的文档补上索引。**只嵌入新的** —— 语料是只增的
   /// （`history[0..checkpoint)`），每轮全量重嵌等于每轮多付一次全量的钱。
@@ -194,6 +210,14 @@ class MemoryRetrieval {
   Future<void> index(List<MemoryDoc> corpus) async {
     final embed = embedder;
     if (embed == null) return;
+
+    final current = fingerprint?.call() ?? '';
+    if (_indexedWith != null && _indexedWith != current) {
+      vectorIndex.clear();
+      lastEmbeddingError = null;
+    }
+    _indexedWith = current;
+
     final missing =
         corpus.where((d) => !vectorIndex.containsKey(d.source)).toList();
     if (missing.isEmpty) return;

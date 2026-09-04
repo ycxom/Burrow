@@ -27,12 +27,12 @@ import '../sandbox/pty_channel.dart';
 import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../llm/llm_client.dart';
-import '../llm/model_catalog.dart';
+import '../llm/thinking_effort.dart';
 import '../llm/vision.dart';
-import '../net/proxy_client.dart';
 import '../settings/settings_store.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
+import '../settings/model_roles.dart';
 import '../skills/skill_store.dart';
 import 'channels_page.dart';
 import 'chat_drawer.dart';
@@ -47,7 +47,9 @@ import 'message_index.dart';
 import 'interactive_terminal.dart';
 import 'chat_view.dart';
 import 'image_attachments.dart';
+import 'anchored_menu.dart';
 import 'model_bar.dart';
+import 'model_sources.dart';
 import 'settings_page.dart';
 import 'system_prompt_page.dart';
 import 'skills_page.dart';
@@ -669,7 +671,9 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> implements AgentHost {
+class _HomeShellState extends State<HomeShell>
+    with WidgetsBindingObserver
+    implements AgentHost {
   late final AgentLoop _agent;
   late final TaskRuntime _runtime;
   late final Terminal _terminal;
@@ -684,6 +688,11 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   /// 抽屉入口是我们自己 compose 的（见 _buildDrawerButton），所以要一个 key
   /// 才能从 AppBar 里够到 Scaffold。
   final _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  /// 两个浮层菜单的锚点。菜单从按钮所在的那个角展开，所以得知道按钮
+  /// 在屏幕上的位置（见 anchored_menu.dart）。
+  final _plusKey = GlobalKey();
+  final _terminalKey = GlobalKey();
 
   /// 列表是否已经滚离顶部。皮肤的 `header:scrolled` 状态靠它。
   /// 只在**跨过阈值**时 setState，不是每帧 —— 顶栏样式没有中间态。
@@ -773,6 +782,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     // 只是要杀进程重开才看得到，这是最难自证的一类"没生效"。
     widget.settings.addListener(_onSettingsChanged);
     _scroll.addListener(_onScroll);
+    // 切到别的 app 时把"读到哪儿"落盘。等 dispose 太晚 —— 被系统回收的
+    // 进程根本走不到那里，而"切出去一趟回来位置就没了"正是要修的事。
+    WidgetsBinding.instance.addObserver(this);
     _prepareRuntime();
   }
 
@@ -867,6 +879,17 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     if (id != null) {
       final messages = await widget.chats.messages(id);
       _agent.history.addAll(messages);
+      // 把上一次的滚动摘要接回来。不接的话 checkpoint 归 0，这个会话的
+      // 整段历史会在下一次发送时原样发出去 —— 而摘要要等那一轮**结束之后**
+      // 才会重新触发，也就是说最该被压缩的那一次请求恰恰没被压缩。
+      final memory = await widget.chats.memoryOf(id);
+      if (memory != null) {
+        _agent.overflow.restore(
+          summary: memory.summary,
+          checkpoint: memory.checkpoint,
+          historyLength: messages.length,
+        );
+      }
       // tool 消息也进来。以前这里把它们滤掉，代价是同一个回合的两段
       // 正文变成两个紧挨着的气泡、中间什么都没有 —— 看着像一条消息
       // 断成了两半。现在它们画成一张工具卡片，那个"断"就有了理由。
@@ -1117,6 +1140,9 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           overflow: _agent.overflow,
           snapshots: _runtime.snapshots,
           skins: widget.skins,
+          // 闭包而不是值：这一路只在会话跑着的时候才会失败，
+          // 取快照的话用户改完配置回到分工表看到的还是上一次那条错误。
+          embeddingError: () => _agent.retrieval.lastEmbeddingError,
         ),
       ),
     );
@@ -1370,6 +1396,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   Future<void> _persistMessages(String id) async {
     final persisted = await widget.chats.replaceMessages(id, _agent.history);
+    // 摘要状态跟着历史一起存，而且就在这一个出口 —— 发送、编辑、回滚、
+    // 切分支全都收敛到这里，分散去存的话漏掉任何一处都会留下
+    // 「checkpoint 指向一段已经不存在的历史」。
+    await widget.chats.setMemory(
+      id,
+      _agent.overflow.summary,
+      _agent.overflow.checkpoint,
+    );
     if (persisted.length != _agent.history.length) return;
 
     // replaceMessages 删掉旧行重插，数据库 id 会变。把新 id 同步回内存，
@@ -1631,7 +1665,24 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   }
 
   @override
+  void deactivate() {
+    // 换会话时这个 State 会被整个换掉。在 deactivate 里存而不是 dispose：
+    // 那时候 RenderObject 还在，还量得出"视口底边是哪一条"。
+    unawaited(_persistReadingPosition());
+    super.deactivate();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      unawaited(_persistReadingPosition());
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.settings.removeListener(_onSettingsChanged);
     _statusTimer?.cancel();
     _highlightTimer?.cancel();
@@ -2033,6 +2084,79 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         _scroll.position.maxScrollExtent - _scroll.offset;
     final away = distanceFromBottom > 120;
     if (away != _scrolledAway && mounted) setState(() => _scrolledAway = away);
+
+    // 「读到哪儿」300ms 采一次样。每帧都算的话，一个五百条的会话每秒要走
+    // 几万次循环，而这个值的唯一用途是"下次打开停在哪"—— 它不需要精确到帧。
+    final now = DateTime.now();
+    if (now.difference(_anchorSampledAt).inMilliseconds < 300) return;
+    _anchorSampledAt = now;
+    _readingAnchor = _viewportBottomMessageId();
+  }
+
+  /// 上次看到哪一条。null = 在底部，也就是"没有特别的位置"。
+  int? _readingAnchor;
+  DateTime _anchorSampledAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 视口底边压着的那条消息的 id。在底部时返回 null。
+  ///
+  /// 取**底边**那条而不是顶边：聊天是往下长的，「我读到这儿了」指的是
+  /// 最后看见的那条，不是屏幕最上面那条。
+  int? _viewportBottomMessageId() {
+    if (!_scroll.hasClients || !_scrolledAway) return null;
+    final position = _scroll.position;
+    final bottom = position.pixels + position.viewportDimension;
+    // 从后往前找。没被 ListView 构建出来的行 currentContext 是 null，
+    // 跳过它们很快 —— 真正要量的只有视口附近那几条。
+    for (var i = _visible.length - 1; i >= 0; i--) {
+      final id = _visible[i].messageId;
+      if (id == null) continue;
+      final box = _messageKeys[id]?.currentContext?.findRenderObject();
+      if (box is! RenderBox || !box.attached) continue;
+      final viewport = RenderAbstractViewport.maybeOf(box);
+      if (viewport == null) continue;
+      if (viewport.getOffsetToReveal(box, 0).offset <= bottom) return id;
+    }
+    return null;
+  }
+
+  /// 把「读到哪儿」写进库。
+  ///
+  /// 落盘而不是只留在内存里：切出去一趟、或者被系统回收之后再回来，
+  /// 内存里那份早没了 —— 而那恰恰是最需要它的时候。
+  Future<void> _persistReadingPosition() async {
+    final id = _threadId;
+    if (id == null || !_runtimeReady) return;
+    // 还挂在树上就现量一次，量不到再退回上一次采样的值。
+    final anchor = _scroll.hasClients ? _viewportBottomMessageId() : _readingAnchor;
+    await widget.chats.setLastRead(id, anchor);
+  }
+
+  /// 键盘弹起 / 收起时，让聊天内容跟着输入框一起走。
+  ///
+  /// Scaffold 会自己把 body 收矮（`resizeToAvoidBottomInset`），所以输入框
+  /// 确实跟着键盘上去了 —— 但列表是**锚在顶部**的，视口一矮，最后几条消息
+  /// 就被留在了折线以下。用户刚点开输入框，想说的话对着的那几条反而看不见了。
+  ///
+  /// 修法是保住「离底部还有多远」这个距离：视口高度和 maxScrollExtent 都会变，
+  /// 而这个距离才是用户眼里"我正看着哪一段"。恢复它，整段聊天就跟着输入框
+  /// 一起上移；原来贴着输入框的那条消息，之后还贴着输入框。
+  ///
+  /// 不用「直接滚到底」代替：那会把正在往回翻历史的用户一把拽回最新消息，
+  /// 而点开输入框并不表示他想离开正在看的那一段。
+  void _followKeyboard() {
+    if (!_scroll.hasClients) return;
+    // 这一刻布局还是变化**之前**的，量到的正是变化前的距离。
+    final gap = _scroll.position.maxScrollExtent - _scroll.position.pixels;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) return;
+      final position = _scroll.position;
+      final target = (position.maxScrollExtent - gap)
+          .clamp(position.minScrollExtent, position.maxScrollExtent);
+      // 差不到一像素就别动 —— jumpTo 会触发一次滚动通知，白跳只会让
+      // `_scrolledAway` 那边跟着抖。
+      if ((target - position.pixels).abs() < 0.5) return;
+      position.jumpTo(target);
+    });
   }
 
   void _scrollToEnd({bool animated = false}) {
@@ -2050,8 +2174,19 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     });
   }
 
+  /// 上一帧的键盘高度。见 [_followKeyboard]。
+  double _keyboardInset = 0;
+
   @override
   Widget build(BuildContext context) {
+    // 键盘是一帧一帧涨上来的，所以这里每帧都会走一次 —— 那正是想要的：
+    // 列表跟着键盘一起动，而不是等它弹完再"啪"地跳一下。
+    final keyboard = MediaQuery.viewInsetsOf(context).bottom;
+    if (keyboard != _keyboardInset) {
+      _keyboardInset = keyboard;
+      _followKeyboard();
+    }
+
     if (!_runtimeReady) {
       return Scaffold(
         appBar: AppBar(title: const Text('Burrow')),
@@ -2152,8 +2287,8 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
               onPressed: _editThreadPrompt,
             ),
             _tabAction(2, Icons.history_outlined, '检查点'),
-            _tabAction(1, Icons.terminal_outlined, '终端'),
-            // 设置 / 技能 / 账号都在抽屉里；终端模式和审批档位在输入框里。
+            _buildTerminalAction(),
+            // 设置 / 技能 / 账号都在抽屉里。
           ],
         ),
         body: AnimatedSwitcher(
@@ -2229,7 +2364,14 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
         _busy && _runningTool == null ? _streaming.toString() : null);
 
     final bottomInset = MediaQuery.paddingOf(context).bottom;
-    return Stack(
+    // 弹层菜单（`+`、终端、长按消息）和输入框用同一套材质。放在这里一次，
+    // 底下每个弹层自己取 —— 挨个往下传三个参数的话，迟早有一个忘了传，
+    // 而那一个会长得和别的都不一样。
+    return MenuMaterial(
+      effect: widget.settings.chatComposerEffect,
+      blur: widget.settings.chatComposerBlur,
+      opacity: widget.settings.chatComposerOpacity,
+      child: Stack(
       children: <Widget>[
         Positioned.fill(
           child: ChatWallpaper(
@@ -2300,6 +2442,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           ),
         ),
       ],
+      ),
     );
   }
 
@@ -2310,8 +2453,20 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   /// 而 `_editMessage(i)` 这些操作要的是**消息下标**。分开算就不会串。
   List<_ChatRow> _buildRows(String? streaming) {
     final rows = <_ChatRow>[];
+    // 0 表示「没有边界」，**必须据此不插那一行** —— 0 同时也是个合法下标，
+    // 当成位置用就会在最前面插一条没有对应消息的空行（见 summaryBoundaryIndex）。
+    final summaryAt = _agent.overflow.hasSummary
+        ? summaryBoundaryIndex(
+            _visible, _agent.history, _agent.overflow.checkpoint)
+        : 0;
     for (var i = 0; i < _visible.length; i++) {
       final message = _visible[i];
+      // 分隔线插在**被覆盖的最后一条之后**，而不是列表最前面：它标的是
+      // 一个位置（"这条线以上模型只通过摘要知道"），摆错地方就不再是标记
+      // 而是装饰。
+      if (summaryAt > 0 && i == summaryAt) {
+        rows.add(_ChatRow.summary(summaryAt));
+      }
       if (i == 0 || !_sameDay(_visible[i - 1].at, message.at)) {
         rows.add(_ChatRow.date(message.at));
       }
@@ -2359,10 +2514,21 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
       );
     }
 
+    if (row.summaryCovered > 0) {
+      return SummaryDivider(
+        covered: row.summaryCovered,
+        summary: _agent.overflow.summary ?? '',
+      );
+    }
+
     final day = row.day;
     if (day != null) return ServicePill(text: _dayLabel(day));
 
     final i = row.index;
+    // 越界就什么都不画。抛出去的话 release 构建会把这一行渲染成一块纯灰色
+    // 方块 —— 而那块灰色和"哪一行算错了"之间没有任何可见的联系，
+    // 上一版就是这么在聊天记录上方糊出一大片灰的。
+    if (i < 0 || i >= _visible.length) return const SizedBox.shrink();
     final message = _visible[i];
 
     // 工具调用不是"谁说的话"，画成卡片而不是气泡 —— 做成气泡的话，
@@ -2527,6 +2693,43 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   /// 顶栏那两个页签入口。已经在那一页时再点一次回到对话 ——
   /// 图标既是"去"也是"回"，省掉一个返回键。
+  /// 顶栏那个终端图标。
+  ///
+  /// 它同时是**状态指示**和**入口**：图标实心 + 品牌色 = 模型手里现在有工具。
+  /// 这件事以前挂在输入框的 `+` 上，可那个加号还要同时表示"有东西配坏了"，
+  /// 一个按钮说两件不相干的事，哪件都说不清。现在它归终端图标 —— 名副其实。
+  ///
+  /// 已经在终端页时点它是**返回对话**，不弹菜单：那一刻用户要的是出去，
+  /// 而不是再翻一层设置。
+  Widget _buildTerminalAction() {
+    final armed = _agent.terminalMode;
+    final inTerminal = _tab == 1;
+    return IconButton(
+      key: _terminalKey,
+      tooltip: inTerminal
+          ? '返回对话'
+          : armed
+              ? '终端 · 模式开着'
+              : '终端',
+      onPressed: () {
+        HapticFeedback.selectionClick();
+        if (inTerminal) {
+          setState(() => _tab = 0);
+        } else {
+          _showTerminalMenu();
+        }
+      },
+      icon: Icon(
+        armed ? Icons.terminal : Icons.terminal_outlined,
+        size: context.parts.headerAction.iconSizeOr(24),
+      ),
+      // 点亮色是状态指示，不是装饰 —— 皮肤能改常态色，改不了它。
+      color: inTerminal || armed
+          ? context.chat.brand
+          : context.parts.headerAction.icon?.color,
+    );
+  }
+
   Widget _tabAction(int tab, IconData icon, String tooltip) {
     final active = _tab == tab;
     return AnimatedSwitcher(
@@ -2546,103 +2749,63 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
     );
   }
 
-  /// 拉**指定渠道**的模型列表并缓存到那个渠道名下。
+  /// 「有哪些来源、怎么从一个来源拉列表」。
   ///
-  /// 带渠道参数而不是用"当前渠道"：选择器里可以翻别的来源，翻的时候
-  /// 当前渠道并没有变；按当前渠道拉的话，用户看到的会是 A 的地址配 B 的列表。
-  Future<List<String>> _refreshModels(String channelId) async {
-    final channel = widget.channels.byId(channelId);
-    if (channel == null) throw StateError('这个渠道已经不存在了');
-    // 走**这个渠道自己**的代理和认证。用默认客户端的话，配了代理的渠道
-    // 在这里会超时，而聊天本身是通的 —— 那种不一致最难查。
-    final auth = await widget.accounts
-        .authFor(channel, apiKey: widget.channels.apiKeyOf(channel));
-    final client = buildHttpClient(proxy: channel.proxy);
-    final List<FetchedModel> models;
-    try {
-      models = channel.oauthProviderId == 'openai_oauth'
-          ? await fetchChatGptOAuthModels(
-              accessToken: auth,
-              accountId:
-                  widget.accounts.credentialFor(channel)?.accountId ?? '',
-              client: client,
-            )
-          : await fetchModels(
-              baseUrl: channel.baseUrl,
-              apiKey: auth,
-              apiFormat: channel.apiFormat,
-              client: client,
-            );
-    } finally {
-      client.close();
-    }
-    final ids = models.map((m) => m.id).toList();
-    await widget.settings.setModelsFor(channelId, ids);
-    return ids;
-  }
-
-  /// 选择器里那一排来源 = 渠道列表，各自带着自己缓存的模型。
-  List<ModelSource> _modelSources() => <ModelSource>[
-        for (final c in widget.channels.channels)
-          ModelSource(
-            id: c.id,
-            name: c.name,
-            host: c.host,
-            models: widget.settings.modelsOf(c.id),
-            configuredModel: c.model,
-            // 带上能力表：手动没设过的那些项由它来填。
-            capabilityOf: (model) => widget.channels.capabilityOf(c, model),
-          ),
-      ];
-
-  /// 选中的来源不是当前渠道时，把渠道一起切过去。
-  ///
-  /// 顺序不能反：[SettingsStore.setModel] 改的是**当前**渠道的模型，
-  /// 先设模型的话，那个模型会被写到用户正想离开的那个渠道上。
-  Future<void> _adoptSource(String sourceId) async {
-    if (sourceId == widget.channels.activeId) return;
-    await widget.channels.setActive(sourceId);
-    final name = widget.channels.byId(sourceId)?.name ?? sourceId;
-    if (mounted) _setStatus('已切换到渠道「$name」');
-  }
+  /// 和设置里那张模型分工表共用一份 —— 拉取那一步必须走渠道自己的代理和
+  /// 认证，抄两份迟早有一份会漏掉其中一样。
+  late final ModelSourceCatalog _catalog = ModelSourceCatalog(
+    channels: widget.channels,
+    accounts: widget.accounts,
+    settings: widget.settings,
+  );
 
   Future<void> _pickModel() async {
     final picked = await showModelPicker(
       context,
       title: '对话模型',
       current: widget.settings.config.model,
-      sources: _modelSources(),
+      sources: _catalog.sources(),
       activeSourceId: widget.channels.activeId,
-      onRefresh: _refreshModels,
+      onRefresh: _catalog.refresh,
     );
     if (picked == null || picked.model.isEmpty) return;
-    await _adoptSource(picked.sourceId);
-    await widget.settings.setModel(picked.model);
+    final switched = picked.sourceId != widget.channels.activeId;
+    // 换渠道 + 换模型是一个动作，顺序不能反 —— 先设模型的话，那个模型会被
+    // 写到用户正想离开的那个渠道上。[ChannelStore.assignRole] 管这件事。
+    await widget.channels.assignRole(
+      ModelRole.chat,
+      ModelRef(channelId: picked.sourceId, model: picked.model),
+    );
+    if (switched && mounted) {
+      final name = widget.channels.byId(picked.sourceId)?.name ?? picked.sourceId;
+      _setStatus('已切换到渠道「$name」');
+    }
   }
 
-  Future<void> _pickEmbeddingModel() async {
-    final picked = await showModelPicker(
-      context,
-      title: '嵌入模型（记忆检索）',
-      current: widget.settings.embeddingModel,
-      sources: _modelSources(),
-      activeSourceId: widget.channels.activeId,
-      onRefresh: _refreshModels,
-      allowNone: true,
-      noneLabel: '不启用',
-      error: _agent.retrieval.lastEmbeddingError,
+  Future<void> _pickThinkingEffort() async {
+    final t = context.chat;
+    final picked = await showModalBottomSheet<ThinkingEffort>(
+      context: context,
+      backgroundColor: t.bgPrimary,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            for (final effort in ThinkingEffort.values)
+              ListTile(
+                leading: Icon(effort == widget.settings.thinkingEffort
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_unchecked),
+                title: Text(effort.label),
+                subtitle:
+                    Text(effort.hint, style: const TextStyle(fontSize: 11)),
+                onTap: () => Navigator.pop(ctx, effort),
+              ),
+          ],
+        ),
+      ),
     );
-    if (picked == null) return;
-    // 嵌入也发往当前渠道，所以在别的来源上挑嵌入模型同样要把渠道带过去 ——
-    // 不带的话就是拿 A 的模型名去 B 那里请求，一路 404 或者更糟：
-    // B 上刚好有个同名模型，于是照常计费。
-    await _adoptSource(picked.sourceId);
-    await widget.settings.setEmbeddingModel(picked.model);
-    // 换了嵌入模型，旧向量作废：不同模型的向量不在同一个空间里，
-    // 混着算余弦得到的是无意义的数。换渠道同理 —— 同名模型在两家服务商
-    // 那里也是两个空间。
-    _agent.retrieval.vectorIndex.clear();
-    _agent.retrieval.lastEmbeddingError = null;
+    if (picked != null) await widget.settings.setThinkingEffort(picked);
   }
 
   /// 选图。相册 / 拍照两个入口摊在一个小弹层里。
@@ -2715,7 +2878,7 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
           : '当前模型不认图，会先用视觉模型描述一遍';
     }
     return '当前渠道不认图，也没有配视觉模型 —— 发出去图会被丢掉。'
-        '到「渠道管理」里填一个视觉模型';
+        '到「设置 → 模型分工」里指一个「图片转文字」模型';
   }
 
   static const _approvalLabels = <ApprovalMode, String>{
@@ -2727,24 +2890,23 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
 
   /// 输入框左边那个 `+`。
   ///
-  /// 原来这里并排放着「加图」「终端模式」，上面还压着一条模型切换栏。
-  /// 全收进一个菜单之后，输入区回到「一个加号 + 一个输入框 + 一个发送」，
-  /// 而那三样都是**偶尔**才动的东西，不值得一直占着屏幕最底下那一行。
+  /// 里面只放**「这条消息怎么发」**：加图、换对话模型、想多久。会话级的
+  /// 开关（终端模式、审批档位）搬到顶栏的终端图标下面去了 —— 它们和这几项
+  /// 不是一类东西，混在一个菜单里，用户每次都要读一遍才知道哪个是哪个。
   ///
-  /// 收进去的代价是状态看不见了，所以按钮本身要把两件要紧的事画出来：
-  /// **终端模式开着**（模型手里有工具）用品牌色，**有东西配坏了**
-  /// （没模型 / 嵌入不可用 / 图发不出去）加一个警告小点。
-  /// 其余状态在顶栏副标题里一直看得见，不必在这里重复。
+  /// 收进菜单的代价是状态看不见，所以按钮自己要画出**有东西配坏了**
+  /// （没模型 / 嵌入不可用 / 图发不出去）：一个警告小点。终端模式开没开
+  /// 归顶栏那个图标管，这里不再重复表态 —— 一个按钮说两件不相干的事，
+  /// 哪件都说不清。
   Widget _buildPlusButton() {
     final t = context.chat;
-    final armed = _agent.terminalMode;
     return Stack(
       clipBehavior: Clip.none,
       children: <Widget>[
         ComposerIconButton(
+          key: _plusKey,
           icon: Icons.add,
-          tooltip: armed ? '更多 · 终端模式开着' : '更多',
-          active: armed,
+          tooltip: '更多',
           enabled: !_busy && !_installingDistro,
           onTap: _showComposerMenu,
         ),
@@ -2777,216 +2939,175 @@ class _HomeShellState extends State<HomeShell> implements AgentHost {
   String? get _composerWarning {
     if (widget.settings.config.model.isEmpty) return '还没有配对话模型';
     final embedError = _agent.retrieval.lastEmbeddingError;
-    if (embedError != null) return '嵌入检索不可用：$embedError';
+    // 指路到分工表：嵌入模型的入口从这个菜单搬走了，只说"不可用"
+    // 的话用户得自己找一遍。
+    if (embedError != null) return '嵌入检索不可用（设置 → 模型分工）：$embedError';
     if (!widget.settings.sendImagesInline &&
         !widget.channels.channels.any((c) => c.canDescribeImages)) {
-      return '当前渠道不认图，也没配视觉模型 —— 现在发不了图';
+      return '当前渠道不认图，也没指图片转文字模型 —— 现在发不了图';
     }
     return null;
   }
 
   Future<void> _showComposerMenu() async {
-    final t = context.chat;
-    await showModalBottomSheet<void>(
+    await showAnchoredMenu<void>(
       context: context,
-      backgroundColor: t.bgPrimary,
-      showDragHandle: true,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      // 菜单里改终端模式要当场看到开关变化，所以自带一份 setState。
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (sheetContext, setSheetState) => SafeArea(
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.82,
-            ),
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 2, 8, 6),
-                    child: Row(
-                      children: <Widget>[
-                        Expanded(
-                          child: Text(
-                            '输入工具',
-                            style: Theme.of(sheetContext).textTheme.titleLarge,
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: '关闭',
-                          onPressed: () => Navigator.pop(sheetContext),
-                          icon: const Icon(Icons.close_rounded),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (_composerWarning case final warning?)
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                      child: Row(
-                        children: <Widget>[
-                          Icon(Icons.error_outline,
-                              size: 16, color: t.tintWarning),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              warning,
-                              style:
-                                  TextStyle(fontSize: 12, color: t.tintWarning),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ListTile(
-                    leading: const Icon(Icons.photo_library_outlined),
-                    title: const Text('从相册选择'),
-                    onTap: () {
-                      Navigator.pop(sheetContext);
-                      _pickImages(camera: false);
-                    },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.photo_camera_outlined),
-                    title: const Text('拍一张'),
-                    onTap: () {
-                      Navigator.pop(sheetContext);
-                      _pickImages(camera: true);
-                    },
-                  ),
-                  const Divider(height: 1),
-                  ListTile(
-                    leading: const Icon(Icons.auto_awesome),
-                    title: const Text('对话模型'),
-                    subtitle: Text(
-                      widget.settings.sourceLabel.isEmpty
-                          ? '还没配'
-                          : widget.settings.sourceLabel,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: () {
-                      Navigator.pop(sheetContext);
-                      _pickModel();
-                    },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.hub_outlined),
-                    title: const Text('嵌入模型'),
-                    subtitle: Text(
-                      _agent.retrieval.lastEmbeddingError != null
-                          ? '不可用'
-                          : widget.settings.embeddingModel.isEmpty
-                              ? '关 · 记忆检索只用两路词法'
-                              : widget.settings.embeddingModel,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: () {
-                      Navigator.pop(sheetContext);
-                      _pickEmbeddingModel();
-                    },
-                  ),
-                  const Divider(height: 1),
-                  SwitchListTile(
-                    secondary: Icon(_agent.terminalMode
-                        ? Icons.terminal
-                        : Icons.terminal_outlined),
-                    title: const Text('终端模式'),
-                    subtitle: Text(
-                      _agent.terminalMode
-                          ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
-                          : !widget.settings.supportsTools
-                              // 说清是"哪个模型"而不是只说不支持：用户随时在
-                              // 换模型，不点名的话他不知道该去改哪一条。
-                              ? '「${widget.channels.active?.model ?? '当前模型'}」'
-                                  '被标记为不支持工具调用'
-                              : _distro == null
-                                  ? '开启后会先装一个 Linux 基座（约 3–30MB）'
-                                  : '普通聊天，模型没有任何工具',
-                      style: const TextStyle(fontSize: 11),
-                    ),
-                    value: _agent.terminalMode,
-                    onChanged: (on) async {
-                      // 装基座会推一个整页出来，菜单得先让开。
-                      if (on && _distro == null) Navigator.pop(sheetContext);
-                      await _setTerminalMode(on);
-                      if (mounted) setSheetState(() {});
-                    },
-                  ),
-                  // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
-                  if (_agent.terminalMode)
-                    ListTile(
-                      leading: Icon(
-                        _agent.mode == ApprovalMode.yolo
-                            ? Icons.gpp_maybe
-                            : Icons.shield_outlined,
-                        color: _agent.mode == ApprovalMode.yolo
-                            ? t.tintError
-                            : null,
-                      ),
-                      title: const Text('审批档位'),
-                      subtitle: Text(
-                        _approvalLabels[_agent.mode] ?? '',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: _agent.mode == ApprovalMode.yolo
-                              ? t.tintError
-                              : null,
-                        ),
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () async {
-                        final picked = await showModalBottomSheet<ApprovalMode>(
-                          context: sheetContext,
-                          backgroundColor: t.bgPrimary,
-                          builder: (pickerContext) => SafeArea(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: <Widget>[
-                                for (final entry in _approvalLabels.entries)
-                                  ListTile(
-                                    leading: Icon(entry.key == _agent.mode
-                                        ? Icons.radio_button_checked
-                                        : Icons.radio_button_unchecked),
-                                    title: Text(entry.value),
-                                    onTap: () =>
-                                        Navigator.pop(pickerContext, entry.key),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        );
-                        if (picked != null) {
-                          // 写回设置而不是只改 _agent —— 这个入口和设置页里的
-                          // 「审批档位」是同一件事，两份状态迟早会不一致。
-                          await widget.settings.setApprovalMode(picked);
-                          if (mounted) setSheetState(() {});
-                        }
-                      },
-                    ),
-                  const SizedBox(height: 8),
-                ],
-              ),
-            ),
-          ),
+      anchor: _plusKey,
+      builder: (menuContext, refresh) => <Widget>[
+        if (_composerWarning case final warning?) MenuNotice(text: warning),
+        MenuAction(
+          icon: Icons.photo_library_outlined,
+          label: '从相册选择',
+          onTap: () {
+            Navigator.pop(menuContext);
+            _pickImages(camera: false);
+          },
         ),
-      ),
+        MenuAction(
+          icon: Icons.photo_camera_outlined,
+          label: '拍一张',
+          onTap: () {
+            Navigator.pop(menuContext);
+            _pickImages(camera: true);
+          },
+        ),
+        MenuAction(
+          icon: Icons.auto_awesome,
+          label: '对话模型',
+          detail: widget.settings.sourceLabel.isEmpty
+              ? '还没配'
+              : widget.settings.sourceLabel,
+          onTap: () {
+            Navigator.pop(menuContext);
+            _pickModel();
+          },
+        ),
+        // 思考强度在这里而不是只在设置里：它是按问题变的 ——「这题难，
+        // 多想会儿」是发送前那一刻的决定，而设置页隔着三层导航，走到那里
+        // 的时候人已经忘了要问什么了。
+        MenuAction(
+          icon: Icons.speed_outlined,
+          label: '思考强度',
+          detail: '${widget.settings.thinkingEffort.label} · 只对会思考的模型有效',
+          onTap: () async {
+            await _pickThinkingEffort();
+            refresh();
+          },
+        ),
+      ],
     );
     if (mounted) setState(() {});
   }
+
+  /// 顶栏那个终端图标的二级菜单。
+  ///
+  /// 「终端模式」和「审批档位」原来摆在输入框的 `+` 里。搬到这儿是因为它们
+  /// 和 `+` 里其余几项**根本不是一类东西**：那几项是"这条消息怎么发"
+  /// （加图、换模型、想多久），而这两项是"模型手里有没有工具、动手前问不问"
+  /// —— 一个会话级的开关，不是一次发送的参数。
+  ///
+  /// 而且顶栏那个终端图标本来就是它们的自然位置：图标亮着 = 模型手里有工具，
+  /// 点开就是那件事的全部设置。原来点它只能跳到终端页面，一个纯粹的
+  /// "看一眼"入口占着屏幕上最显眼的位置之一。
+  Future<void> _showTerminalMenu() async {
+    await showAnchoredMenu<void>(
+      context: context,
+      anchor: _terminalKey,
+      builder: (menuContext, refresh) {
+        final t = context.chat;
+        final yolo = _agent.mode == ApprovalMode.yolo;
+        return <Widget>[
+          MenuAction(
+            icon: _agent.terminalMode ? Icons.terminal : Icons.terminal_outlined,
+            label: '终端模式',
+            detail: _agent.terminalMode
+                ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
+                : !widget.settings.supportsTools
+                    // 说清是"哪个模型"而不是只说不支持：用户随时在换模型，
+                    // 不点名的话他不知道该去改哪一条。
+                    ? '「${widget.channels.active?.model ?? '当前模型'}」'
+                        '被标记为不支持工具调用'
+                    : _distro == null
+                        ? '开启后会先装一个 Linux 基座（约 3–30MB）'
+                        : '普通聊天，模型没有任何工具',
+            trailing: Switch(
+              value: _agent.terminalMode,
+              onChanged: (on) async {
+                // 装基座会推一个整页出来，菜单得先让开。
+                if (on && _distro == null) Navigator.pop(menuContext);
+                await _setTerminalMode(on);
+                refresh();
+              },
+            ),
+            onTap: () async {
+              final on = !_agent.terminalMode;
+              if (on && _distro == null) Navigator.pop(menuContext);
+              await _setTerminalMode(on);
+              refresh();
+            },
+          ),
+          // 审批档位只在终端模式下有意义：聊天模式没有工具可审批。
+          if (_agent.terminalMode)
+            MenuAction(
+              icon: yolo ? Icons.gpp_maybe : Icons.shield_outlined,
+              label: '审批档位',
+              detail: _approvalLabels[_agent.mode] ?? '',
+              tone: yolo ? t.tintError : null,
+              onTap: () async {
+                final picked = await showModalBottomSheet<ApprovalMode>(
+                  context: menuContext,
+                  backgroundColor: t.bgPrimary,
+                  builder: (pickerContext) => SafeArea(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        for (final entry in _approvalLabels.entries)
+                          ListTile(
+                            leading: Icon(entry.key == _agent.mode
+                                ? Icons.radio_button_checked
+                                : Icons.radio_button_unchecked),
+                            title: Text(entry.value),
+                            onTap: () =>
+                                Navigator.pop(pickerContext, entry.key),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+                if (picked != null) {
+                  // 写回设置而不是只改 _agent —— 这个入口和设置页里的
+                  // 「审批档位」是同一件事，两份状态迟早会不一致。
+                  await widget.settings.setApprovalMode(picked);
+                  refresh();
+                }
+              },
+            ),
+          // 跳转排在最后。它是「去看一眼」，而上面两项是「怎么跑」——
+          // 后者才是用户点开这个菜单十有八九要做的事。
+          MenuAction(
+            icon: Icons.open_in_full_rounded,
+            label: '打开终端',
+            detail: _distro == null
+                ? '降级模式 —— 只有 Android 自带的 sh'
+                : '手动敲命令，和模型共用同一个 ${_distro!.distro.displayName}',
+            onTap: () {
+              Navigator.pop(menuContext);
+              HapticFeedback.selectionClick();
+              setState(() => _tab = 1);
+            },
+          ),
+        ];
+      },
+    );
+    if (mounted) setState(() {});
+  }
+
 }
 
 /// 消息列表里的一行。
 ///
-/// 三种：日期分隔（[day] 非空）、一条消息（[index] >= 0）、
-/// 流式输出那条（[streaming] 非空）。
+/// 四种：日期分隔（[day] 非空）、摘要分隔线（[summaryCovered] > 0）、
+/// 一条消息（[index] >= 0）、流式输出那条（[streaming] 非空）。
 class _ChatRow {
   final DateTime? day;
   final int index;
@@ -2998,8 +3119,20 @@ class _ChatRow {
   /// 由 [_ChatRow.message] 接手 —— 所以这一种只在命令跑着的时候存在。
   final ({String title, DateTime startedAt})? runningTool;
 
+  /// 这一行是摘要分隔线时，线以上被覆盖的消息条数。0 = 不是这种行。
+  final int summaryCovered;
+
   const _ChatRow.date(this.day)
       : index = -1,
+        streaming = null,
+        runningTool = null,
+        summaryCovered = 0,
+        lastInGroup = true,
+        firstInGroup = true;
+
+  const _ChatRow.summary(this.summaryCovered)
+      : day = null,
+        index = -1,
         streaming = null,
         runningTool = null,
         lastInGroup = true,
@@ -3008,12 +3141,14 @@ class _ChatRow {
   const _ChatRow.message(this.index, this.lastInGroup, this.firstInGroup)
       : day = null,
         streaming = null,
-        runningTool = null;
+        runningTool = null,
+        summaryCovered = 0;
 
   const _ChatRow.streaming(this.streaming)
       : day = null,
         index = -1,
         runningTool = null,
+        summaryCovered = 0,
         lastInGroup = true,
         firstInGroup = false;
 
@@ -3021,6 +3156,7 @@ class _ChatRow {
       : day = null,
         index = -1,
         streaming = null,
+        summaryCovered = 0,
         lastInGroup = true,
         firstInGroup = false;
 }

@@ -207,6 +207,42 @@ void main() {
   });
 
   group('滚动摘要的触发时机', () {
+    test('长会话在第一次发送之前就压一次，而不是发完才压', () async {
+      // 老会话（v12 之前建的）读回来一律是"还没摘过"，checkpoint 从 0 开始。
+      // 只在回合结束后压的话，第一次发送会把整段历史原样发出去 ——
+      // 那正是最贵、也最容易直接撞上窗口上限的一刻。
+      final overflow = OverflowManager(
+        summarize: (_, __) async => '之前聊了一些东西',
+        messageThreshold: 2,
+        tokenThreshold: 1 << 30,
+      );
+      final (agent, llm, _) = await buildLoop(
+        [const LlmTurn(text: '好的')],
+        overflow: overflow,
+      );
+      agent.terminalMode = false;
+
+      // 模拟从库里读回来的一段长历史。
+      agent.history.addAll(<ChatMessage>[
+        for (var i = 0; i < 20; i++)
+          ChatMessage(
+              role: i.isEven ? 'user' : 'assistant',
+              content: '老消息 $i',
+              at: DateTime.now()),
+      ]);
+
+      await agent.send('接着聊');
+
+      expect(overflow.checkpoint, greaterThan(0),
+          reason: '发出去之前就该压过了');
+      // 人格 + 摘要 + 窗口里留下的那几条。整段历史都发出去的话会远大于这个数。
+      expect(llm.messagesSeen.single.length, lessThan(10),
+          reason: '第一次请求就该是压缩过的，而不是等这一轮结束才压');
+      expect(llm.messagesSeen.single.any((m) => m.content.contains('之前聊了一些东西')),
+          isTrue,
+          reason: '压掉的那批要有摘要顶上');
+    });
+
     test('纯聊天的回合也会触发摘要', () async {
       // 这条钉的是一个实测踩到的 bug：摘要检查原先写在工具轮循环的**末尾**，
       // 而没有工具调用时 `if (turn.toolCalls.isEmpty) break;` 会先跳出去，

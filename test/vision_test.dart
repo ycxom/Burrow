@@ -326,7 +326,57 @@ void main() {
         const <String>['a.png'],
       );
       expect(result.ok, isFalse);
-      expect(result.error, contains('渠道管理'));
+      // 提示得指向真正能配它的那个界面。指错地方比不提示更费时间。
+      expect(result.error, contains('模型分工'));
+    });
+
+    test('分工表点名的那个先用，不进随机池', () async {
+      // 用户指定了"图片转文字用这个"，结果一半的图被随机丢给了别的渠道，
+      // 那条指派就等于没设。跑几次都必须是同一个。
+      for (var i = 0; i < 8; i++) {
+        final preprocessor = VisionPreprocessor(
+          candidates: () => <VisionCandidate>[
+            for (final label in <String>['v1', 'v2', 'v3'])
+              VisionCandidate(
+                label: label,
+                config:
+                    LlmConfig(baseUrl: 'http://x', apiKey: 'k', model: label),
+                auth: () async => 'k',
+                preferred: label == 'v2',
+              ),
+          ],
+          createClient: (config, _) =>
+              _FakeDescriber(config.model, () async => '一只猫'),
+        );
+        final result = await preprocessor.describe(const <String>['a.png']);
+        expect(result.usedLabel, 'v2');
+      }
+    });
+
+    test('点名的失败了仍然退到别的候选', () async {
+      // 前置多模态是可选增强，不该因为被点名的那个网关抽风就让整条消息
+      // 发不出去。
+      final preprocessor = VisionPreprocessor(
+        candidates: () => <VisionCandidate>[
+          for (final label in <String>['v1', 'v2'])
+            VisionCandidate(
+              label: label,
+              config: LlmConfig(baseUrl: 'http://x', apiKey: 'k', model: label),
+              auth: () async => 'k',
+              preferred: label == 'v2',
+            ),
+        ],
+        createClient: (config, _) => _FakeDescriber(
+          config.model,
+          () async {
+            if (config.model == 'v2') throw Exception('网关 500');
+            return '一只猫';
+          },
+        ),
+      );
+      final result = await preprocessor.describe(const <String>['a.png']);
+      expect(result.ok, isTrue);
+      expect(result.usedLabel, 'v1');
     });
 
     test('成功时带回用的是哪个来源', () async {

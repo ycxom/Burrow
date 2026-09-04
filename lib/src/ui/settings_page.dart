@@ -8,6 +8,7 @@ import '../sandbox/sandbox_session.dart';
 import '../sandbox/snapshot_store.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
+import '../settings/model_roles.dart';
 import '../llm/thinking_effort.dart';
 import '../llm/vision.dart';
 import 'system_prompt_page.dart';
@@ -15,6 +16,7 @@ import '../settings/settings_store.dart';
 import 'agent_settings_page.dart';
 import 'chat_appearance_page.dart';
 import 'channels_page.dart';
+import 'model_roles_page.dart';
 import 'skin_store.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -28,6 +30,7 @@ class SettingsPage extends StatefulWidget {
     required this.overflow,
     required this.snapshots,
     required this.skins,
+    this.embeddingError,
     super.key,
   });
 
@@ -49,6 +52,12 @@ class SettingsPage extends StatefulWidget {
 
   /// 只为传给外观页。设置页自己不碰皮肤。
   final ChatSkinStore skins;
+
+  /// 嵌入那一路最近一次失败的原因。只往下传给模型分工表。
+  ///
+  /// 闭包而不是值：它在会话跑着的时候才会变，取快照的话用户改完配置回来
+  /// 看到的还是上一次那条错误。
+  final String? Function()? embeddingError;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -95,6 +104,23 @@ class _SettingsPageState extends State<SettingsPage> {
       if (channel.proxy?.isNotEmpty ?? false) '代理',
     ];
     return bits.join(' · ');
+  }
+
+  /// 分工表那一行的副标题：每个角色一小段，没单独指定的不写。
+  ///
+  /// 只列**真的被指到别处**的那几个：全都跟着当前渠道时这一行没有信息量，
+  /// 写成一串"跟随、跟随、跟随"只会把真正被指走的那一条淹掉。
+  String _rolesSummary() {
+    final aside = <String>[];
+    for (final role in ModelRole.values) {
+      if (role == ModelRole.chat) continue;
+      final ref = widget.channels.refOf(role);
+      if (ref == null) continue;
+      final name = widget.channels.byId(ref.channelId)?.name ?? ref.channelId;
+      aside.add('${role.label} → $name');
+    }
+    if (aside.isEmpty) return '对话、嵌入、图片转文字、摘要各用哪个渠道的哪个模型';
+    return aside.join(' · ');
   }
 
   Future<void> _editSystemPrompt() async {
@@ -211,8 +237,8 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 18),
           const _Header(
             icon: Icons.hub_outlined,
-            title: '渠道',
-            subtitle: '发给谁、用什么认证、走不走代理',
+            title: '渠道与模型',
+            subtitle: '发给谁、用什么认证、哪件事用哪个模型',
           ),
           Card(
             clipBehavior: Clip.antiAlias,
@@ -224,6 +250,24 @@ class _SettingsPageState extends State<SettingsPage> {
               onTap: () => _push(ChannelsPage(
                 channels: widget.channels,
                 accounts: widget.accounts,
+              )),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            clipBehavior: Clip.antiAlias,
+            child: ListTile(
+              leading: const Icon(Icons.table_rows_outlined),
+              title: const Text('模型分工'),
+              // 副标题直接把现在的分工摊开。这一项的价值就是"各用各的"，
+              // 而那件事只有摆出来才看得见 —— 点进去才知道等于没说。
+              subtitle: Text(_rolesSummary(), style: const TextStyle(fontSize: 11)),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => _push(ModelRolesPage(
+                channels: widget.channels,
+                settings: widget.store,
+                accounts: widget.accounts,
+                embeddingError: widget.embeddingError,
               )),
             ),
           ),

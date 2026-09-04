@@ -244,6 +244,70 @@ void main() {
       if (await dir.exists()) await dir.delete(recursive: true);
     });
 
+    test('v11 的库升到 v12：老会话读得出来，摘要状态从空开始', () async {
+      final dir = await Directory.systemTemp.createTemp('burrow_migrate12');
+      final path = '${dir.path}/old.db';
+
+      // v11：threads 还没有 summary / summary_checkpoint 两列。
+      final old = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 11,
+          onCreate: (db, _) async {
+            await db.execute('''
+              CREATE TABLE threads(
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, preview TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                terminal_mode INTEGER NOT NULL DEFAULT 0, system_prompt TEXT)
+            ''');
+            await db.execute('''
+              CREATE TABLE messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                created_at INTEGER NOT NULL, output_ref TEXT, checkpoint INTEGER,
+                source TEXT, images TEXT, tokens_in INTEGER, tokens_out INTEGER,
+                tokens_cached INTEGER, tokens_estimated INTEGER,
+                reasoning TEXT, reasoning_ms INTEGER, branch_id TEXT,
+                tool_name TEXT, tool_title TEXT, tool_ok INTEGER,
+                tool_ms INTEGER)
+            ''');
+            await db.insert('threads', <String, Object?>{
+              'id': 't1',
+              'title': '老会话',
+              'preview': '老消息',
+              'updated_at': 1000,
+            });
+            await db.insert('messages', <String, Object?>{
+              'thread_id': 't1',
+              'role': 'user',
+              'content': '老消息',
+              'created_at': 1000,
+            });
+          },
+        ),
+      );
+      await old.close();
+
+      final upgraded = await ChatStore.openAt(path);
+      expect((await upgraded.messages('t1')).single.content, '老消息');
+      // 老会话没摘过 —— 读回来就是"还没摘过"，和升级前的行为一模一样。
+      expect(await upgraded.memoryOf('t1'), isNull);
+
+      // 新列真的建出来了才写得进去。没建的话第一次发消息就炸。
+      await upgraded.setMemory('t1', '一段摘要', 12);
+      final memory = (await upgraded.memoryOf('t1'))!;
+      expect(memory.summary, '一段摘要');
+      expect(memory.checkpoint, 12);
+
+      // 清掉之后 checkpoint 也得跟着没 —— 留着一个指向"没有摘要"的下标，
+      // 恢复时会把一批消息踢出窗口而没有东西顶上。
+      await upgraded.setMemory('t1', null, 12);
+      expect(await upgraded.memoryOf('t1'), isNull);
+
+      await upgraded.close();
+      if (await dir.exists()) await dir.delete(recursive: true);
+    });
+
     test('v10 的库升到 v11：老的工具消息读得出来，且默认算成功', () async {
       final dir = await Directory.systemTemp.createTemp('burrow_migrate11');
       final path = '${dir.path}/old.db';

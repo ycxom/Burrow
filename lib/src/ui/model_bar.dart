@@ -1,8 +1,9 @@
 /// 模型选择器：先选来源（渠道），再选模型。
 ///
-/// 入口在输入框左边那个 `+` 菜单里。原来这里还有一条常驻的快速切换栏，
-/// 后来收进菜单了 —— 那一栏一直占着屏幕最底下一行，而换模型是**偶尔**
-/// 才做的事；「现在用的是谁」在顶栏副标题里一直看得见，不必占两处。
+/// 两类入口共用它：输入框 `+` 菜单里的「对话模型」，和设置里那张模型分工表。
+/// 两者的区别只有一个 —— **选中之后要不要把当前渠道一起切走**（见
+/// [showModelPicker] 的 `adoptsSource`）。对话模型必须切，因为它就是当前渠道；
+/// 配角模型不能切，那正是这张表要解决的事。
 ///
 /// ## 为什么处处标着来源
 ///
@@ -84,9 +85,24 @@ Future<ModelChoice?> showModelPicker(
   /// 来源上了，不带的话拉回来的列表会安到错误的来源头上。
   required Future<List<String>> Function(String sourceId) onRefresh,
 
-  /// 允许「不启用」。嵌入模型可以关，对话模型不能。
+  /// 允许「不启用」。配角模型可以关，对话模型不能。
   bool allowNone = false,
   String noneLabel = '不启用',
+
+  /// 「不启用」那一条的灰字：**关掉之后会发生什么**。
+  String noneHint = '',
+
+  /// [current] 属于哪个来源。null = 当前渠道。
+  ///
+  /// 分工表里挑配角模型时，"当前选的那个"完全可能在另一个渠道上 ——
+  /// 不区分的话，翻到它自己那个来源时反而看不到自己的选择被打勾。
+  String? currentSourceId,
+
+  /// 选中之后把当前渠道一起切过去。
+  ///
+  /// 对话模型是 true（它就是当前渠道）；配角模型是 false —— 为了换个嵌入
+  /// 模型把整个对话搬到另一家去，正是这张分工表存在的理由。
+  bool adoptsSource = true,
 
   /// 上一次失败的原因。芯片上只写得下「不可用」三个字，
   /// 真正的原因得有个地方看得到 —— 否则用户只知道坏了，不知道为什么。
@@ -107,6 +123,9 @@ Future<ModelChoice?> showModelPicker(
       onRefresh: onRefresh,
       allowNone: allowNone,
       noneLabel: noneLabel,
+      noneHint: noneHint,
+      currentSourceId: currentSourceId,
+      adoptsSource: adoptsSource,
       error: error,
     ),
   );
@@ -120,6 +139,9 @@ class _ModelPickerSheet extends StatefulWidget {
   final Future<List<String>> Function(String sourceId) onRefresh;
   final bool allowNone;
   final String noneLabel;
+  final String noneHint;
+  final String? currentSourceId;
+  final bool adoptsSource;
   final String? error;
 
   const _ModelPickerSheet({
@@ -130,6 +152,9 @@ class _ModelPickerSheet extends StatefulWidget {
     required this.onRefresh,
     required this.allowNone,
     required this.noneLabel,
+    required this.noneHint,
+    required this.currentSourceId,
+    required this.adoptsSource,
     this.error,
   });
 
@@ -138,8 +163,10 @@ class _ModelPickerSheet extends StatefulWidget {
 }
 
 class _ModelPickerSheetState extends State<_ModelPickerSheet> {
-  /// 正在看的来源。开局是当前渠道 —— 用户十有八九是来换模型不是来换渠道的。
-  late String? _sourceId = widget.activeSourceId ??
+  /// 正在看的来源。开局是**这条指派现在所在的**来源，没有就退到当前渠道 ——
+  /// 用户十有八九是来换模型不是来换渠道的，而"这一项现在用的是谁"就在那里。
+  late String? _sourceId = widget.currentSourceId ??
+      widget.activeSourceId ??
       (widget.sources.isEmpty ? null : widget.sources.first.id);
 
   /// 来源 id → 模型列表。按来源分开存，切回去时不用重拉。
@@ -161,8 +188,18 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     return null;
   }
 
+  /// 正在看的就是 [_ModelPickerSheet.current] 所属的来源。
+  ///
+  /// 「不启用」和「当前这个」只有在这里才该显示：在 B 的列表里点一个属于 A
+  /// 的条目，选出来的到底是什么，没有一个说得通的答案。
+  bool get _onCurrentSource =>
+      _sourceId == (widget.currentSourceId ?? widget.activeSourceId);
+
+  /// 在这里点下去会把当前对话渠道一起切走。
   bool get _switchesChannel =>
-      _sourceId != null && _sourceId != widget.activeSourceId;
+      widget.adoptsSource &&
+      _sourceId != null &&
+      _sourceId != widget.activeSourceId;
 
   @override
   void initState() {
@@ -299,20 +336,20 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
               child: ListView(
                 padding: const EdgeInsets.only(top: 8, bottom: 24),
                 children: <Widget>[
-                  // 「不启用」和「当前这个」都只属于当前渠道。翻到别的来源时
-                  // 收起来 —— 在 B 的列表里点一个属于 A 的条目，选出来的
-                  // 到底是什么，没有一个说得通的答案。
-                  if (widget.allowNone && !_switchesChannel)
+                  // 「不启用」和「当前这个」都只属于这条指派所在的来源。
+                  // 翻到别的来源时收起来 —— 见 [_onCurrentSource]。
+                  if (widget.allowNone && _onCurrentSource)
                     _tile(
                       label: widget.noneLabel,
                       value: '',
                       selected: widget.current.isEmpty,
-                      subtitle: '记忆检索只用 BM25 + 覆盖率两路词法',
+                      subtitle:
+                          widget.noneHint.isEmpty ? null : widget.noneHint,
                     ),
                   // 当前这个不在拉回来的列表里（手填的、或者服务端换了渠道）
                   // 也要能看见自己选的是什么，否则界面上像是没选。
                   if (widget.current.isNotEmpty &&
-                      !_switchesChannel &&
+                      _onCurrentSource &&
                       !visible.contains(widget.current) &&
                       keyword.isEmpty)
                     _tile(
@@ -324,7 +361,7 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                   // 别的来源：把它自己配着的模型摆出来。列表拉不动的渠道
                   // （网关关着、地址填错）否则一个可点的东西都没有，
                   // 「换回那个渠道」就只能绕到渠道管理里去做。
-                  if (_switchesChannel &&
+                  if (!_onCurrentSource &&
                       (_source?.configuredModel.isNotEmpty ?? false) &&
                       !visible.contains(_source!.configuredModel) &&
                       keyword.isEmpty)
@@ -340,7 +377,7 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                       value: m,
                       // 别的来源上的同名模型**不是**当前在用的那个，
                       // 打上勾会让人以为"已经是它了"从而放心点下去。
-                      selected: !_switchesChannel && m == widget.current,
+                      selected: _onCurrentSource && m == widget.current,
                     ),
                   if (visible.isEmpty && !loading && error == null)
                     Padding(
@@ -423,6 +460,11 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
       );
     }
 
+    // 不切渠道的入口（分工表里的配角模型）也得说一句：用户刚在一排芯片里
+    // 点到了别的渠道，界面上没有任何东西说明"这不会影响我的对话"。
+    final asideOfActive =
+        !widget.adoptsSource && source.id != widget.activeSourceId;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
       child: Row(
@@ -431,7 +473,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
           const SizedBox(width: 6),
           Expanded(
             child: Text(
-              '发往 ${source.host}',
+              asideOfActive
+                  ? '这一项发往 ${source.host}，当前对话渠道不变'
+                  : '发往 ${source.host}',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(fontSize: 11.5, color: t.tintTertiary),

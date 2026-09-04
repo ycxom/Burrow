@@ -112,7 +112,6 @@ class SettingsStore extends ChangeNotifier {
     this._temperature,
     this._streamOutput,
     this._terminalModeDefault,
-    this._embeddingModel,
     this._imageMode,
     this._systemPrompt,
     this._modelsByChannel,
@@ -140,7 +139,6 @@ class SettingsStore extends ChangeNotifier {
 
   static const _prefix = 'burrow.llm.';
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
-  static const _keyEmbeddingModel = 'burrow.llm.embeddingModel';
   static const _keyImageMode = 'burrow.llm.imageMode';
   static const _keySystemPrompt = 'burrow.llm.systemPrompt';
   static const _keyThinkingEffort = 'burrow.llm.thinkingEffort';
@@ -182,7 +180,6 @@ class SettingsStore extends ChangeNotifier {
   /// 真相了。渠道是唯一的来源，这里只负责把「当前那个」加上生成参数
   /// 摊成下游要的 [LlmConfig]。
   ChannelStore? _channels;
-  String _embeddingModel;
   ImageMode _imageMode;
   String _systemPrompt;
 
@@ -387,12 +384,6 @@ class SettingsStore extends ChangeNotifier {
     await _prefs?.setString(_keyImageMode, mode.name);
   }
 
-  /// 记忆检索用的嵌入模型。空 = 不启用，检索退回两路词法。
-  ///
-  /// 和对话模型分开存：它们通常**不是同一个模型**，而且嵌入模型一旦选定就
-  /// 不该乱换 —— 换了之后旧向量和新向量不在同一个空间里，余弦没有意义。
-  String get embeddingModel => _embeddingModel;
-
   /// 当前渠道上一次拉回来的模型 id 列表。
   ///
   /// 缓存下来是为了让底部那条快速切换器**一打开就有东西**。每次都现拉的话，
@@ -466,7 +457,6 @@ class SettingsStore extends ChangeNotifier {
       prefs.getDouble('${_prefix}temperature') ?? 0.3,
       prefs.getBool('${_prefix}streamOutput') ?? true,
       prefs.getBool(_keyTerminalDefault) ?? false,
-      prefs.getString(_keyEmbeddingModel) ?? '',
       _byName(ImageMode.values, prefs.getString(_keyImageMode), ImageMode.auto),
       prefs.getString(_keySystemPrompt) ?? '',
       _decodeModels(prefs.getString(_keyModelsByChannel)),
@@ -533,17 +523,6 @@ class SettingsStore extends ChangeNotifier {
     return fallback;
   }
 
-  /// 换对话模型 —— 改的是**当前渠道**的模型。
-  ///
-  /// 底部快切改一次就落到渠道上，而不是另存一份「临时模型」：
-  /// 那样渠道管理里显示的和实际在用的就对不上了。
-  Future<void> setModel(String model) async {
-    final channels = _channels;
-    final active = channels?.active;
-    if (channels == null || active == null || active.model == model) return;
-    await channels.upsert(active.copyWith(model: model));
-  }
-
   Future<void> setTemperature(double value) async {
     if (_temperature == value) return;
     _temperature = value;
@@ -556,13 +535,6 @@ class SettingsStore extends ChangeNotifier {
     _streamOutput = value;
     notifyListeners();
     await _prefs?.setBool('${_prefix}streamOutput', value);
-  }
-
-  Future<void> setEmbeddingModel(String model) async {
-    if (_embeddingModel == model) return;
-    _embeddingModel = model;
-    notifyListeners();
-    await _prefs?.setString(_keyEmbeddingModel, model);
   }
 
   /// 记下**某个渠道**拉回来的模型列表。

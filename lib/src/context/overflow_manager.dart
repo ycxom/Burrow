@@ -198,9 +198,57 @@ class OverflowManager {
 
   bool _summarizing = false;
 
+  /// 最近一次摘要失败的原因。null = 从没失败过，或者上一次成功了。
+  ///
+  /// 留着是为了让「压缩为什么没生效」在界面上答得出来。失败本身是安静的
+  /// —— 上下文照样只增不减，用户唯一能察觉到的是"聊久了就变慢变贵"。
+  String? _lastError;
+
+  /// 这条失败还没报给用户看过。
+  bool _errorUnreported = false;
+
+  /// 上次失败时的历史长度。见 [_shouldSummarize] 里的退避。
+  int _failedAt = -1;
+
   String? get summary => _summary;
   int get checkpoint => _checkpoint;
   bool get hasSummary => _summary != null && _summary!.isNotEmpty;
+  String? get lastError => _lastError;
+
+  /// 取一条还没报过的失败原因。**取一次就算报过了。**
+  ///
+  /// 摘要失败之后每加一条消息都会重新判定，把同一句话在状态条上刷十遍
+  /// 只会把别的状态挤掉 —— 这件事说一次就够。
+  String? takeUnreportedError() {
+    if (!_errorUnreported) return null;
+    _errorUnreported = false;
+    return _lastError;
+  }
+
+  /// 从库里恢复上一次的摘要状态。
+  ///
+  /// 不恢复的话，重开 app 或者切走再切回会话，checkpoint 归 0、摘要归 null
+  /// —— 长会话每次打开都要重新全量摘要一遍，而在那次摘要发生之前，
+  /// **整段历史会原样发出去**，恰恰是最容易撞窗口上限的那一刻。
+  ///
+  /// checkpoint 是历史的下标，所以要按当前历史长度夹一次：编辑重发、
+  /// 回到某条消息、切换分支都会把历史截短，而存下来的那个下标不知道。
+  /// 越界的话 `history.skip()` 会安静地返回空窗口 —— 模型当场失忆。
+  void restore({String? summary, required int checkpoint, required int historyLength}) {
+    _summary = (summary?.trim().isEmpty ?? true) ? null : summary!.trim();
+    _checkpoint = checkpoint.clamp(0, historyLength);
+    _lastError = null;
+    _errorUnreported = false;
+    _failedAt = -1;
+  }
+
+  /// 历史被截短之后把 checkpoint 拉回来。
+  ///
+  /// 「回到这条消息」和分支切换都会砍掉一截历史。不跟着收的话，checkpoint
+  /// 可能落在新历史的末尾之后，窗口里就一条消息都不剩了。
+  void clampTo(int historyLength) {
+    if (_checkpoint > historyLength) _checkpoint = historyLength;
+  }
 
   /// 构造要发给 LLM 的消息序列。
   ///
@@ -221,17 +269,28 @@ class OverflowManager {
     return window;
   }
 
-  /// 每次追加消息后调用。达到阈值就异步触发摘要。
+  /// 每次追加消息后调用。达到阈值就摘要一次。
   ///
-  /// 返回 true 表示本次触发了摘要（调用方可据此在 UI 上显示"正在整理记忆"）。
+  /// 返回 true 表示**真的摘出来了**，不是"试过了"。这两件事必须分开：
+  /// 试过但失败时窗口一点都没变短，而调用方会照着返回值在界面上说
+  /// 「已整理长期记忆」—— 那句话会把唯一一次能发现问题的机会盖掉。
+  /// 失败的原因在 [takeUnreportedError]。
   Future<bool> onMessageAdded(List<ChatMessage> history) async {
     if (_summarizing) return false;
     if (!_shouldSummarize(history)) return false;
-    await _summarizeUpTo(history);
-    return true;
+    return _summarizeUpTo(history);
   }
 
   bool _shouldSummarize(List<ChatMessage> history) {
+    // 上次失败之后要再攒够一个阈值才重试。
+    //
+    // 不退避的话，一个配坏的摘要模型会让**之后每加一条消息都白打一次请求**
+    // —— 又慢又花钱，而且每次都失败。而摘要失败通常是配置问题（地址、
+    // 模型名、协议对不上），重试一百次也不会自己好。
+    if (_failedAt >= 0 && history.length < _failedAt + messageThreshold) {
+      return false;
+    }
+
     final pending = history.length - _checkpoint;
     final byCount = pending >= messageThreshold * 2;
 
@@ -256,13 +315,13 @@ class OverflowManager {
   ///
   /// 注意保留的是**最近 T**，不是全部摘要完 —— 摘要完会导致模型丢失
   /// 刚刚几轮的原文，而那几轮往往正是当前任务的上下文。
-  Future<void> _summarizeUpTo(List<ChatMessage> history) async {
+  Future<bool> _summarizeUpTo(List<ChatMessage> history) async {
     _summarizing = true;
     final myEpoch = _epoch;
 
     try {
       final newCheckpoint = _findCheckpoint(history);
-      if (newCheckpoint <= _checkpoint) return;
+      if (newCheckpoint <= _checkpoint) return false;
 
       final batch = history.sublist(_checkpoint, newCheckpoint);
       final payload = StringBuffer();
@@ -282,13 +341,37 @@ class OverflowManager {
         payload.writeln('${m.role}: $body');
       }
 
-      final result = await summarize(_summaryPrompt, payload.toString());
+      final String result;
+      try {
+        result = await summarize(_summaryPrompt, payload.toString());
+      } catch (e) {
+        // **失败绝不推进 checkpoint。**
+        //
+        // 推进了就是：那批消息被踢出窗口，而没有任何摘要顶上 —— 上下文
+        // 凭空少一截，而且 hasSummary 为假会让 AgentLoop 的主动检索一起
+        // 跳过（见 `_retrieveInto`），被丢掉的内容连捞都捞不回来。
+        // 宁可不压缩：窗口更满一点，至少内容还在。
+        _fail(history, '$e');
+        return false;
+      }
 
       // 在途期间被 clear 了 —— 丢弃结果，不要复活旧状态。
-      if (myEpoch != _epoch) return;
+      if (myEpoch != _epoch) return false;
 
-      _summary = result.trim();
+      final next = result.trim();
+      if (next.isEmpty) {
+        // 请求成功但摘出来是空的，后果和失败一模一样：没有东西能替代那批
+        // 原文。摘要模型名填错时就是这样 —— 服务端 200，正文是空的。
+        _fail(history, '摘要模型返回了空结果');
+        return false;
+      }
+
+      _lastError = null;
+      _errorUnreported = false;
+      _failedAt = -1;
+      _summary = next;
       _checkpoint = newCheckpoint;
+      return true;
     } finally {
       _summarizing = false;
     }
@@ -335,10 +418,19 @@ class OverflowManager {
     return head.length > 120 ? '${head.substring(0, 120)}…' : head;
   }
 
+  void _fail(List<ChatMessage> history, String reason) {
+    _lastError = reason;
+    _errorUnreported = true;
+    _failedAt = history.length;
+  }
+
   void clear() {
     _epoch++;
     _checkpoint = 0;
     _summary = null;
+    _lastError = null;
+    _errorUnreported = false;
+    _failedAt = -1;
   }
 
   /// 摘要提示词。为终端 Agent 场景专门写过 ——

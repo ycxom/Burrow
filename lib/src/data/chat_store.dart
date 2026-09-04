@@ -80,7 +80,7 @@ class ChatStore {
   static Future<ChatStore> openAt(String path) async {
     final db = await openDatabase(
       path,
-      version: 11,
+      version: 13,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -144,6 +144,24 @@ class ChatStore {
           await db.execute('ALTER TABLE messages ADD COLUMN tool_ok INTEGER');
           await db.execute('ALTER TABLE messages ADD COLUMN tool_ms INTEGER');
         }
+        if (from < 12) {
+          // 滚动摘要的状态：那份摘要文本，和它覆盖到第几条。
+          //
+          // 以前只活在内存里，于是重开 app 或者切走再切回会话就归零 ——
+          // 长会话每次打开都要重新全量摘要一遍，而在那次摘要发生之前，
+          // **整段历史会原样发出去**，恰恰是最容易撞窗口上限的那一刻。
+          //
+          // 老会话这两列是空的：读回来就是"还没摘过"，和以前一模一样。
+          await db.execute('ALTER TABLE threads ADD COLUMN summary TEXT');
+          await db.execute(
+              'ALTER TABLE threads ADD COLUMN summary_checkpoint INTEGER');
+        }
+        if (from < 13) {
+          // 上次读到哪一条。NULL = 上次就停在最新那条（或者从没记过），
+          // 打开时直接到底 —— 和加这一列之前的行为一样。
+          await db.execute(
+              'ALTER TABLE threads ADD COLUMN last_read_message_id INTEGER');
+        }
         if (from < 8) {
           // 这一条是不是估算值。1 = 估算。
           //
@@ -162,7 +180,10 @@ class ChatStore {
             preview TEXT NOT NULL,
             updated_at INTEGER NOT NULL,
             terminal_mode INTEGER NOT NULL DEFAULT 0,
-            system_prompt TEXT
+            system_prompt TEXT,
+            summary TEXT,
+            summary_checkpoint INTEGER,
+            last_read_message_id INTEGER
           )
         ''');
         await db.execute('''
@@ -306,6 +327,63 @@ class ChatStore {
       whereArgs: <Object?>[threadId],
     );
   }
+
+  /// 这个会话上一次的滚动摘要状态。会话不存在、或者从没摘过时返回 null。
+  ///
+  /// 摘要和 checkpoint 一起取一起存 —— 分开的话中间任何一次失败都会留下
+  /// 「摘要是旧的、checkpoint 是新的」这种组合，而那正好是最坏的一种：
+  /// 一批消息被摘要覆盖掉，顶上去的却是覆盖不到它们的旧摘要。
+  Future<({String summary, int checkpoint})?> memoryOf(String threadId) async {
+    final rows = await _db.query(
+      'threads',
+      columns: <String>['summary', 'summary_checkpoint'],
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final summary = rows.first['summary'] as String?;
+    final checkpoint = rows.first['summary_checkpoint'] as int?;
+    if (summary == null || summary.isEmpty || checkpoint == null) return null;
+    return (summary: summary, checkpoint: checkpoint);
+  }
+
+  /// 存这个会话的滚动摘要状态。[summary] 为 null = 清掉。
+  Future<void> setMemory(String threadId, String? summary, int checkpoint) =>
+      _db.update(
+        'threads',
+        <String, Object?>{
+          'summary': summary,
+          'summary_checkpoint': summary == null ? null : checkpoint,
+        },
+        where: 'id = ?',
+        whereArgs: <Object?>[threadId],
+      );
+
+  /// 这个会话上次读到哪一条。null = 上次就在底部，打开时直接到最新。
+  ///
+  /// 存的是**消息 id 而不是滚动像素**。像素在重新排版之后没有意义 ——
+  /// 换个皮肤、调一次字号、换台屏幕，同一个数字指向的就是另一段对话了。
+  /// 而"我上次看到这条"是个和排版无关的事实。
+  Future<int?> lastReadOf(String threadId) async {
+    final rows = await _db.query(
+      'threads',
+      columns: <String>['last_read_message_id'],
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['last_read_message_id'] as int?;
+  }
+
+  /// 记下读到哪一条。[messageId] 为 null = 在底部。
+  Future<void> setLastRead(String threadId, int? messageId) => _db.update(
+        'threads',
+        <String, Object?>{'last_read_message_id': messageId},
+        where: 'id = ?',
+        whereArgs: <Object?>[threadId],
+      );
 
   Future<void> setTerminalMode(String threadId, bool on) async {
     await _db.update(

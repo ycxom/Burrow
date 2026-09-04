@@ -12,6 +12,11 @@
 ///
 /// 代理是**每个渠道各自的**：一个渠道走内网直连、另一个走梯子，是很常见的
 /// 组合，全局代理会把前者也拖进去。
+///
+/// 这里还存着**模型分工表**（见 [ModelRole]）：哪件事用哪个渠道的哪个模型。
+/// 放在这里而不是单独一个 store，是因为它的每一条都得先能解析成一个渠道 ——
+/// 而"这个渠道还在不在"只有这里知道，删渠道时顺手把指向它的指派一起清掉，
+/// 是唯一不会留下悬空指向的地方。
 library;
 
 import 'dart:convert';
@@ -24,6 +29,7 @@ import '../llm/llm_client.dart';
 import '../llm/model_registry.dart';
 import '../llm/system_prompt.dart';
 import '../llm/thinking_effort.dart';
+import 'model_roles.dart';
 
 @immutable
 
@@ -124,6 +130,39 @@ class ResolvedCapability {
   /// 这一项是自动探测来的（而不是用户勾的、也不是渠道默认值）。
   final bool visionFromRegistry;
   final bool toolsFromRegistry;
+}
+
+/// 一个角色最终落到哪儿：**哪个渠道**、**哪个模型**。
+///
+/// 渠道整个带出来而不是只带 id：调用方要的是地址、密钥、代理、协议这一整套，
+/// 只给 id 的话每个调用方都得自己再查一次，而查漏了的表现是"用 A 的地址发
+/// B 的模型名"—— 正是这张表要根治的那个毛病。
+class ResolvedRole {
+  const ResolvedRole({
+    required this.role,
+    required this.channel,
+    required this.model,
+    required this.inherited,
+  });
+
+  final ModelRole role;
+  final Channel channel;
+  final String model;
+
+  /// 用户没在表里指派，这是回退来的。
+  ///
+  /// 界面要把"你指的"和"回退来的"显示成两回事：一条回退来的指派会随着
+  /// 当前渠道变来变去，而用户看到一个具体的模型名时不会想到这一点。
+  final bool inherited;
+
+  /// 这一条的身份。嵌入用它判断"向量还是不是同一个空间里的"。
+  ///
+  /// 渠道 id 一起进指纹：同名模型在两家服务商那里是两个空间，只比模型名的话
+  /// 换个渠道之后旧向量会被当成还能用，而余弦算出来的是无意义的数。
+  String get fingerprint => '${channel.id}::$model';
+
+  @override
+  String toString() => '${channel.name} · $model';
 }
 
 class Channel {
@@ -412,15 +451,26 @@ class Channel {
 }
 
 class ChannelStore extends ChangeNotifier {
-  ChannelStore._(
-      this._channels, this._activeId, this._keys, this._prefs, this._secure);
+  ChannelStore._(this._channels, this._activeId, this._keys, this._roles,
+      this._prefs, this._secure);
 
   static const keyPrefix = 'burrow.channel.key.';
   static const _listKey = 'burrow.channels';
   static const _activeKey = 'burrow.channels.active';
+  static const _rolesKey = 'burrow.llm.modelRoles';
+
+  /// 旧版那份全局嵌入模型：只有模型名，没有渠道。见 [_claimLegacyEmbedding]。
+  static const legacyEmbeddingKey = 'burrow.llm.embeddingModel';
 
   final List<Channel> _channels;
   String? _activeId;
+
+  /// 模型分工表。只放**用户显式指派过**的角色 —— 没指派的走各自的回退
+  /// （见 [resolveRole]），存一份"等于回退值"的记录只会让回退跟着旧值冻住。
+  final Map<ModelRole, ModelRef> _roles;
+
+  /// 还没认领的旧版嵌入模型。见 [_claimLegacyEmbedding]。
+  String? _legacyEmbedding;
 
   /// models.dev 的能力表。默认空 —— 拉不到 / 还没加载时一切照旧，
   /// 全部退回渠道默认值，和加这个功能之前的行为完全一样。
@@ -482,11 +532,13 @@ class ChannelStore extends ChangeNotifier {
     List<Channel> channels = const [],
     Map<String, String> keys = const {},
     String? activeId,
+    Map<ModelRole, ModelRef> roles = const {},
   }) =>
       ChannelStore._(
         List<Channel>.from(channels),
         activeId,
         Map<String, String>.from(keys),
+        Map<ModelRole, ModelRef>.from(roles),
         null,
         null,
       );
@@ -534,7 +586,59 @@ class ChannelStore extends ChangeNotifier {
       }
     }
 
-    return ChannelStore._(channels, p.getString(_activeKey), keys, p, s);
+    final store = ChannelStore._(
+      channels,
+      p.getString(_activeKey),
+      keys,
+      _rolesFromJson(p.getString(_rolesKey)),
+      p,
+      s,
+    );
+    store._legacyEmbedding = p.getString(legacyEmbeddingKey);
+    await store._claimLegacyEmbedding();
+    return store;
+  }
+
+  static Map<ModelRole, ModelRef> _rolesFromJson(String? raw) {
+    if (raw == null || raw.isEmpty) return <ModelRole, ModelRef>{};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return <ModelRole, ModelRef>{};
+      final out = <ModelRole, ModelRef>{};
+      for (final entry in decoded.entries) {
+        final role = ModelRole.fromStorage(entry.key.toString());
+        final ref = ModelRef.fromJson(entry.value);
+        // 对话模型没有独立存储（它就是当前渠道），读到也丢掉 ——
+        // 留着的话表里会有两份"当前用哪个模型"，迟早对不上。
+        if (role == null || role == ModelRole.chat || ref == null) continue;
+        out[role] = ref;
+      }
+      return out;
+    } catch (_) {
+      // 表坏了当成没指派过。全部回退到当前渠道，和加这张表之前的行为一样。
+      return <ModelRole, ModelRef>{};
+    }
+  }
+
+  /// 把旧版那份「只有模型名」的嵌入模型认领成一条完整指派。
+  ///
+  /// 当初它就是配给当时那个渠道的（请求本来就发往当前渠道），所以认领给
+  /// 当前渠道是对的。不认领的话，升级后用户会发现自己配过的嵌入模型不见了
+  /// —— 而记忆检索会安静地退回两路词法，没有任何提示。
+  ///
+  /// 可能这一刻一个渠道都还没有（旧版单份配置要等 [migrateFrom] 才变成渠道），
+  /// 那就留着下次再认领，别在这里丢掉。
+  Future<void> _claimLegacyEmbedding() async {
+    final model = _legacyEmbedding?.trim();
+    if (model == null) return;
+    final id = active?.id;
+    if (id == null) return;
+    _legacyEmbedding = null;
+    if (model.isNotEmpty && !_roles.containsKey(ModelRole.embedding)) {
+      _roles[ModelRole.embedding] = ModelRef(channelId: id, model: model);
+      await _persist();
+    }
+    await _prefs?.remove(legacyEmbeddingKey);
   }
 
   /// 把旧版的单份配置搬成第一个渠道。
@@ -563,6 +667,8 @@ class ChannelStore extends ChangeNotifier {
     );
     await upsert(channel, apiKey: config.apiKey);
     await setActive(channel.id);
+    // 现在才有了第一个渠道，[load] 那次认领没赶上。
+    await _claimLegacyEmbedding();
   }
 
   Future<void> upsert(Channel channel, {String? apiKey}) async {
@@ -589,6 +695,9 @@ class ChannelStore extends ChangeNotifier {
   Future<void> remove(String id) async {
     _channels.removeWhere((c) => c.id == id);
     _keys.remove(id);
+    // 指向它的分工一起清掉。留着的话表里会显示一个存在过的模型名，
+    // 而实际上那一路已经不工作了 —— 又是一次"配了但没生效"。
+    _roles.removeWhere((_, ref) => ref.channelId == id);
     // 删掉的渠道正好是当前渠道时，落到第一个上而不是留一个悬空指向 ——
     // 悬空的话 active 会静默回退到 first，用户看不出发生了什么。
     if (_activeId == id) {
@@ -612,8 +721,103 @@ class ChannelStore extends ChangeNotifier {
     if (prefs == null) return;
     await prefs.setString(
         _listKey, jsonEncode(_channels.map((c) => c.toJson()).toList()));
+    await prefs.setString(
+      _rolesKey,
+      jsonEncode(<String, Object?>{
+        for (final entry in _roles.entries)
+          entry.key.storage: entry.value.toJson(),
+      }),
+    );
     final id = _activeId;
     if (id != null) await prefs.setString(_activeKey, id);
+  }
+
+  // -------------------------------------------------------------------------
+  // 模型分工表
+  // -------------------------------------------------------------------------
+
+  /// 表里为某个角色写着的那一条。**指向已删渠道时返回 null** ——
+  /// 悬空的指派和没指派的区别只在界面上，在运行时它俩都是"这一路不工作"，
+  /// 让调用方去分辨只会多出一堆判空。
+  ModelRef? refOf(ModelRole role) {
+    if (role == ModelRole.chat) {
+      final c = active;
+      return c == null ? null : ModelRef(channelId: c.id, model: c.model);
+    }
+    final ref = _roles[role];
+    if (ref == null) return null;
+    return byId(ref.channelId) == null ? null : ref;
+  }
+
+  /// 某个角色最终落到哪个渠道的哪个模型上。null = 这一路现在不工作。
+  ///
+  /// 回退规则**每个角色不一样**，因为"没指派"对它们的含义本来就不一样：
+  ///
+  ///   - [ModelRole.chat]：它就是当前渠道，没有别的来源。
+  ///   - [ModelRole.embedding]：没指派 = 不启用。向量路本来就是可选的第三路。
+  ///   - [ModelRole.vision]：没指派 = 交回给「哪些渠道自己配了视觉模型」那套
+  ///     多候选（见 vision.dart）。那套的价值是失败能换下一个，不该因为
+  ///     多了一张表就没了。
+  ///   - [ModelRole.summary]：没指派 = 当前渠道自己配的摘要模型，再没有就是
+  ///     对话模型本身。和加这张表之前完全一样。
+  ResolvedRole? resolveRole(ModelRole role) {
+    if (role == ModelRole.chat) {
+      final c = active;
+      final model = c?.model.trim() ?? '';
+      if (c == null || model.isEmpty) return null;
+      return ResolvedRole(
+          role: role, channel: c, model: model, inherited: true);
+    }
+
+    final ref = refOf(role);
+    if (ref != null) {
+      return ResolvedRole(
+        role: role,
+        channel: byId(ref.channelId)!,
+        model: ref.model,
+        inherited: false,
+      );
+    }
+
+    if (role != ModelRole.summary) return null;
+
+    final c = active;
+    if (c == null) return null;
+    final summary = c.summaryModel?.trim() ?? '';
+    final model = summary.isNotEmpty ? summary : c.model.trim();
+    if (model.isEmpty) return null;
+    return ResolvedRole(role: role, channel: c, model: model, inherited: true);
+  }
+
+  /// 指派一个角色。[ref] 为 null = 清掉这一条，回到该角色的回退。
+  ///
+  /// [ModelRole.chat] 走的是另一条路：它没有独立存储，指派它等于**换当前
+  /// 渠道 + 改那个渠道的模型**。顺序不能反 —— 先改模型的话，那个模型会被
+  /// 写到用户正想离开的那个渠道上。
+  Future<void> assignRole(ModelRole role, ModelRef? ref) async {
+    if (role == ModelRole.chat) {
+      if (ref == null || byId(ref.channelId) == null) return;
+      await setActive(ref.channelId);
+      final channel = byId(ref.channelId)!;
+      if (channel.model != ref.model) {
+        await upsert(channel.copyWith(model: ref.model));
+      }
+      return;
+    }
+
+    final next = ref == null || ref.model.trim().isEmpty
+        ? null
+        : ModelRef(channelId: ref.channelId, model: ref.model.trim());
+    if (next != null && byId(next.channelId) == null) return;
+    if (_roles[role] == next) return;
+
+    if (next == null) {
+      _roles.remove(role);
+    } else {
+      _roles[role] = next;
+    }
+    notifyListeners();
+    await _persist();
   }
 
   /// 当前渠道投影成 [LlmConfig]。
@@ -647,4 +851,17 @@ class ChannelStore extends ChangeNotifier {
       thinkingEffort: thinkingEffort,
     );
   }
+
+  /// 一个角色那次请求要用的配置：地址、密钥、代理、协议全跟着**它自己那个
+  /// 渠道**走，只把模型换成它的。
+  ///
+  /// 这个方法就是这张表存在的全部意义 —— 在它之前，配角模型只有一个名字，
+  /// 而地址和密钥现取当前渠道的。
+  LlmConfig configForRole(ResolvedRole role, {bool sendImagesInline = false}) =>
+      configFor(role.channel, sendImagesInline: sendImagesInline).copyWith(
+        model: role.model,
+        // 摘要请求读的是 summaryModel 那个字段，不一起换的话它会退回渠道
+        // 自己配的摘要模型 —— 那就等于这条指派没生效。
+        summaryModel: role.model,
+      );
 }

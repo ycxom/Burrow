@@ -79,3 +79,41 @@ int _countOf(List<ChatMessage> messages, String role) {
   }
   return n;
 }
+
+/// 摘要分隔线画在界面上第几条**之前**。**0 = 不画。**
+///
+/// [checkpoint] 是 `history` 的下标，而界面画的是 `visible` —— 上面那段说得
+/// 很清楚，两个列表不是一份东西的两个视图。直接拿 checkpoint 当界面下标用，
+/// 线就会画错位置。
+///
+/// 返回 0 表示"这里没有边界"，调用方必须据此**不插那一行**。这不是个可有
+/// 可无的约定：0 同时也是一个合法的下标，把它当位置用就会在列表最前面插一条
+/// 空的分隔行 —— 而那一行没有对应的消息，画的时候会去取 `visible[-1]`。
+/// release 构建里抛异常的 widget 渲染成一块纯灰色方块，于是表现是「聊天记录
+/// 上方多出一大片灰色」，看不出和摘要有任何关系。这个函数被抽出来就是为了
+/// 让那件事有地方钉住。
+int summaryBoundaryIndex(
+  List<ChatMessage> visible,
+  List<ChatMessage> history,
+  int checkpoint,
+) {
+  if (checkpoint <= 0 || visible.isEmpty) return 0;
+
+  // 从 checkpoint 往前找**最后一条界面上也有的**消息。history 里夹着一些
+  // 只给模型看的东西（检索注入、图片描述），它们没有对应的气泡。
+  //
+  // 只往回找几步就放弃：注入的东西不会连着一大串，找了十几步还对不上说明
+  // 两个列表已经不同步了 —— 那时候猜一个位置画条线，比不画更糟。
+  final from = (checkpoint < history.length ? checkpoint : history.length) - 1;
+  for (var h = from; h >= 0 && h > from - 16; h--) {
+    final covered = history[h];
+    for (var v = visible.length - 1; v >= 0; v--) {
+      if (identical(visible[v], covered)) {
+        // 线只画在中间。落在最后一条之后等于"整段对话都被摘要了"，
+        // 那条线下面什么都没有，画出来只会让人以为消息没了。
+        return v + 1 >= visible.length ? 0 : v + 1;
+      }
+    }
+  }
+  return 0;
+}

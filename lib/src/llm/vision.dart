@@ -55,10 +55,21 @@ class VisionCandidate {
   /// 在列候选的时候取好、等真轮到它时早就失效了 —— 而候选可能永远轮不到。
   final Future<String> Function() auth;
 
+  /// 用户在模型分工表里**点名**的那一个。
+  ///
+  /// 点名了就先用它，而不是和别的候选一起进随机池 —— 随机是给"地位相同的
+  /// 几个"用的，被点名的那个地位不同：用户指定了"图片转文字用 C 渠道的这个
+  /// 模型"，结果一半的图被随机丢给了别的渠道，那条指派就等于没设。
+  ///
+  /// 它失败时**仍然会退到别的候选**。前置多模态是可选增强，不该因为点名的
+  /// 那个网关抽风就让整条消息发不出去。
+  final bool preferred;
+
   const VisionCandidate({
     required this.label,
     required this.config,
     required this.auth,
+    this.preferred = false,
   });
 }
 
@@ -144,15 +155,17 @@ class VisionPreprocessor {
 
     final pool = List<VisionCandidate>.from(candidates());
     if (pool.isEmpty) {
-      return VisionResult.failure('没有可用的视觉模型。到「渠道管理」里给某个渠道填一个视觉模型，'
+      return VisionResult.failure('没有可用的视觉模型。到「模型分工」里指一个「图片转文字」模型，'
           '或者把当前渠道标记成「对话模型能直接看图」。');
     }
 
     final failures = <String>[];
     while (pool.isNotEmpty) {
-      // 随机挑而不是按顺序：按顺序的话第一个永远扛住全部流量，
-      // 而它多半也是最贵的那个（用户会把最好的排在前面）。
-      final candidate = pool.removeAt(_random.nextInt(pool.length));
+      // 被点名的先用。剩下的随机挑而不是按顺序：按顺序的话第一个永远扛住
+      // 全部流量，而它多半也是最贵的那个（用户会把最好的排在前面）。
+      final named = pool.indexWhere((c) => c.preferred);
+      final candidate =
+          pool.removeAt(named >= 0 ? named : _random.nextInt(pool.length));
       final client = createClient(candidate.config, candidate.auth);
       try {
         final description = await client.describeImages(

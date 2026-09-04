@@ -543,7 +543,8 @@ class _ContextSettingsPageState extends State<ContextSettingsPage> {
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
         children: <Widget>[
           const _SectionTitle('什么时候自动摘要',
-              subtitle: '超过阈值时把最早的对话压成一段摘要。'
+              subtitle: '阈值是「窗口里要留多少」。攒到两倍时摘一次，'
+                  '把超出的那半压成摘要、留下最近的那半。'
                   '原始记录不删，模型可以用 recall_memory 查回来'),
           Card(
             clipBehavior: Clip.antiAlias,
@@ -573,7 +574,9 @@ class _ContextSettingsPageState extends State<ContextSettingsPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
-                  Text('消息条数阈值：${_messages.round()} 条',
+                  Text(
+                      '消息条数阈值：${_messages.round()} 条'
+                      '（攒到 ${_messages.round() * 2} 条时摘一次）',
                       style: Theme.of(context).textTheme.titleSmall),
                   Slider(
                     value: _messages,
@@ -586,7 +589,9 @@ class _ContextSettingsPageState extends State<ContextSettingsPage> {
                         store.setContextLimits(messageThreshold: v.round()),
                   ),
                   const SizedBox(height: 4),
-                  Text('token 阈值：${_tokens.round()}',
+                  Text(
+                      'token 阈值：${_tokens.round()}'
+                      '（攒到 ${_tokens.round() * 2} 时摘一次）',
                       style: Theme.of(context).textTheme.titleSmall),
                   Slider(
                     value: _tokens,
@@ -618,11 +623,24 @@ class _ContextSettingsPageState extends State<ContextSettingsPage> {
               children: <Widget>[
                 ListTile(
                   dense: true,
-                  leading: const Icon(Icons.compress),
+                  leading: Icon(
+                    Icons.compress,
+                    color: overflow.lastError == null ? null : scheme.error,
+                  ),
                   title: const Text('摘要覆盖'),
-                  subtitle: Text(overflow.hasSummary
-                      ? '已覆盖到第 ${overflow.checkpoint} 条'
-                      : '还没有触发过摘要'),
+                  // 失败必须在这里说出来。原来无论成功、失败还是没触发，
+                  // 这一行都只有「还没有触发过摘要」一句 —— 而摘要一直
+                  // 失败的表现恰好也是这一句，用户找不到任何可查的方向。
+                  subtitle: Text(
+                    switch ((overflow.lastError, overflow.hasSummary)) {
+                      (final why?, _) => '上次整理失败，已保留原文：$why',
+                      (_, true) => '已覆盖到第 ${overflow.checkpoint} 条',
+                      _ => '还没有触发过摘要',
+                    },
+                    style: overflow.lastError == null
+                        ? null
+                        : TextStyle(color: scheme.error),
+                  ),
                 ),
                 const Divider(height: 1),
                 ListTile(

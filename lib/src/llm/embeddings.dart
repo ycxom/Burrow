@@ -10,6 +10,7 @@
 /// 否则就是又一次静默失败（见 README 里 `/v1` 那一节）。
 library;
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -35,10 +36,20 @@ const _batchTooLarge = {400, 413, 422};
 const _maxChars = 4000;
 
 class OpenAiEmbedder {
-  /// 都用闭包现读，而不是构造时快照 —— 用户在底部那条切换器上换了嵌入模型，
+  /// 都用闭包现读，而不是构造时快照 —— 用户在模型分工表里换了嵌入模型，
   /// 下一次检索就该用新的，不该等重开会话。
+  ///
+  /// 地址跟着**嵌入模型自己那个渠道**走，不是当前对话渠道。这两者曾经是
+  /// 同一个，于是「聊天用 A、嵌入用 B」配出来的实际行为是拿 B 的模型名去
+  /// A 的地址上请求 —— 一路 404，或者更糟：A 上刚好有个同名模型，
+  /// 于是照常计费、照常返回一堆不在同一空间里的向量。
   final String Function() baseUrl;
-  final String Function() apiKey;
+
+  /// 这次请求的 Authorization。
+  ///
+  /// 允许返回 Future：OAuth 渠道的 access_token 会过期，每次现取才是对的，
+  /// 而"现取"本身是个异步动作（可能要先刷新一次）。
+  final FutureOr<String> Function() apiKey;
 
   /// 嵌入模型 id。空 = 没启用。
   final String Function() model;
@@ -138,7 +149,7 @@ class OpenAiEmbedder {
     String modelId,
     List<String> chunk,
   ) async {
-    final key = apiKey().trim();
+    final key = (await apiKey()).trim();
     final response = await _client
         .post(
           resolveApiEndpoint(base, '/embeddings'),

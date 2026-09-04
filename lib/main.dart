@@ -34,6 +34,7 @@ import 'src/sandbox/sandbox_session.dart';
 import 'src/sandbox/snapshot_store.dart';
 import 'src/settings/account_store.dart';
 import 'src/settings/channel_store.dart';
+import 'src/settings/model_roles.dart';
 import 'src/settings/settings_store.dart';
 import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
@@ -246,14 +247,24 @@ Future<void> _boot({
   // 不接这一条的话「切了模型但还在用旧的」—— 而且切换本身看起来是成功的。
   settings.addListener(() => llm.config = settings.config);
 
-  // 嵌入后端。全部用闭包现读设置：换了嵌入模型下一次检索就生效。
-  final embedder = OpenAiEmbedder(
-    baseUrl: () => settings.config.baseUrl,
-    apiKey: () => settings.config.apiKey,
-    model: () => settings.embeddingModel,
-    proxy: () => channels.active?.proxy ?? '',
-  );
   final accounts = await AccountStore.load();
+
+  /// 一个配角模型这次落到哪儿。**每次现算** —— 分工表和渠道都随时会变。
+  ResolvedRole? role(ModelRole which) => channels.resolveRole(which);
+
+  // 嵌入后端。地址、密钥、代理全跟着**嵌入模型自己那个渠道**走，
+  // 而不是当前对话渠道 —— 那正是「聊天用 A、嵌入用 B」以前配不出来的原因。
+  final embedder = OpenAiEmbedder(
+    baseUrl: () => role(ModelRole.embedding)?.channel.baseUrl ?? '',
+    apiKey: () async {
+      final bound = role(ModelRole.embedding);
+      if (bound == null) return '';
+      return accounts.authFor(bound.channel,
+          apiKey: channels.apiKeyOf(bound.channel));
+    },
+    model: () => role(ModelRole.embedding)?.model ?? '',
+    proxy: () => role(ModelRole.embedding)?.channel.proxy ?? '',
+  );
 
   // 老版本把 baseUrl/key/model 存在 prefs 的单份配置里。不迁的话，
   // 升级后用户看到的是一个空的渠道列表 —— 那看起来就是"我的配置丢了"。
@@ -302,6 +313,34 @@ Future<void> _boot({
     ));
   };
 
+  /// 压缩历史。
+  ///
+  /// 摘要模型指到别的渠道时，**得用那个渠道自己的客户端**：主客户端的地址、
+  /// 密钥、代理都是当前对话渠道的，拿它去发一个属于别家的模型名，结果不是
+  /// 404 就是安静地摘出一段空的（[ConfigurableLlmClient.summarize] 出错时
+  /// 返回空串，不抛）。
+  ///
+  /// 没指派、或者指派的就是当前渠道时走主客户端 —— 那条路上有连接复用，
+  /// 而摘要在长对话里会反复发生。
+  Future<String> summarize(String systemPrompt, String payload) async {
+    final bound = role(ModelRole.summary);
+    if (bound == null ||
+        bound.inherited ||
+        bound.channel.id == channels.activeId) {
+      return llm.summarize(systemPrompt, payload);
+    }
+    final client = ConfigurableLlmClient(
+      config: channels.configForRole(bound),
+      httpClient: buildHttpClient(proxy: bound.channel.proxy),
+    )..bearerProvider = () => accounts.authFor(bound.channel,
+        apiKey: channels.apiKeyOf(bound.channel));
+    try {
+      return await client.summarize(systemPrompt, payload);
+    } finally {
+      client.cancel();
+    }
+  }
+
   // Skill 装在 rootfs 的 /opt/burrow-skills 里，索引留在 app 私有目录 ——
   // rootfs 会被「代目录 + 原子 rename」整个换掉，索引跟着丢的话
   // 用户会看到「我明明装过的 skill 不见了」。见 SkillStore 的注释。
@@ -332,20 +371,39 @@ Future<void> _boot({
   //
   // 候选**每次现算**而不是启动时定好：渠道随时会被改、被删，
   // 定好的一份列表迟早会指向一个不存在的渠道。
+  //
+  // 分工表里点名的那个排最前（[VisionCandidate.preferred]），剩下的仍然是
+  // 「哪些渠道自己配了视觉模型」那份。点名的失败了还能退到别人身上。
   final vision = VisionPreprocessor(
-    candidates: () => <VisionCandidate>[
-      for (final channel in channels.channels)
-        if (channel.canDescribeImages)
+    candidates: () {
+      final named = role(ModelRole.vision);
+      return <VisionCandidate>[
+        if (named != null)
           VisionCandidate(
-            label: '${channel.name} · ${channel.visionModel}',
-            // 地址、协议、代理都跟着那个渠道走，只把模型换成视觉模型。
-            config: channels
-                .configFor(channel, sendImagesInline: true)
-                .copyWith(model: channel.visionModel),
-            auth: () =>
-                accounts.authFor(channel, apiKey: channels.apiKeyOf(channel)),
+            label: '${named.channel.name} · ${named.model}',
+            config: channels.configForRole(named, sendImagesInline: true),
+            auth: () => accounts.authFor(named.channel,
+                apiKey: channels.apiKeyOf(named.channel)),
+            preferred: true,
           ),
-    ],
+        for (final channel in channels.channels)
+          if (channel.canDescribeImages &&
+              // 点名的那个已经在上面了，别再作为普通候选进一次池 ——
+              // 进两次的话它在"随机挑"里的权重会翻倍，而它本来就不该参与随机。
+              !(named != null &&
+                  named.channel.id == channel.id &&
+                  named.model == channel.visionModel))
+            VisionCandidate(
+              label: '${channel.name} · ${channel.visionModel}',
+              // 地址、协议、代理都跟着那个渠道走，只把模型换成视觉模型。
+              config: channels
+                  .configFor(channel, sendImagesInline: true)
+                  .copyWith(model: channel.visionModel),
+              auth: () =>
+                  accounts.authFor(channel, apiKey: channels.apiKeyOf(channel)),
+            ),
+      ];
+    },
     createClient: (config, auth) => ConfigurableLlmClient(
       config: config,
       httpClient: buildHttpClient(proxy: config.proxy),
@@ -366,13 +424,19 @@ Future<void> _boot({
       snapshots: runtime.snapshots,
       prefixGens: gens,
       overflow: OverflowManager(
-        summarize: llm.summarize,
+        summarize: summarize,
         trigger: settings.overflowTrigger,
         messageThreshold: settings.messageThreshold,
         tokenThreshold: settings.tokenThreshold,
       ),
       // 每个会话一份向量索引：语料是这个会话的历史，跨会话共用没有意义。
-      retrieval: MemoryRetrieval(embedder: embedder.call),
+      //
+      // 指纹交给它自己盯：换了嵌入模型（或者把那个渠道删了）之后旧向量
+      // 就不在同一个空间里了，而算出来的余弦仍然是个"看着挺正常"的数。
+      retrieval: MemoryRetrieval(
+        embedder: embedder.call,
+        fingerprint: () => role(ModelRole.embedding)?.fingerprint ?? '',
+      ),
       distiller: OutputDistiller(),
       limitGuard: ContextLimitGuard(),
       skills: skills,

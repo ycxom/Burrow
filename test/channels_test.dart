@@ -5,9 +5,12 @@
 /// 没有一个会抛异常，所以只能在这里钉死。
 library;
 
+import 'dart:convert';
+
 import 'package:burrow/src/llm/llm_client.dart';
 import 'package:burrow/src/net/proxy_client.dart';
 import 'package:burrow/src/settings/channel_store.dart';
+import 'package:burrow/src/settings/model_roles.dart';
 import 'package:burrow/src/settings/settings_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -235,6 +238,7 @@ void main() {
   });
 
   _modelCacheTests();
+  _modelRoleTests();
 
   group('客户端换代理', () {
     test('换配置时代理变了会重建底层客户端', () {
@@ -253,6 +257,168 @@ void main() {
 
 /// 模型列表**跟着渠道走**。
 ///
+
+/// 模型分工表：哪件事用哪个渠道的哪个模型。
+///
+/// 这一组钉的是和上面那份模型缓存同一个病根：配角模型曾经只有一个**名字**，
+/// 地址和密钥现取当前渠道的。于是「聊天用 A、嵌入用 B」配出来的实际行为是
+/// 拿 B 的模型名去 A 的地址上请求 —— 一路 404，或者更糟：A 上刚好有个同名
+/// 模型，于是照常计费、照常返回一堆不在同一空间里的向量。
+///
+/// 全都不抛异常，所以只能在这里钉死。
+void _modelRoleTests() {
+  const a = Channel(
+    id: 'c1',
+    name: '本地网关',
+    baseUrl: 'http://gw:3000',
+    model: 'glm-5',
+    proxy: '127.0.0.1:7890',
+  );
+  const b = Channel(
+    id: 'c2',
+    name: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-5',
+  );
+
+  group('模型分工表', () {
+    setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+
+    test('配角模型发往它自己那个渠道，不是当前渠道', () async {
+      final channels = ChannelStore.forTest(
+        channels: [a, b],
+        activeId: 'c1',
+        keys: {'c2': 'sk-openai'},
+      );
+      await channels.assignRole(ModelRole.embedding,
+          const ModelRef(channelId: 'c2', model: 'text-embedding-3-small'));
+
+      final resolved = channels.resolveRole(ModelRole.embedding)!;
+      expect(resolved.channel.id, 'c2');
+      expect(resolved.channel.baseUrl, 'https://api.openai.com/v1');
+      expect(resolved.model, 'text-embedding-3-small');
+      // 当前对话渠道**没有**被拖着一起换。为了换个嵌入模型把整个对话搬走，
+      // 正是这张表要根治的事。
+      expect(channels.activeId, 'c1');
+    });
+
+    test('投影出来的配置带的是那个渠道的地址、密钥和代理', () async {
+      final channels = ChannelStore.forTest(
+        channels: [a, b],
+        activeId: 'c1',
+        keys: {'c1': 'sk-local', 'c2': 'sk-openai'},
+      );
+      await channels.assignRole(ModelRole.vision,
+          const ModelRef(channelId: 'c2', model: 'gpt-5-vision'));
+
+      final config =
+          channels.configForRole(channels.resolveRole(ModelRole.vision)!);
+      expect(config.baseUrl, 'https://api.openai.com/v1');
+      expect(config.apiKey, 'sk-openai');
+      expect(config.model, 'gpt-5-vision');
+      // 代理跟着 c2（没配），不是当前渠道 c1 那个 —— 抄错的话表现只是超时，
+      // 看不出和代理有关。
+      expect(config.proxy, isNull);
+    });
+
+    test('对话模型的指派 = 换渠道 + 换那个渠道的模型', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      await channels.assignRole(
+          ModelRole.chat, const ModelRef(channelId: 'c2', model: 'gpt-5-mini'));
+
+      expect(channels.activeId, 'c2');
+      expect(channels.byId('c2')!.model, 'gpt-5-mini');
+      // 顺序反了的话新模型会被写到用户正想离开的那个渠道上。
+      expect(channels.byId('c1')!.model, 'glm-5');
+    });
+
+    test('删掉渠道会连指向它的分工一起清掉', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      await channels.assignRole(ModelRole.embedding,
+          const ModelRef(channelId: 'c2', model: 'text-embedding-3-small'));
+
+      await channels.remove('c2');
+      // 留着的话表里会显示一个存在过的模型名，而那一路其实已经不工作了。
+      expect(channels.refOf(ModelRole.embedding), isNull);
+      expect(channels.resolveRole(ModelRole.embedding), isNull);
+    });
+
+    test('摘要没指派时跟着当前渠道，指派后不再跟着', () async {
+      const withSummary = Channel(
+        id: 'c1',
+        name: '本地网关',
+        baseUrl: 'http://gw:3000',
+        model: 'glm-5',
+        summaryModel: 'glm-4.6-flash',
+      );
+      final channels =
+          ChannelStore.forTest(channels: [withSummary, b], activeId: 'c1');
+
+      final inherited = channels.resolveRole(ModelRole.summary)!;
+      expect(inherited.model, 'glm-4.6-flash');
+      expect(inherited.inherited, isTrue);
+
+      await channels.assignRole(ModelRole.summary,
+          const ModelRef(channelId: 'c2', model: 'gpt-5-mini'));
+      final assigned = channels.resolveRole(ModelRole.summary)!;
+      expect(assigned.channel.id, 'c2');
+      expect(assigned.inherited, isFalse);
+    });
+
+    test('嵌入没指派 = 不启用，没有任何回退', () async {
+      final channels = ChannelStore.forTest(channels: [a], activeId: 'c1');
+      // 回退到对话模型的话，检索会拿一个聊天模型去打 /embeddings，
+      // 而失败是安静的 —— 用户只会觉得"检索有时候不太准"。
+      expect(channels.resolveRole(ModelRole.embedding), isNull);
+    });
+
+    test('指纹带上渠道：同名模型在两家服务商那里是两个空间', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      await channels.assignRole(ModelRole.embedding,
+          const ModelRef(channelId: 'c1', model: 'bge-m3'));
+      final first = channels.resolveRole(ModelRole.embedding)!.fingerprint;
+
+      await channels.assignRole(ModelRole.embedding,
+          const ModelRef(channelId: 'c2', model: 'bge-m3'));
+      final second = channels.resolveRole(ModelRole.embedding)!.fingerprint;
+
+      expect(first, isNot(second));
+    });
+
+    test('落盘的是完整的一对，重开还在', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final prefs = await SharedPreferences.getInstance();
+      final first = await ChannelStore.load(prefs: prefs, secure: null);
+      await first.upsert(a);
+      await first.upsert(b);
+      await first.assignRole(ModelRole.embedding,
+          const ModelRef(channelId: 'c2', model: 'text-embedding-3-small'));
+
+      final second = await ChannelStore.load(prefs: prefs, secure: null);
+      final ref = second.refOf(ModelRole.embedding)!;
+      expect(ref.channelId, 'c2');
+      expect(ref.model, 'text-embedding-3-small');
+    });
+
+    test('旧版那份只有模型名的嵌入配置，认领给当时那个渠道', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'burrow.channels': jsonEncode(<Object>[a.toJson(), b.toJson()]),
+        'burrow.channels.active': 'c2',
+        ChannelStore.legacyEmbeddingKey: 'text-embedding-3-small',
+      });
+      final prefs = await SharedPreferences.getInstance();
+      final store = await ChannelStore.load(prefs: prefs, secure: null);
+
+      // 当初请求就是发往当时那个渠道的，所以认领给它是对的。不认领的话，
+      // 升级后用户配过的嵌入模型会安静地消失。
+      final ref = store.refOf(ModelRole.embedding)!;
+      expect(ref.channelId, 'c2');
+      expect(ref.model, 'text-embedding-3-small');
+      expect(prefs.getString(ChannelStore.legacyEmbeddingKey), isNull);
+    });
+  });
+}
+
 /// 这一组钉的是一个会让人花错钱的 bug：模型列表曾经是一份全局缓存，
 /// 在 A 渠道拉一次、切到 B，选择器里列的还是 A 的模型。挑一个发出去，
 /// 要么 404，要么更糟 —— B 那边刚好有个同名模型，于是照常计费。

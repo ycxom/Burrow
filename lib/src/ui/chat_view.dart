@@ -27,9 +27,10 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import '../agent/agent_loop.dart' show TokenUsage;
 import '../context/token_counter.dart';
 import '../settings/settings_store.dart';
+import 'anchored_menu.dart';
 import 'chat_theme.dart';
+import 'glass_surface.dart';
 import 'image_attachments.dart';
-import 'liquid_glass.dart';
 import 'skin_parts.dart';
 import 'skin_style.dart';
 import 'thinking.dart';
@@ -637,6 +638,138 @@ class _ServicePillState extends State<ServicePill> {
   }
 }
 
+/// 摘要分隔线：**这条线以上的对话已经被压成一段摘要了**。
+///
+/// 在它之前，滚动摘要是完全看不见的：模型收到的上下文里少了一大截原文、多了
+/// 一段摘要，而界面上一切照旧。于是「它怎么忘了我十分钟前说的话」这个最常见
+/// 的疑问，在界面上找不到任何线索 —— 用户唯一能查的地方是设置里一行
+/// 「已覆盖到第 N 条」，而那行字和聊天记录对不上号。
+///
+/// 所以这条线要画在**它真正发生的位置上**：线以上是模型只通过摘要知道的，
+/// 线以下是它逐字读到的。点一下摊开摘要原文 —— 那是「模型现在到底记得什么」
+/// 的准确答案，比任何解释都直接。
+///
+/// 默认收起：绝大多数时候用户只需要知道「这里有一道线」。
+class SummaryDivider extends StatefulWidget {
+  const SummaryDivider({
+    required this.covered,
+    required this.summary,
+    super.key,
+  });
+
+  /// 线以上有多少条消息被这段摘要覆盖了。
+  final int covered;
+
+  /// 摘要正文。
+  final String summary;
+
+  @override
+  State<SummaryDivider> createState() => _SummaryDividerState();
+}
+
+class _SummaryDividerState extends State<SummaryDivider> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.chat;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Expanded(child: Divider(height: 1, color: t.tintTertiary)),
+              GestureDetector(
+                onTap: () => setState(() => _expanded = !_expanded),
+                behavior: HitTestBehavior.opaque,
+                child: Padding(
+                  // 线本身只有一像素高，直接点太难点中。四周留一圈 padding
+                  // 把可点区域撑到手指的尺寸。
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: t.servicePill,
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(
+                          _expanded
+                              ? Icons.keyboard_arrow_up_rounded
+                              : Icons.keyboard_arrow_down_rounded,
+                          size: 15,
+                          color: t.tintOnService,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '以上 ${widget.covered} 条已压缩成摘要',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                            color: t.tintOnService,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              Expanded(child: Divider(height: 1, color: t.tintTertiary)),
+            ],
+          ),
+          // 收起时**根本不建**那张卡片，而不是把它藏起来。摘要动辄几百字，
+          // 藏起来的那份仍然要排版、仍然进无障碍树 —— 一段看不见的文字被
+          // 读屏念出来，比不做这个折叠还糟。
+          AnimatedSize(
+            duration: const Duration(milliseconds: 160),
+            curve: Curves.easeOut,
+            alignment: Alignment.topCenter,
+            child: _expanded
+                ? _card(t)
+                : const SizedBox(width: double.infinity),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _card(ChatTokens t) => Container(
+        width: double.infinity,
+        margin: const EdgeInsets.only(top: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: t.bgSecondary,
+          borderRadius: BorderRadius.circular(ChatShape.radiusLg),
+          border: Border.all(color: t.tintTertiary.withValues(alpha: 0.4)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              widget.summary,
+              style: TextStyle(
+                fontSize: 12.5,
+                height: 1.5,
+                color: t.tintSecondary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            // 说清楚原文没丢。不说的话，看到"已压缩"三个字的第一反应
+            // 是"我的记录被删了"。
+            Text(
+              '原文都还在，往上翻就能看到；模型也能自己检索回去。',
+              style: TextStyle(fontSize: 11, color: t.tintTertiary),
+            ),
+          ],
+        ),
+      );
+}
+
 // ---------------------------------------------------------------------------
 // 气泡
 // ---------------------------------------------------------------------------
@@ -1089,71 +1222,54 @@ class ChatBubble extends StatelessWidget {
   }
 
   /// 长按菜单。Telegram 的消息操作全在这里。
+  ///
+  /// 用和 `+`、终端图标同一个浮层（见 anchored_menu.dart），而不是
+  /// Material 的 `showMenu`：那个弹出来是一块和输入框、和别的菜单都不像的
+  /// 白板 —— 用户把输入框调成液态玻璃之后，长按消息弹出来的还是一块实心
+  /// 灰卡，而这两样东西在屏幕上只隔着几十像素。
+  ///
+  /// 锚点是**手指落下的那个点**，不是某个按钮：气泡上没有按钮，长按的位置
+  /// 就是用户注意力所在。
   Future<void> _showMenu(BuildContext context, Offset globalPos) async {
     if (text.trim().isEmpty) return;
-    final overlay =
-        Overlay.of(context).context.findRenderObject() as RenderBox?;
-    if (overlay == null) return;
-
     final t = context.chat;
-    final selected = await showMenu<String>(
+
+    final selected = await showAnchoredMenu<String>(
       context: context,
-      position: RelativeRect.fromRect(
-        globalPos & const Size(1, 1),
-        Offset.zero & overlay.size,
-      ),
-      items: <PopupMenuEntry<String>>[
-        const PopupMenuItem(
-          value: 'copy',
-          child: ListTile(
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.copy_outlined, size: 20),
-            title: Text('复制'),
-          ),
+      at: globalPos,
+      builder: (menuContext, _) => <Widget>[
+        MenuAction(
+          icon: Icons.copy_outlined,
+          label: '复制',
+          onTap: () => Navigator.pop(menuContext, 'copy'),
         ),
         if (onRetry != null)
-          const PopupMenuItem(
-            value: 'retry',
-            child: ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.refresh, size: 20),
-              title: Text('重新生成'),
-            ),
+          MenuAction(
+            icon: Icons.refresh,
+            label: '重新生成',
+            onTap: () => Navigator.pop(menuContext, 'retry'),
           ),
         if (onEdit != null)
-          const PopupMenuItem(
-            value: 'edit',
-            child: ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.edit_outlined, size: 20),
-              // 具体是"保存"还是"保存并重发"由编辑框里再选 ——
-              // 助手消息没有"重发"，那个按钮压根不会出现。
-              title: Text('编辑'),
-            ),
+          MenuAction(
+            icon: Icons.edit_outlined,
+            label: '编辑',
+            // 具体是"保存"还是"保存并重发"由编辑框里再选 ——
+            // 助手消息没有"重发"，那个按钮压根不会出现。
+            onTap: () => Navigator.pop(menuContext, 'edit'),
           ),
         if (onRewind != null)
-          const PopupMenuItem(
-            value: 'rewind',
-            child: ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.history, size: 20),
-              title: Text('回到这里'),
-              subtitle: Text('对话和文件一起回退', style: TextStyle(fontSize: 11)),
-            ),
+          MenuAction(
+            icon: Icons.history,
+            label: '回到这里',
+            detail: '对话和文件一起回退',
+            onTap: () => Navigator.pop(menuContext, 'rewind'),
           ),
         if (onDelete != null)
-          PopupMenuItem(
-            value: 'delete',
-            child: ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.delete_outline, size: 20, color: t.tintError),
-              title: Text('删除这条及之后', style: TextStyle(color: t.tintError)),
-            ),
+          MenuAction(
+            icon: Icons.delete_outline,
+            label: '删除这条及之后',
+            tone: t.tintError,
+            onTap: () => Navigator.pop(menuContext, 'delete'),
           ),
       ],
     );
@@ -1493,7 +1609,7 @@ class _ChatComposerState extends State<ChatComposer> {
                   curve: Curves.easeOutCubic,
                   alignment: Alignment.bottomCenter,
                   clipBehavior: Clip.none,
-                  child: _ComposerSurface(
+                  child: GlassSurface(
                     effect: widget.effect,
                     blur: widget.blur,
                     opacity: widget.opacity,
@@ -1696,294 +1812,6 @@ class _ComposerDock extends StatelessWidget {
       ),
     );
   }
-}
-
-/// 输入药丸的材质层。模糊只裁在药丸内部，阴影留在裁剪外；否则玻璃会把整块
-/// 底栏都糊掉，看起来像半透明面板而不是悬浮在壁纸上的一滴液体。
-class _ComposerSurface extends StatelessWidget {
-  const _ComposerSurface({
-    required this.effect,
-    required this.blur,
-    required this.opacity,
-    required this.style,
-    required this.child,
-    this.focused = false,
-  });
-
-  final ChatComposerEffect effect;
-  final double blur;
-  final double opacity;
-
-  /// 已经按焦点状态解析过的 `composer.field` 样式。由 ChatComposer 传进来而不是
-  /// 在这里查 context.parts —— 焦点只有它知道。
-  final PartStyle style;
-  final Widget child;
-  final bool focused;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.chat;
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final alpha = opacity.clamp(0.25, 1.0).toDouble();
-    final requestedBlur = blur.clamp(0.0, 30.0).toDouble();
-    final radius =
-        style.rounded(BorderRadius.circular(ChatShape.composerRadius + 2));
-
-    final Color? color;
-    final Gradient? gradient;
-    final Border border;
-    final double sigma;
-    final List<BoxShadow> shadows;
-
-    switch (effect) {
-      case ChatComposerEffect.solid:
-        color = t.composerField.withValues(alpha: alpha);
-        gradient = null;
-        border = Border.all(
-          color: t.borderPrimary.withValues(alpha: 0.8),
-          width: 0.8,
-        );
-        sigma = 0;
-        shadows = const <BoxShadow>[
-          BoxShadow(
-            color: Color(0x18000000),
-            blurRadius: 10,
-            offset: Offset(0, 4),
-          ),
-        ];
-      case ChatComposerEffect.frosted:
-        color = t.composerBg.withValues(alpha: alpha);
-        gradient = null;
-        border = Border.all(
-          color: (dark ? Colors.white : Colors.white)
-              .withValues(alpha: dark ? 0.18 : 0.72),
-        );
-        sigma = requestedBlur;
-        shadows = const <BoxShadow>[
-          BoxShadow(
-            color: Color(0x26000000),
-            blurRadius: 18,
-            offset: Offset(0, 7),
-          ),
-        ];
-      case ChatComposerEffect.liquid:
-        // KernelSU 在折射后的表面统一画 surfaceContainer(40%)。这里用主题的
-        // composer 底色承担同一职责，上面的渐变只保留玻璃的方向性高光。
-        color = t.composerBg.withValues(alpha: alpha * 0.38);
-        gradient = LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: dark
-              ? <Color>[
-                  Colors.white.withValues(alpha: alpha * 0.10),
-                  t.bgSecondary.withValues(alpha: alpha * 0.30),
-                  t.brand.withValues(alpha: alpha * 0.08),
-                ]
-              : <Color>[
-                  Colors.white.withValues(alpha: alpha * 0.46),
-                  t.bgBrandSecondary.withValues(alpha: alpha * 0.30),
-                  Colors.white.withValues(alpha: alpha * 0.26),
-                ],
-        );
-        // 描边交给 _GlassEdge 那圈**带角度的**渐变，这里给一条透明的占位。
-        // 一圈均匀的白边是「描过边的方块」，不是玻璃 —— 真玻璃的亮边跟着
-        // 光源走：左上最亮、两侧几乎没有、右下有一点反射。
-        border = Border.all(color: Colors.transparent, width: 0);
-        // KernelSU 的主玻璃用 4dp。把用户设置映射到同一档：默认 20 落到 4，
-        // 最大也只到 6dp，避免把折射环完全抹平。
-        sigma = (requestedBlur * 0.20).clamp(2.0, 6.0).toDouble();
-        shadows = <BoxShadow>[
-          const BoxShadow(
-            color: Color(0x26000000),
-            blurRadius: 24,
-            offset: Offset(0, 9),
-          ),
-          BoxShadow(
-            color: t.brand.withValues(alpha: dark ? 0.09 : 0.12),
-            blurRadius: 20,
-            spreadRadius: -4,
-          ),
-        ];
-      case ChatComposerEffect.outline:
-        color = t.composerBg.withValues(alpha: alpha * 0.34);
-        gradient = null;
-        border = Border.all(
-          color: t.brand.withValues(alpha: 0.52),
-          width: 1.2,
-        );
-        sigma = requestedBlur * 0.25;
-        shadows = const <BoxShadow>[
-          BoxShadow(
-            color: Color(0x12000000),
-            blurRadius: 8,
-            offset: Offset(0, 3),
-          ),
-        ];
-    }
-
-    final skinGradient = style.gradient;
-    final skinColor = style.fillColor();
-    final skinBlur = style.blur;
-
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 250),
-      curve: Curves.easeOutCubic,
-      decoration: BoxDecoration(
-        borderRadius: radius,
-        boxShadow: style.shadowsOr(shadows),
-      ),
-      child: ClipRRect(
-        borderRadius: radius,
-        child: LiquidGlass(
-          blurSigma: skinBlur ?? sigma,
-          // 折射只给「液态」这一档。毛玻璃档要的就是一块糊掉的板子，
-          // 给它加折射等于把两档做成同一个东西。
-          refract: effect == ChatComposerEffect.liquid && skinBlur == null,
-          // 和外面那个 ClipRRect 用同一个半径，否则折射环会和真正的边缘错开。
-          cornerRadius: radius,
-          // 原版是 24dp/24dp 配 56dp 高的药丸（约 0.43 个高度）。
-          // 这里药丸约 48 高，按同样的比例给 —— 之前 16/12 太保守，
-          // 边上那点弯几乎看不出来，整块还是像毛玻璃。
-          refractionHeight: 20,
-          refractionAmount: 20,
-          // KernelSU 的主玻璃层不做色散；色散只在按压指示器里短暂出现。
-          // 输入框常驻彩边会显脏，也会让小字号文字边缘显得发虚。
-          chromaticAberration: 0,
-          saturation: 1.5,
-          brightness: 0,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 250),
-            curve: Curves.easeOutCubic,
-            decoration: BoxDecoration(
-              color: skinGradient != null ? null : (skinColor ?? color),
-              gradient: skinGradient ?? (skinColor != null ? null : gradient),
-              // 液态档的边缘完全交给 _GlassEdge。这里再补一圈焦点白边，
-              // 会和镜面描边叠成肉眼可见的双框。
-              border: style.borderOr(
-                effect == ChatComposerEffect.liquid
-                    ? Border.all(color: Colors.transparent, width: 0)
-                    : Border.all(
-                        color: focused
-                            ? t.brand.withValues(alpha: dark ? 0.72 : 0.62)
-                            : border.top.color,
-                        width: focused ? 1.2 : border.top.width,
-                      ),
-              ),
-              borderRadius: radius,
-            ),
-            child: Stack(
-              children: <Widget>[
-                child,
-                if (effect == ChatComposerEffect.liquid &&
-                    skinGradient == null &&
-                    skinColor == null)
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: CustomPaint(
-                        painter: _GlassEdge(
-                          radius: radius,
-                          dark: dark,
-                          focused: focused,
-                          brand: t.brand,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// 玻璃的**边**：一圈真内阴影 + 一圈带角度的镜面描边。
-///
-/// KernelSU 那套里这是两个独立的效果（`innerShadow` 和 `highlight`），
-/// 也正是折射之外最像玻璃的两样东西：
-///
-///   - **内阴影**给厚度。少了它，药丸是贴在屏幕上的一张纸；有了它，
-///     是一块压在壁纸上的料。之前用「顶部往下的线性渐变」凑，
-///     只有上边有厚度，转过圆角就露馅。
-///   - **镜面描边**给光。一圈均匀的白边是「描过边的方块」；真玻璃的亮边
-///     跟着光源走 —— 左上最亮，两侧几乎没有，右下有一点点反射。
-///
-/// 两样都画在内容**上面**：它们是玻璃表面的性质，不是背景的。
-class _GlassEdge extends CustomPainter {
-  const _GlassEdge({
-    required this.radius,
-    required this.dark,
-    required this.focused,
-    required this.brand,
-  });
-
-  final BorderRadius radius;
-  final bool dark;
-  final bool focused;
-  final Color brand;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (size.isEmpty) return;
-    final rrect = radius.toRRect(Offset.zero & size);
-
-    // ---- 内阴影 ----
-    // 描一圈很粗的模糊黑边，再裁掉形状外面的部分，留下的就是内阴影。
-    // Flutter 没有现成的 inner shadow；`BlurStyle.inner` 画的是「阴影」
-    // 而不是「描边的内半边」，在半透明填充上会整块发灰。
-    canvas.save();
-    canvas.clipRRect(rrect);
-    canvas.drawRRect(
-      rrect.deflate(3),
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 5
-        ..color = Colors.black.withValues(alpha: dark ? 0.22 : 0.10)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3),
-    );
-    canvas.restore();
-
-    // ---- 镜面描边 ----
-    final rim = rrect.deflate(0.6);
-    final white = dark ? 0.52 : 0.84;
-    canvas.drawRRect(
-      rim,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = focused ? 1.4 : 1.1
-        ..shader = LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: <Color>[
-            Colors.white.withValues(alpha: white),
-            Colors.white.withValues(alpha: white * 0.18),
-            Colors.white.withValues(alpha: white * 0.10),
-            Colors.white.withValues(alpha: white * 0.34),
-          ],
-          stops: const <double>[0, 0.32, 0.62, 1],
-        ).createShader(Offset.zero & size),
-    );
-
-    // 聚焦时沿边压一层品牌色。比整圈换成蓝色克制 ——
-    // 玻璃还是玻璃，只是被点亮了一点。
-    if (focused) {
-      canvas.drawRRect(
-        rim,
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 1.4
-          ..color = brand.withValues(alpha: dark ? 0.26 : 0.22),
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(_GlassEdge old) =>
-      old.radius != radius ||
-      old.dark != dark ||
-      old.focused != focused ||
-      old.brand != brand;
 }
 
 /// 44px 圆形发送键。生成中变成停止键 ——
