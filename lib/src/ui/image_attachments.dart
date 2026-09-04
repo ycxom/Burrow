@@ -4,7 +4,14 @@
 ///
 /// `image_picker` 交回来的文件在系统缓存目录里，随时会被清掉；而消息是要
 /// 长期存的，界面上那张缩略图得三个月后还能打开。所以选完立刻拷进这个会话
-/// 自己的目录 —— 会话删了，图跟着删，不用另做一套引用计数。
+/// 自己的目录 —— 会话删了，图跟着删（见 `reclaimThreadAttachments`）。
+///
+/// ## 为什么按内容哈希命名
+///
+/// 同一张图只占一份，而且**"还有没有人要"变成一个可判定的问题**：文件名就是
+/// 内容，那么"这个文件还被引用吗"等价于"这个路径还出现在某条消息或某个分支
+/// 版本里吗"。回收因此不需要一个会漂的计数器，只要比对两个集合 ——
+/// 见 [reclaimOrphanImages]。
 ///
 /// ## 为什么在选的时候就缩、就转格式
 ///
@@ -22,6 +29,7 @@ library;
 
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
@@ -57,18 +65,33 @@ class ImageAttachmentStore {
     return _adopt(<XFile>[shot]);
   }
 
+  /// 拷进会话目录，**按内容哈希命名**。
+  ///
+  /// 不用原文件名（相册里的名字会重复，也可能带怪字符），也不用时间戳 ——
+  /// 时间戳只保证唯一，而这里要的是**同一张图只占一份**：
+  ///
+  ///   - 同一张截图发两次（很常见：先问一遍、答得不对再问一遍），
+  ///     时间戳命名会在磁盘上留两份一模一样的几百 KB。
+  ///   - 「编辑重发」会把同一条消息连同它的图重新走一遍这条路；
+  ///     没有内容寻址的话，每编辑一次就多一份。
+  ///
+  /// 而且哈希名让回收变得可判定：一个文件还有没有人要，等价于"它的路径
+  /// 还出现在某条消息或某个分支版本里吗"。见 [reclaimOrphanImages]。
   Future<List<String>> _adopt(Iterable<XFile> files) async {
     await dir.create(recursive: true);
     final out = <String>[];
     for (final file in files) {
       final transcoded = await transcodeForUpload(await file.readAsBytes());
-      // 用时间戳+序号命名，不用原文件名：相册里的名字可能重复，也可能带
-      // 路径分隔符之外的怪字符。这里只需要唯一。
-      final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
-      final target =
-          File('${dir.path}/img_${stamp}_${out.length}${transcoded.extension}');
-      await target.writeAsBytes(transcoded.bytes);
-      out.add(target.path);
+      final digest = sha256.convert(transcoded.bytes).toString();
+      final target = File('${dir.path}/$digest${transcoded.extension}');
+      // 已经有了就不重写。内容一样，路径也就一样 —— 去重是这个命名方式的
+      // 附赠品，不是另做的一件事。
+      if (!await target.exists()) {
+        await target.writeAsBytes(transcoded.bytes);
+      }
+      // 同一批里挑了两张一样的图时路径会重复。去掉重复的那条 ——
+      // 让同一张图在一条消息里出现两次没有意义，只会多发一次。
+      if (!out.contains(target.path)) out.add(target.path);
     }
     return out;
   }

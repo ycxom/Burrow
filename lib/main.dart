@@ -36,6 +36,7 @@ import 'src/settings/account_store.dart';
 import 'src/settings/channel_store.dart';
 import 'src/settings/model_roles.dart';
 import 'src/settings/settings_store.dart';
+import 'src/settings/thread_lock.dart';
 import 'src/skills/skill_store.dart';
 import 'src/ui/app.dart';
 import 'src/ui/liquid_glass.dart';
@@ -241,6 +242,10 @@ Future<void> _boot({
       .listen((_) => channels.registry = modelRegistry.registry);
   unawaited(modelRegistry.refresh());
   final chats = await ChatStore.open();
+
+  // 会话锁的"这次运行开过哪些"。只活在内存里 —— 落盘的话开过一次就一直
+  // 开着，这道锁只在第一次有用。
+  final unlocked = ThreadUnlockSession();
   final llm = ConfigurableLlmClient(config: settings.config);
 
   // 设置一变就把配置推给客户端。底部那条快速切换器改的是 SettingsStore，
@@ -458,5 +463,6 @@ Future<void> _boot({
     skills: skills,
     accounts: accounts,
     channels: channels,
+    unlocked: unlocked,
   ));
 }

@@ -516,6 +516,15 @@ class ChatAvatar extends StatelessWidget {
             fit: BoxFit.cover,
             gaplessPlayback: true,
             filterQuality: FilterQuality.medium,
+            // **按显示尺寸解码。** 用户挑的头像常常是一张几 MP 的原图，
+            // 全解出来是几十 MB 的 RGBA，而这里只画一个几十像素的小圆。
+            // 乘 devicePixelRatio 是为了高分屏上不糊。
+            cacheWidth: (diameter *
+                    MediaQuery.devicePixelRatioOf(context) *
+                    // 留一点余量：头像在皮肤里可以被放大。
+                    1.5)
+                .round()
+                .clamp(24, 512),
             errorBuilder: (_, __, ___) => fallback,
           )
         : fallback;

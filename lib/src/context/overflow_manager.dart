@@ -242,6 +242,17 @@ class OverflowManager {
     _failedAt = -1;
   }
 
+  /// 历史**前面**插进来一段之后，把 checkpoint 往后挪。
+  ///
+  /// 打开会话时只先读最后一页，剩下的在后台补进历史开头（见 app.dart 的
+  /// `_fillOlderHistory`）。checkpoint 是历史的下标 —— 前面多了 n 条，
+  /// 它就得 +n，否则"摘要覆盖到第几条"会指到一段完全不相干的消息上：
+  /// 窗口里会冒出一批本该被摘要盖住的原文，而真正该显示的那几条反而没了。
+  void shiftBy(int count) {
+    if (count <= 0 || _checkpoint <= 0) return;
+    _checkpoint += count;
+  }
+
   /// 历史被截短之后把 checkpoint 拉回来。
   ///
   /// 「回到这条消息」和分支切换都会砍掉一截历史。不跟着收的话，checkpoint

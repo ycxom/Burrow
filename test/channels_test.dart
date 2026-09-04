@@ -550,4 +550,84 @@ void _modelCacheTests() {
       expect(settings.sourceLabel, isEmpty);
     });
   });
+
+  group('标星模型', () {
+    const a = Channel(
+        id: 'c1', name: '本地网关', baseUrl: 'http://gw:3000', model: 'glm-5');
+    const b = Channel(
+        id: 'c2',
+        name: 'OpenAI',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5');
+
+    setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+
+    test('标一次加上，再标一次去掉', () async {
+      final channels = ChannelStore.forTest(channels: [a], activeId: 'c1');
+
+      await channels.toggleStarred('c1', 'glm-4.6');
+      expect(channels.byId('c1')!.isStarred('glm-4.6'), isTrue);
+
+      await channels.toggleStarred('c1', 'glm-4.6');
+      expect(channels.byId('c1')!.isStarred('glm-4.6'), isFalse);
+    });
+
+    test('星标跟着渠道，不是全局', () async {
+      // 同一个模型名在两个渠道上是不同的东西（一个免费网关、一个计费官方），
+      // 「我在这个渠道上常用哪几个」也就只能按渠道分。
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      await channels.toggleStarred('c1', 'gpt-5');
+
+      expect(channels.byId('c1')!.isStarred('gpt-5'), isTrue);
+      expect(channels.byId('c2')!.isStarred('gpt-5'), isFalse);
+    });
+
+    test('删渠道时星标跟着一起走，不留悬空收藏', () async {
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      await channels.toggleStarred('c2', 'gpt-5-mini');
+
+      await channels.remove('c2');
+      expect(channels.byId('c2'), isNull);
+    });
+
+    test('json 往返不丢', () {
+      const channel = Channel(
+        id: 'c1',
+        name: '本地网关',
+        baseUrl: 'http://gw:3000',
+        model: 'glm-5',
+        starredModels: <String>{'glm-4.6', 'glm-5'},
+      );
+      final back = Channel.fromJson(channel.toJson());
+      expect(back.starredModels, <String>{'glm-4.6', 'glm-5'});
+    });
+
+    test('老配置没有这个字段，读出来是空集', () {
+      final back = Channel.fromJson(<String, Object?>{
+        'id': 'c1',
+        'name': '老渠道',
+        'base_url': 'http://gw:3000',
+        'model': 'glm-5',
+      });
+      expect(back.starredModels, isEmpty);
+    });
+
+    test('落盘的是排好序的列表 —— 同样的内容不该产生不同的字节', () {
+      const channel = Channel(
+        id: 'c1',
+        name: 'n',
+        baseUrl: 'http://gw:3000',
+        model: 'm',
+        starredModels: <String>{'b', 'a', 'c'},
+      );
+      expect(channel.toJson()['starred_models'], <String>['a', 'b', 'c']);
+    });
+
+    test('不存在的渠道或空模型名都是空操作', () async {
+      final channels = ChannelStore.forTest(channels: [a], activeId: 'c1');
+      await channels.toggleStarred('没这个渠道', 'glm-5');
+      await channels.toggleStarred('c1', '   ');
+      expect(channels.byId('c1')!.starredModels, isEmpty);
+    });
+  });
 }

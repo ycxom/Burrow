@@ -233,6 +233,28 @@ void main() {
       expect(overflow.hasSummary, isFalse);
     });
 
+    test('前面补进一段历史时 checkpoint 跟着往后挪', () {
+      // 打开会话只先读最后一页，剩下的在后台补进历史**开头**。checkpoint 是
+      // 历史的下标 —— 不跟着挪的话，「摘要覆盖到第几条」会指到一段完全不
+      // 相干的消息上：窗口里冒出一批本该被摘要盖住的原文，而真正该显示的
+      // 那几条反而没了。
+      final overflow = OverflowManager(summarize: (_, __) async => '');
+      final log = history(10);
+      overflow.restore(summary: '摘要', checkpoint: 4, historyLength: log.length);
+
+      overflow.clampTo(30); // 历史变长了，夹不动
+      overflow.shiftBy(20);
+      expect(overflow.checkpoint, 24);
+    });
+
+    test('没摘过的时候不挪 —— 0 不是一个位置', () {
+      final overflow = OverflowManager(summarize: (_, __) async => '');
+      overflow.shiftBy(20);
+      // checkpoint 为 0 表示"一条都没被摘要盖住"。把它挪到 20 就等于凭空
+      // 声称前 20 条已经被摘要覆盖了，而摘要压根不存在。
+      expect(overflow.checkpoint, 0);
+    });
+
     test('历史被截短后 clampTo 把 checkpoint 拉回来', () {
       final overflow = OverflowManager(summarize: (_, __) async => '');
       overflow.restore(summary: '摘要', checkpoint: 8, historyLength: 20);

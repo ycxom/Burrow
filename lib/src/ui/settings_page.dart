@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
 import '../sandbox/sandbox_session.dart';
+import '../data/chat_store.dart';
 import '../sandbox/snapshot_store.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
@@ -29,6 +30,7 @@ class SettingsPage extends StatefulWidget {
     required this.currentTaskId,
     required this.overflow,
     required this.snapshots,
+    required this.chats,
     required this.skins,
     this.embeddingError,
     super.key,
@@ -49,6 +51,9 @@ class SettingsPage extends StatefulWidget {
   final String currentTaskId;
   final OverflowManager overflow;
   final SnapshotStore snapshots;
+
+  /// 只为传给「上下文与检查点」那一页 —— 那里的清理按钮要连聊天库一起收。
+  final ChatStore chats;
 
   /// 只为传给外观页。设置页自己不碰皮肤。
   final ChatSkinStore skins;
@@ -406,6 +411,8 @@ class _SettingsPageState extends State<SettingsPage> {
                     store: widget.store,
                     overflow: widget.overflow,
                     snapshots: widget.snapshots,
+                    chats: widget.chats,
+                    tasksRoot: widget.tasksRoot,
                   )),
                 ),
               ],

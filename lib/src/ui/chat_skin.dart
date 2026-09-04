@@ -198,8 +198,7 @@ class ChatSkinCatalog {
   static ChatSkinPack get fallback => _nekogram;
 
   /// 内置 ID 被保留，避免外部包冒充默认皮肤。
-  static bool isReservedId(String id) =>
-      builtIns.any((skin) => skin.id == id);
+  static bool isReservedId(String id) => builtIns.any((skin) => skin.id == id);
 
   /// 合并外部加载器提供的皮肤。
   static List<ChatSkinPack> available({

@@ -46,6 +46,12 @@ class ModelSource {
   /// 在别处解释一百遍，不如在这里显示两个图标。
   final ResolvedCapability Function(String model)? capabilityOf;
 
+  /// 这个来源上被标星的模型。
+  ///
+  /// 聚合网关一个 key 后面挂着几十上百个模型，而真正会用的就那三五个。
+  /// 星标把它们提到最前面 —— 这是这个列表唯一一个"用得越久越省事"的地方。
+  final Set<String> starred;
+
   const ModelSource({
     required this.id,
     required this.name,
@@ -53,6 +59,7 @@ class ModelSource {
     this.models = const <String>[],
     this.configuredModel = '',
     this.capabilityOf,
+    this.starred = const <String>{},
   });
 }
 
@@ -104,6 +111,11 @@ Future<ModelChoice?> showModelPicker(
   /// 模型把整个对话搬到另一家去，正是这张分工表存在的理由。
   bool adoptsSource = true,
 
+  /// 标星 / 取消标星。null = 这个入口不给标星。
+  ///
+  /// 带来源参数：星标是**跟着渠道**的，同一个模型名在两个渠道上是两回事。
+  Future<void> Function(String sourceId, String model)? onToggleStar,
+
   /// 上一次失败的原因。芯片上只写得下「不可用」三个字，
   /// 真正的原因得有个地方看得到 —— 否则用户只知道坏了，不知道为什么。
   String? error,
@@ -126,6 +138,7 @@ Future<ModelChoice?> showModelPicker(
       noneHint: noneHint,
       currentSourceId: currentSourceId,
       adoptsSource: adoptsSource,
+      onToggleStar: onToggleStar,
       error: error,
     ),
   );
@@ -142,6 +155,7 @@ class _ModelPickerSheet extends StatefulWidget {
   final String noneHint;
   final String? currentSourceId;
   final bool adoptsSource;
+  final Future<void> Function(String sourceId, String model)? onToggleStar;
   final String? error;
 
   const _ModelPickerSheet({
@@ -155,6 +169,7 @@ class _ModelPickerSheet extends StatefulWidget {
     required this.noneHint,
     required this.currentSourceId,
     required this.adoptsSource,
+    required this.onToggleStar,
     this.error,
   });
 
@@ -180,6 +195,46 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
 
   final _filter = TextEditingController();
   final Set<String> _loading = <String>{};
+
+  /// 用户在这个弹层里改过的星标，键是 `来源id::模型`。
+  ///
+  /// 存在这里而不是等外面刷新回来：标星要**当场看到**，而外面那份状态回到
+  /// 这个弹层要走一整圈（写库 → notifyListeners → 上层 setState → 重建弹层），
+  /// 弹层是一条独立的 route，那一圈走不到它身上。
+  final Map<String, bool> _starOverrides = <String, bool>{};
+
+  bool _isStarred(String sourceId, String model) =>
+      _starOverrides['$sourceId::$model'] ??
+      (widget.sources
+              .where((s) => s.id == sourceId)
+              .firstOrNull
+              ?.starred
+              .contains(model) ??
+          false);
+
+  Future<void> _toggleStar(String sourceId, String model) async {
+    final toggle = widget.onToggleStar;
+    if (toggle == null) return;
+    setState(() {
+      _starOverrides['$sourceId::$model'] = !_isStarred(sourceId, model);
+    });
+    await toggle(sourceId, model);
+  }
+
+  /// 标星的排到最前面，**组内保持原来的顺序**。
+  ///
+  /// 不做二次排序（比如按名字）：服务端返回的顺序本身带信息（不少网关把
+  /// 主推的排在前面），重排一遍等于把那点信息扔了。这里只做"提到最前面"
+  /// 这一件事。
+  List<String> _starredFirst(String? sourceId, List<String> models) {
+    if (sourceId == null) return models;
+    final starred = <String>[];
+    final rest = <String>[];
+    for (final model in models) {
+      (_isStarred(sourceId, model) ? starred : rest).add(model);
+    }
+    return <String>[...starred, ...rest];
+  }
 
   ModelSource? get _source {
     for (final s in widget.sources) {
@@ -249,9 +304,19 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     final id = _sourceId;
     final keyword = _filter.text.trim().toLowerCase();
     final all = _models[id] ?? const <String>[];
-    final visible = keyword.isEmpty
+    final matched = keyword.isEmpty
         ? all
         : all.where((m) => m.toLowerCase().contains(keyword)).toList();
+    // 标过星但这次没拉回来的也要列出来：网关下架一个模型、或者列表压根没拉
+    // 动的时候，用户标过的那几个仍然是他要找的东西 —— 而它们恰恰是标星唯一
+    // 派得上用场的场合。
+    final missing = keyword.isEmpty && id != null
+        ? <String>[
+            for (final model in _source?.starred ?? const <String>{})
+              if (!matched.contains(model)) model,
+          ]
+        : const <String>[];
+    final visible = _starredFirst(id, <String>[...missing, ...matched]);
     final loading = id != null && _loading.contains(id);
     final error = id == null ? null : _errors[id];
 
@@ -518,30 +583,76 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
               style: TextStyle(fontSize: 11, color: t.tintTertiary)),
       // 只显示**有**的能力，不显示没有的。两个灰图标并排的信息量还不如没有，
       // 而"这个模型能看图"是用户挑模型时真正在找的东西。
-      trailing: capability == null
+      trailing: value.isEmpty
           ? null
           : Row(
               mainAxisSize: MainAxisSize.min,
               children: <Widget>[
-                if (capability.vision)
-                  Tooltip(
-                    message: '能直接看图',
-                    child: Icon(Icons.visibility_outlined,
-                        size: 16, color: t.tintTertiary),
+                if (capability != null) ...<Widget>[
+                  if (capability.vision)
+                    Tooltip(
+                      message: '能直接看图',
+                      child: Icon(Icons.visibility_outlined,
+                          size: 16, color: t.tintTertiary),
+                    ),
+                  if (capability.vision && capability.tools)
+                    const SizedBox(width: 6),
+                  if (capability.tools)
+                    Tooltip(
+                      message: '支持工具调用（终端模式）',
+                      child: Icon(Icons.build_outlined,
+                          size: 16, color: t.tintTertiary),
+                    ),
+                ],
+                // 星标摆在最右边，和能力图标之间留一段距离：那两个是
+                // **模型的属性**（只能看），这个是**可以点的开关**。
+                // 挨在一起会让人以为能力图标也能点。
+                if (widget.onToggleStar != null && id != null) ...<Widget>[
+                  const SizedBox(width: 10),
+                  _StarButton(
+                    starred: _isStarred(id, value),
+                    onTap: () => _toggleStar(id, value),
                   ),
-                if (capability.vision && capability.tools)
-                  const SizedBox(width: 6),
-                if (capability.tools)
-                  Tooltip(
-                    message: '支持工具调用（终端模式）',
-                    child: Icon(Icons.build_outlined,
-                        size: 16, color: t.tintTertiary),
-                  ),
+                ],
               ],
             ),
       onTap: id == null
           ? null
           : () => Navigator.pop(context, ModelChoice(id, value)),
+    );
+  }
+}
+
+/// 一颗可以点的星。
+///
+/// 单独一个 widget 而不是直接放 IconButton：它要有自己的点击热区（列表行
+/// 本身是"选中这个模型"，星是另一件事），而 IconButton 默认 48 的热区会把
+/// 密集列表撑高一大截。
+class _StarButton extends StatelessWidget {
+  const _StarButton({required this.starred, required this.onTap});
+
+  final bool starred;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.chat;
+    return Tooltip(
+      message: starred ? '取消标星' : '标星，排到最前面',
+      child: InkResponse(
+        onTap: onTap,
+        radius: 18,
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Icon(
+            starred ? Icons.star_rounded : Icons.star_border_rounded,
+            size: 19,
+            // 标了的用品牌色。没标的压到最弱一档 —— 一列全是灰星星
+            // 会把真正标过的那几个淹掉。
+            color: starred ? t.brand : t.tintTertiary.withValues(alpha: 0.55),
+          ),
+        ),
+      ),
     );
   }
 }

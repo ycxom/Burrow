@@ -189,6 +189,17 @@ class Channel {
   /// 渠道级的联网搜索默认值。同上。只对 Gemini 原生协议有意义。
   final bool searchCapable;
 
+  /// 被标星的模型 id。
+  ///
+  /// 聚合网关一个 key 后面挂着几十上百个模型，而任何一个人真正会用的就那
+  /// 三五个。每次换模型都要在一个长列表里滚半天找它，是这个界面最烦人的地方
+  /// —— 标星把它们提到最前面。
+  ///
+  /// **跟着渠道存，不是全局。** 同一个模型名在不同渠道上是不同的东西
+  /// （一个免费网关和一个计费官方接口），而"我在这个渠道上常用哪几个"
+  /// 恰恰是按渠道分的。
+  final Set<String> starredModels;
+
   /// 模型 id → 能力。只放**被单独标过**的那些，没标的走上面两个默认值。
   ///
   /// 稀疏存而不是把拉回来的模型列表全存一遍：模型列表动辄几十上百条，全存下来
@@ -235,6 +246,7 @@ class Channel {
     this.searchCapable = false,
     this.toolsCapable = true,
     this.modelCapabilities = const <String, ModelCapability>{},
+    this.starredModels = const <String>{},
     this.visionModel,
     this.systemPromptStyle = SystemPromptStyle.systemRole,
     this.googleProject,
@@ -301,6 +313,8 @@ class Channel {
   bool hasExplicitCapability(String model) =>
       modelCapabilities.containsKey(model.trim());
 
+  bool isStarred(String model) => starredModels.contains(model.trim());
+
   /// 能不能拿来做前置多模态。
   ///
   /// 看的是 [visionModel] 而不是对话模型的能力：这个渠道是被**别的**渠道借去
@@ -356,6 +370,7 @@ class Channel {
     bool? searchCapable,
     bool? toolsCapable,
     Map<String, ModelCapability>? modelCapabilities,
+    Set<String>? starredModels,
     String? visionModel,
     bool clearVisionModel = false,
     SystemPromptStyle? systemPromptStyle,
@@ -377,6 +392,7 @@ class Channel {
         searchCapable: searchCapable ?? this.searchCapable,
         toolsCapable: toolsCapable ?? this.toolsCapable,
         modelCapabilities: modelCapabilities ?? this.modelCapabilities,
+        starredModels: starredModels ?? this.starredModels,
         visionModel:
             clearVisionModel ? null : (visionModel ?? this.visionModel),
         systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
@@ -403,6 +419,9 @@ class Channel {
           for (final entry in modelCapabilities.entries)
             entry.key: entry.value.toJson(),
         },
+        // 排序后再存：JSON 里的顺序不该跟着 Set 的内部顺序变，
+        // 否则每次保存都会产生一份"内容一样但字节不同"的记录。
+        'starred_models': starredModels.toList()..sort(),
         'vision_model': visionModel,
         'system_prompt_style': systemPromptStyle.name,
         'google_project': googleProject,
@@ -425,6 +444,7 @@ class Channel {
         // 的终端模式本来是能用的，不该因为加了个开关就集体失效。
         toolsCapable: j['tools_capable'] as bool? ?? true,
         modelCapabilities: _capabilitiesFromJson(j['model_capabilities']),
+        starredModels: _starredFromJson(j['starred_models']),
         visionModel: j['vision_model'] as String?,
         systemPromptStyle: SystemPromptStyle.values
                 .where((v) => v.name == j['system_prompt_style'])
@@ -436,6 +456,15 @@ class Channel {
         oauthProviderId: j['oauth_provider'] as String?,
         oauthAccountId: j['oauth_account'] as String?,
       );
+
+  /// 老配置没有这个字段，读出来就是空集 —— 一个星都没标过，和以前一样。
+  static Set<String> _starredFromJson(Object? raw) {
+    if (raw is! List) return const <String>{};
+    return <String>{
+      for (final entry in raw)
+        if (entry is String && entry.trim().isNotEmpty) entry.trim(),
+    };
+  }
 
   static Map<String, ModelCapability> _capabilitiesFromJson(Object? raw) {
     if (raw is! Map) return const <String, ModelCapability>{};
@@ -787,6 +816,19 @@ class ChannelStore extends ChangeNotifier {
     final model = summary.isNotEmpty ? summary : c.model.trim();
     if (model.isEmpty) return null;
     return ResolvedRole(role: role, channel: c, model: model, inherited: true);
+  }
+
+  /// 标星 / 取消标星。
+  ///
+  /// 写回渠道而不是另存一份"收藏夹"：星标是渠道的一个属性，删渠道时它跟着
+  /// 一起走，不会留下一堆指向不存在渠道的收藏。
+  Future<void> toggleStarred(String channelId, String model) async {
+    final channel = byId(channelId);
+    final id = model.trim();
+    if (channel == null || id.isEmpty) return;
+    final next = Set<String>.from(channel.starredModels);
+    if (!next.remove(id)) next.add(id);
+    await upsert(channel.copyWith(starredModels: next));
   }
 
   /// 指派一个角色。[ref] 为 null = 清掉这一条，回到该角色的回退。

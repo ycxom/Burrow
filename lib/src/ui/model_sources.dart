@@ -35,8 +35,13 @@ class ModelSourceCatalog {
             configuredModel: c.model,
             // 带上能力表：手动没设过的那些项由它来填。
             capabilityOf: (model) => channels.capabilityOf(c, model),
+            starred: c.starredModels,
           ),
       ];
+
+  /// 标星 / 取消标星。写回那个渠道 —— 星标是渠道的属性，不是全局收藏夹。
+  Future<void> toggleStar(String channelId, String model) =>
+      channels.toggleStarred(channelId, model);
 
   /// 从某个渠道拉一次模型列表，顺手缓存下来。
   ///

@@ -1,7 +1,9 @@
 package com.burrow
 
 import android.app.Activity
+import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import com.burrow.bridge.PtyBridge
 import io.flutter.embedding.android.FlutterActivity
@@ -14,6 +16,7 @@ class MainActivity : FlutterActivity() {
     private var pendingImageResult: MethodChannel.Result? = null
     private var pendingImageSlot: String? = null
     private var pendingSkinResult: MethodChannel.Result? = null
+    private var pendingCredentialResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -51,6 +54,12 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                // 唤起系统锁屏验证。只给"忘了会话密码"和"删除锁着的会话"用 ——
+                // 日常进会话走 app 自己那道密码，两者不该共用一把钥匙。
+                "confirmDeviceCredential" -> {
+                    confirmDeviceCredential(call.argument<String>("reason"), result)
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -84,6 +93,44 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    /**
+     * 弹系统的「确认你的锁屏凭据」。
+     *
+     * 用 KeyguardManager 而不是 BiometricPrompt：后者要求宿主是
+     * FragmentActivity，而换基类会牵动 pty 那一整套 activity result 分发。
+     * 系统这个 Intent 本身就覆盖 PIN / 图案 / 密码 / 生物识别。
+     *
+     * 没设锁屏时返回 `unavailable` 而不是失败：那种情况用户怎么试都过不了，
+     * 界面上要能说清楚"去系统设置里加一个锁屏"。
+     */
+    private fun confirmDeviceCredential(reason: String?, result: MethodChannel.Result) {
+        if (pendingCredentialResult != null) {
+            result.error("auth_busy", "已经在验证了", null)
+            return
+        }
+        val keyguard = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        if (keyguard == null || !keyguard.isDeviceSecure) {
+            result.success("unavailable")
+            return
+        }
+        @Suppress("DEPRECATION")
+        val intent = keyguard.createConfirmDeviceCredentialIntent(
+            reason ?: "验证身份",
+            null,
+        )
+        if (intent == null) {
+            result.success("unavailable")
+            return
+        }
+        pendingCredentialResult = result
+        try {
+            startActivityForResult(intent, REQUEST_CONFIRM_CREDENTIAL)
+        } catch (_: ActivityNotFoundException) {
+            pendingCredentialResult = null
+            result.success("unavailable")
         }
     }
 
@@ -183,6 +230,12 @@ class MainActivity : FlutterActivity() {
 
     @Deprecated("FlutterActivity 仍通过 activity result 分发系统选择器结果")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQUEST_CONFIRM_CREDENTIAL) {
+            val result = pendingCredentialResult
+            pendingCredentialResult = null
+            result?.success(if (resultCode == Activity.RESULT_OK) "ok" else "refused")
+            return
+        }
         if (requestCode == REQUEST_PICK_SKIN) {
             val result = pendingSkinResult
             pendingSkinResult = null
@@ -269,6 +322,7 @@ class MainActivity : FlutterActivity() {
         private const val SYSTEM_CHANNEL = "com.burrow/system"
         private const val REQUEST_PICK_IMAGE = 0xB012
         private const val REQUEST_PICK_SKIN = 0xB013
+        private const val REQUEST_CONFIRM_CREDENTIAL = 0xB014
         private const val MAX_IMAGE_BYTES = 30L * 1024L * 1024L
         private const val MAX_SKIN_BYTES = 20L * 1024L * 1024L
         private val SKIN_EXTENSIONS = listOf("json", "zip")

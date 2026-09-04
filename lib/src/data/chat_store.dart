@@ -1,11 +1,14 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+import 'package:flutter/foundation.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../agent/agent_loop.dart' show TokenUsage;
 import '../context/overflow_manager.dart';
+import '../settings/thread_lock.dart';
 
 class ChatThread {
   const ChatThread({
@@ -72,6 +75,12 @@ class ChatStore {
 
   final Database _db;
 
+  /// 直接查表。**只给测试用** —— 回收干没干净只有直接数行数才看得见，
+  /// 而上层 API 一律返回"没有了"，孤儿行恰恰是那种"查询看不见、空间一直
+  /// 占着"的东西。
+  @visibleForTesting
+  Database get raw => _db;
+
   static Future<ChatStore> open() async =>
       openAt(p.join(await getDatabasesPath(), 'burrow.db'));
 
@@ -80,7 +89,7 @@ class ChatStore {
   static Future<ChatStore> openAt(String path) async {
     final db = await openDatabase(
       path,
-      version: 13,
+      version: 14,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -162,6 +171,10 @@ class ChatStore {
           await db.execute(
               'ALTER TABLE threads ADD COLUMN last_read_message_id INTEGER');
         }
+        if (from < 14) {
+          // 会话锁。NULL = 没加锁，和加这一列之前完全一样。
+          await db.execute('ALTER TABLE threads ADD COLUMN lock_json TEXT');
+        }
         if (from < 8) {
           // 这一条是不是估算值。1 = 估算。
           //
@@ -183,7 +196,8 @@ class ChatStore {
             system_prompt TEXT,
             summary TEXT,
             summary_checkpoint INTEGER,
-            last_read_message_id INTEGER
+            last_read_message_id INTEGER,
+            lock_json TEXT
           )
         ''');
         await db.execute('''
@@ -385,6 +399,48 @@ class ChatStore {
         whereArgs: <Object?>[threadId],
       );
 
+  /// 这个会话的锁。null = 没加锁。
+  Future<ThreadLock?> lockOf(String threadId) async {
+    final rows = await _db.query(
+      'threads',
+      columns: <String>['lock_json'],
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final raw = rows.first['lock_json'];
+    if (raw is! String || raw.isEmpty) return null;
+    try {
+      return ThreadLock.fromJson(jsonDecode(raw));
+    } catch (_) {
+      // 这一列坏了当成没锁。**故意的** —— 反过来（当成锁着但打不开）会把
+      // 用户自己的对话变成一个谁也进不去的黑洞，而这道锁本来就只挡"别人
+      // 拿起手机点进来"，不值得用永久锁死来兑现。
+      return null;
+    }
+  }
+
+  /// 哪些会话锁着。列表要用它画那把小锁，一次查完比一条条问快得多。
+  Future<Set<String>> lockedThreadIds() async {
+    final rows = await _db.query(
+      'threads',
+      columns: <String>['id'],
+      where: "lock_json IS NOT NULL AND lock_json != ''",
+    );
+    return <String>{for (final row in rows) row['id']! as String};
+  }
+
+  /// 设 / 撤这个会话的锁。[lock] 为 null = 撤掉。
+  Future<void> setLock(String threadId, ThreadLock? lock) => _db.update(
+        'threads',
+        <String, Object?>{
+          'lock_json': lock == null ? null : jsonEncode(lock.toJson()),
+        },
+        where: 'id = ?',
+        whereArgs: <Object?>[threadId],
+      );
+
   Future<void> setTerminalMode(String threadId, bool on) async {
     await _db.update(
       'threads',
@@ -445,6 +501,99 @@ class ChatStore {
     });
   }
 
+  /// 现在**还有人要**的全部图片路径。
+  ///
+  /// 两个来源都要数，缺一不可：
+  ///
+  ///   - `messages.images` —— 活动路径上那些消息带的图。
+  ///   - `segments.messages_json` —— 分支版本里的图。只看消息的话，
+  ///     「重新生成」之后切回上一版，那一版的图已经被当成孤儿删掉了 ——
+  ///     而用户看到的是一条提到图却没有图的消息。
+  ///
+  /// **一次数全库，不按会话分。** 内容相同的分支段会被两个会话共用（段是按
+  /// 内容哈希存的），那时候 A 的段里可能写着 B 目录下的路径。按会话数的话，
+  /// 删 A 会把 B 还在用的图删掉。
+  ///
+  /// 返回值带一个 [complete]：**有任何一处解析不了，它就是 false**，
+  /// 意思是"这份集合不完整，别拿它去删东西"。少了这个标记，一条坏掉的
+  /// images 列会让那条消息的图看起来没人引用 —— 然后被删掉。
+  Future<({Set<String> paths, bool complete})> referencedImagePaths() async {
+    final paths = <String>{};
+    var complete = true;
+
+    // 两处的形状不一样：messages 那一列存的是 JSON **字符串**，
+    // 而段里已经是解出来的数组。收在一个函数里，免得两边各写一次判空。
+    void collect(Object? raw) {
+      try {
+        final list = raw is String
+            ? (raw.isEmpty ? const <Object?>[] : jsonDecode(raw) as List)
+            : raw is List
+                ? raw
+                : const <Object?>[];
+        for (final path in list) {
+          if (path is String && path.isNotEmpty) paths.add(path);
+        }
+      } catch (_) {
+        // 解析不了 = **不知道这条引用了什么**，而不是"它没引用任何东西"。
+        // 当成后者就会把它的图删掉，而那不可恢复。
+        complete = false;
+      }
+    }
+
+    for (final row in await _db.query('messages',
+        columns: <String>['images'], where: 'images IS NOT NULL')) {
+      collect(row['images']);
+    }
+
+    // 段里存的是整段消息的 JSON，图片路径埋在每条消息的 images 字段里。
+    for (final row
+        in await _db.query('segments', columns: <String>['messages_json'])) {
+      final raw = row['messages_json'];
+      if (raw is! String) continue;
+      try {
+        for (final message in jsonDecode(raw) as List) {
+          if (message is Map) collect(message['images']);
+        }
+      } catch (_) {
+        complete = false;
+      }
+    }
+    return (paths: paths, complete: complete);
+  }
+
+  /// 回收谁也引用不到的分支内容，并把库文件真的缩回去。
+  ///
+  /// 平时的回收靠引用计数（见 [_releaseSegment]），那条路是够的。这里是**兜底
+  /// 加真正的空间回收**，两件平时不发生、但发生了就没人看得见的事：
+  ///
+  ///   1. **引用计数是重算的，不是信任已有的值。** 计数只要因为任何原因漂过
+  ///      一次（改坏的代码、手动改过库、以后新增的删除路径忘了减），那些段就
+  ///      永远回收不掉了 —— 而它们在任何一个界面上都看不见。直接按 branches
+  ///      数一遍是唯一不会越攒越错的做法。
+  ///   2. **SQLite 删行只是把页标成空闲**，文件物理大小不变。删掉一个几万条
+  ///      消息的会话之后，用户在系统设置里看到的占用一点没少 —— 那看起来就
+  ///      像"删了个寂寞"。VACUUM 才真的把文件缩回去。
+  ///
+  /// VACUUM 会锁库并整个重写一遍文件，**只能由用户手动触发**，不能挂在启动
+  /// 路径或者删除动作后面。
+  Future<({int segments, int bytes})> compact() async {
+    final file = File(_db.path);
+    final before = await file.exists() ? await file.length() : 0;
+
+    await _db.execute(
+      'UPDATE segments SET ref_count = '
+      '(SELECT COUNT(*) FROM branches WHERE branches.segment_hash = '
+      'segments.hash)',
+    );
+    final swept = await _db.delete('segments', where: 'ref_count <= 0');
+
+    // VACUUM 不能在事务里跑。
+    await _db.execute('VACUUM');
+
+    final after = await file.exists() ? await file.length() : 0;
+    return (segments: swept, bytes: before - after > 0 ? before - after : 0);
+  }
+
   /// 引用减一，减到 0 就把内容删掉。
   static Future<void> _releaseSegment(DatabaseExecutor txn, String hash) async {
     await txn.rawUpdate(
@@ -474,11 +623,86 @@ class ChatStore {
     }
   }
 
-  Future<List<ChatMessage>> messages(String threadId) async {
+  /// 从**最新那条往回数**，装到 [tokenBudget] 为止的一段。
+  ///
+  /// 打开会话时先只要这一段：一个聊了几个月的会话有几千条消息，全量读出来
+  /// 再造几千个对象、算一遍日期分组，是首屏前唯一那段纯等待。而用户打开会话
+  /// 十有八九是接着最近这几句说 —— 更早的等他真往上翻再补。
+  ///
+  /// **切分用字符数而不是真的估 token**：估 token 要先把 content 读进内存，
+  /// 那正是这里想省掉的那一步。`LENGTH()` 在 SQLite 里不用取出内容就能算。
+  /// 换算系数取 [TokenCounter] 里最保守的那一档（中文 0.65 字/token），
+  /// 于是这一段**只会比预算短，不会更长** —— 宁可多翻一次，也不要首屏还是卡。
+  ///
+  /// [before] 给了就只看比它更早的消息，用来翻上一页。
+  ///
+  /// 返回的消息按时间**升序**，和 [messages] 一致。
+  /// [messageLimit] 是**条数**上限，和 [tokenBudget] 取先到的那个。
+  ///
+  /// 光有 token 预算不够用：一页要装多少，日常由"一屏放得下几条"决定，
+  /// 而不是由字数决定。Telegram 系客户端首屏取 20 条就是这个道理 ——
+  /// 手机上一屏也就五六条，多读的每一条都是首屏之前的纯等待。
+  /// token 预算留着管另一头：一条几十 KB 的命令输出，光它自己就该成一页。
+  Future<List<ChatMessage>> tailMessages(
+    String threadId, {
+    required int tokenBudget,
+    int? messageLimit,
+    int? before,
+  }) async {
+    const charsPerToken = 0.65;
+    final budgetChars = (tokenBudget * charsPerToken).ceil();
+
+    final sizes = await _db.rawQuery(
+      'SELECT id, LENGTH(content) AS n FROM messages '
+      'WHERE thread_id = ?${before == null ? '' : ' AND id < ?'} '
+      'ORDER BY id DESC',
+      <Object?>[threadId, if (before != null) before],
+    );
+    if (sizes.isEmpty) return const <ChatMessage>[];
+
+    var used = 0;
+    var taken = 0;
+    // 至少给一条。预算再小也不能返回空 —— 空会被上层当成"没有更早的了"，
+    // 于是那条超长消息之前的历史就再也翻不出来。
+    var cutoff = sizes.first['id']! as int;
+    for (final row in sizes) {
+      used += (row['n'] as int? ?? 0) + 32;
+      taken++;
+      cutoff = row['id']! as int;
+      if (used >= budgetChars) break;
+      if (messageLimit != null && taken >= messageLimit) break;
+    }
+
+    return _readMessages(
+      where: 'thread_id = ? AND id >= ?'
+          '${before == null ? '' : ' AND id < ?'}',
+      args: <Object?>[threadId, cutoff, if (before != null) before],
+    );
+  }
+
+  /// 这个会话一共多少条消息。用来判断"上面还有没有"。
+  Future<int> messageCountOf(String threadId) async {
+    final rows = await _db.rawQuery(
+      'SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?',
+      <Object?>[threadId],
+    );
+    return rows.first['n']! as int;
+  }
+
+  Future<List<ChatMessage>> messages(String threadId) =>
+      _readMessages(where: 'thread_id = ?', args: <Object?>[threadId]);
+
+  /// 行 → 消息。[tailMessages] 和 [messages] 共用 —— 这张表有二十来列，
+  /// 抄第二份的话，以后加一列必然会漏掉其中一处，而漏掉的表现是
+  /// 「翻上去之后那几条消息少了点东西」。
+  Future<List<ChatMessage>> _readMessages({
+    required String where,
+    required List<Object?> args,
+  }) async {
     final rows = await _db.query(
       'messages',
-      where: 'thread_id = ?',
-      whereArgs: <Object?>[threadId],
+      where: where,
+      whereArgs: args,
       orderBy: 'id ASC',
     );
     return rows

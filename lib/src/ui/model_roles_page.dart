@@ -60,6 +60,7 @@ class _ModelRolesPageState extends State<ModelRolesPage> {
       sources: _catalog.sources(),
       activeSourceId: widget.channels.activeId,
       onRefresh: _catalog.refresh,
+      onToggleStar: _catalog.toggleStar,
       allowNone: role.optional,
       noneLabel: role.unsetLabel,
       noneHint: role.hint,

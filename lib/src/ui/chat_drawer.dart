@@ -13,10 +13,16 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import '../data/chat_store.dart';
+import '../data/task_runtime.dart';
+import '../net/device_auth.dart';
+import '../settings/thread_lock.dart';
+import 'anchored_menu.dart';
+import 'thread_lock_page.dart';
 import 'chat_theme.dart';
 
 enum _SearchScope { threads, current, global }
@@ -26,6 +32,17 @@ class ChatDrawer extends StatefulWidget {
 
   /// 当前打开的会话；null = 还没存盘的新会话。
   final String? currentThreadId;
+
+  /// 这次运行里哪些会话已经开过锁了。见 thread_lock.dart。
+  final ThreadUnlockSession unlocked;
+
+  /// 现在能拿到的全部模型名。找回时给「常用哪个模型」那道选择题当干扰项 ——
+  /// 用用户自己渠道上的模型，假选项才看起来同样可信。
+  final List<String> Function() modelPool;
+
+  /// `sandbox/tasks`。删会话时用它找到那个会话的图片和归档输出。
+  /// null = 拿不到（运行时还没起来），那就只删库里的那部分。
+  final Directory? tasksRoot;
 
   /// 选中一个会话。传 null 表示「开一个新的」。
   final ValueChanged<String?> onSelect;
@@ -41,7 +58,10 @@ class ChatDrawer extends StatefulWidget {
   const ChatDrawer({
     super.key,
     required this.store,
+    required this.unlocked,
+    required this.modelPool,
     required this.currentThreadId,
+    this.tasksRoot,
     required this.onSelect,
     required this.onOpenMessage,
     required this.onOpenSettings,
@@ -77,7 +97,18 @@ class _ChatDrawerState extends State<ChatDrawer> {
     super.dispose();
   }
 
-  void _reload() => _threads = widget.store.threads();
+  /// 哪些会话锁着。
+  ///
+  /// 一次查完存下来，而不是每行各问一次库：抽屉里几十行，每行一次异步查询
+  /// 会让那把小锁一个一个地冒出来。
+  Set<String> _locked = <String>{};
+
+  void _reload() {
+    _threads = widget.store.threads();
+    unawaited(widget.store.lockedThreadIds().then((ids) {
+      if (mounted) setState(() => _locked = ids);
+    }));
+  }
 
   Future<void> _rename(ChatThread thread) async {
     final controller = TextEditingController(text: thread.title);
@@ -108,6 +139,24 @@ class _ChatDrawerState extends State<ChatDrawer> {
   }
 
   Future<void> _delete(ChatThread thread) async {
+    // 锁着的会话，删之前先过一次手机锁屏。
+    //
+    // 这里**不要**会话密码：忘了密码的主人仍然该删得掉自己的东西，而删除
+    // 不泄露任何内容，风险和"读它"完全不是一回事。反过来说也不能什么都不问
+    // —— 否则捡到手机的人一键就能把一段锁着的对话抹掉。
+    if (_locked.contains(thread.id)) {
+      final result = await DeviceAuth.confirm('验证身份以删除这个私密会话');
+      if (!mounted) return;
+      if (result != DeviceAuthResult.ok) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(result == DeviceAuthResult.unavailable
+              ? '这台手机没有设锁屏，删不了私密会话。先到系统设置里加一个'
+              : '没有通过验证'),
+        ));
+        return;
+      }
+    }
+    if (!mounted) return;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -115,6 +164,7 @@ class _ChatDrawerState extends State<ChatDrawer> {
         // 说清楚删的是什么、不删的是什么。用户最怕的是"我的文件也没了"，
         // 而实际上 workspace 是按任务留着的。
         content: Text('「${thread.title}」的全部消息会被删除，无法恢复。\n'
+            '附带的图片和命令输出归档也会一起删掉。\n'
             '这个任务的 workspace 和检查点不受影响。'),
         actions: [
           TextButton(
@@ -129,6 +179,12 @@ class _ChatDrawerState extends State<ChatDrawer> {
     );
     if (ok != true) return;
     await widget.store.deleteThread(thread.id);
+    // 图片和归档输出跟着消息一起走 —— 它们只被消息引用，记录一删就再没有
+    // 任何东西指得到，留着纯粹占地方，而用户在界面上完全看不见它们还在。
+    final tasksRoot = widget.tasksRoot;
+    if (tasksRoot != null) {
+      await reclaimThreadAttachments(tasksRoot, thread.id);
+    }
     if (!mounted) return;
     setState(_reload);
     // 删的是当前正开着的那个，就退到一个新会话 ——
@@ -338,7 +394,12 @@ class _ChatDrawerState extends State<ChatDrawer> {
               ),
             );
           }
-          final hits = snapshot.data ?? const <ChatMessageSearchHit>[];
+          // 锁着的会话不进搜索结果。搜索命中会把消息正文直接摆出来 ——
+          // 挡住了会话本身却让内容从搜索框里漏出去，这道锁就白设了。
+          final hits = <ChatMessageSearchHit>[
+            for (final hit in snapshot.data ?? const <ChatMessageSearchHit>[])
+              if (!_locked.contains(hit.threadId)) hit,
+          ];
           if (hits.isEmpty) {
             final empty =
                 _scope == _SearchScope.current && widget.currentThreadId == null
@@ -456,7 +517,13 @@ class _ChatDrawerState extends State<ChatDrawer> {
                 color: active ? t.bgBrandSecondary : null,
                 borderRadius: BorderRadius.circular(ChatShape.radiusLg),
               ),
-              child: ListTile(
+              // 长按要拿到**触点**：菜单从手指落下的地方长出来。
+              // ListTile 的 onLongPress 不给位置，所以套一层。
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onLongPressStart: (details) =>
+                    _showThreadMenu(thread, details.globalPosition),
+                child: ListTile(
                 dense: true,
                 visualDensity: VisualDensity.compact,
                 shape: RoundedRectangleBorder(
@@ -480,18 +547,30 @@ class _ChatDrawerState extends State<ChatDrawer> {
                   ),
                 ),
                 subtitle: Text(
-                  thread.preview,
+                  // 锁着就不显示预览。列表上那一行摘要恰恰是最会泄露内容的
+                  // 地方 —— 挡住了正文却把开头一句摆在外面，这道锁就白设了。
+                  _locked.contains(thread.id) ? '已加锁' : thread.preview,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 11, color: t.tintTertiary),
                 ),
-                onTap: () {
-                  Navigator.of(context).pop();
-                  if (thread.id != widget.currentThreadId) {
-                    widget.onSelect(thread.id);
+                trailing: _locked.contains(thread.id)
+                    ? Icon(Icons.lock_rounded, size: 14, color: t.tintTertiary)
+                    : null,
+                onTap: () async {
+                  // 先把 navigator 抓在手上：过锁那一步是异步的，回来之后
+                  // 这个 context 可能已经不在树上了。
+                  final navigator = Navigator.of(context);
+                  if (thread.id == widget.currentThreadId) {
+                    navigator.pop();
+                    return;
                   }
+                  if (!await _passGate(thread)) return;
+                  if (!mounted) return;
+                  navigator.pop();
+                  widget.onSelect(thread.id);
                 },
-                onLongPress: () => _showThreadMenu(thread),
+                ),
               ),
             );
           },
@@ -500,33 +579,136 @@ class _ChatDrawerState extends State<ChatDrawer> {
     );
   }
 
-  Future<void> _showThreadMenu(ChatThread thread) async {
-    await showModalBottomSheet<void>(
+  /// 长按会话弹的菜单。
+  ///
+  /// 和输入框的 `+`、顶栏终端图标用同一个浮层（见 anchored_menu.dart）：
+  /// 三处都是"长按/点一下弹出来的二级菜单"，长得不一样没有任何理由。
+  Future<void> _showThreadMenu(ChatThread thread, Offset at) async {
+    final locked = _locked.contains(thread.id);
+    await showAnchoredMenu<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.drive_file_rename_outline),
-              title: const Text('重命名'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _rename(thread);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline),
-              title: const Text('删除'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _delete(thread);
-              },
-            ),
-          ],
+      at: at,
+      builder: (menuContext, _) => <Widget>[
+        MenuAction(
+          icon: Icons.drive_file_rename_outline,
+          label: '重命名',
+          onTap: () {
+            Navigator.pop(menuContext);
+            _rename(thread);
+          },
+        ),
+        MenuAction(
+          icon: locked ? Icons.lock_open_outlined : Icons.lock_outline_rounded,
+          label: locked ? '取消私密' : '设为私密',
+          detail: locked ? '不再需要密码' : '进来要先输密码',
+          onTap: () {
+            Navigator.pop(menuContext);
+            if (locked) {
+              _removeLock(thread);
+            } else {
+              _addLock(thread);
+            }
+          },
+        ),
+        MenuAction(
+          icon: Icons.delete_outline,
+          label: '删除',
+          tone: context.chat.tintError,
+          onTap: () {
+            Navigator.pop(menuContext);
+            _delete(thread);
+          },
+        ),
+      ],
+    );
+  }
+
+  /// 这个会话里那些能当答案的事实。
+  ///
+  /// 每次现算，不存 —— 存一份快照的话，消息被删过之后那份快照会变成一个
+  /// 谁也答不上的答案。
+  Future<ThreadFacts> _factsOf(ChatThread thread) async {
+    final messages = await widget.store.messages(thread.id);
+    final persona = await widget.store.systemPromptOf(thread.id) ?? '';
+    // 模型名从最近一条助手消息的署名里取（形如「渠道名 · 模型名」）。
+    var model = '';
+    for (var i = messages.length - 1; i >= 0; i--) {
+      final source = messages[i].source;
+      if (source == null || source.isEmpty) continue;
+      final at = source.indexOf(' · ');
+      model = at < 0 ? source : source.substring(at + 3);
+      break;
+    }
+    return ThreadFacts(
+      model: model,
+      title: thread.title,
+      persona: persona,
+      opening: messages
+              .where((m) => m.role == 'user')
+              .firstOrNull
+              ?.content ??
+          '',
+      spoken: <String>[
+        for (final m in messages)
+          if (m.role == 'user' || m.role == 'assistant') m.content,
+      ],
+    );
+  }
+
+  /// 给这个会话加锁。
+  Future<void> _addLock(ChatThread thread) async {
+    final facts = await _factsOf(thread);
+    if (!mounted) return;
+    final lock = await Navigator.of(context).push<ThreadLock>(
+      MaterialPageRoute<ThreadLock>(
+        builder: (_) => ThreadLockSetupPage(
+          threadTitle: thread.title,
+          facts: facts,
         ),
       ),
     );
+    if (lock == null) return;
+    await widget.store.setLock(thread.id, lock);
+    // 刚设完就当它是开着的：用户这一刻显然知道密码，再让他立刻输一遍
+    // 只是在证明一件双方都清楚的事。
+    widget.unlocked.unlock(thread.id);
+    if (mounted) setState(_reload);
+  }
+
+  /// 撤掉锁。**要先证明你进得去** —— 否则这道锁等于没有：
+  /// 谁拿到手机都能一键把它撤了。
+  Future<void> _removeLock(ChatThread thread) async {
+    if (!await _passGate(thread)) return;
+    await widget.store.setLock(thread.id, null);
+    widget.unlocked.lock(thread.id);
+    if (mounted) setState(_reload);
+  }
+
+  /// 挡在"要动这个会话"前面的那道关。没加锁直接放行。
+  Future<bool> _passGate(ChatThread thread) async {
+    final lock = await widget.store.lockOf(thread.id);
+    if (lock == null) return true;
+    if (widget.unlocked.isUnlocked(thread.id)) return true;
+    // 标准答案现从会话里取 —— 不落盘，也就不会和被删过的消息对不上。
+    final facts = await _factsOf(thread);
+    if (!mounted) return false;
+    final navigator = Navigator.of(context);
+    final ok = await navigator.push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => ThreadUnlockPage(
+          threadTitle: thread.title,
+          lock: lock,
+          facts: facts,
+          modelPool: widget.modelPool(),
+          onPasswordReset: (reset) => widget.store.setLock(thread.id, reset),
+        ),
+      ),
+    );
+    if (ok == true) {
+      widget.unlocked.unlock(thread.id);
+      return true;
+    }
+    return false;
   }
 
   Widget _footer(ChatTokens t) {

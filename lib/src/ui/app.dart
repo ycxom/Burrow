@@ -10,6 +10,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:xterm/xterm.dart';
@@ -18,6 +19,7 @@ import '../agent/agent_loop.dart';
 import '../agent/tools.dart';
 import '../bootstrap/distro.dart';
 import '../context/overflow_manager.dart';
+import '../context/token_counter.dart';
 import '../data/chat_store.dart';
 import '../data/task_runtime.dart';
 import '../sandbox/exec_policy.dart';
@@ -30,6 +32,7 @@ import '../llm/llm_client.dart';
 import '../llm/thinking_effort.dart';
 import '../llm/vision.dart';
 import '../settings/settings_store.dart';
+import '../settings/thread_lock.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
 import '../settings/model_roles.dart';
@@ -402,6 +405,9 @@ class BurrowApp extends StatelessWidget {
   final AccountStore accounts;
   final ChannelStore channels;
 
+  /// 会话锁：这次运行里哪些私密会话已经开过。见 thread_lock.dart。
+  final ThreadUnlockSession unlocked;
+
   /// 已安装的外部皮肤包。和 settings 一起被监听 —— 装完一个皮肤要立刻
   /// 出现在列表里，而它不属于 SettingsStore。
   final ChatSkinStore skins;
@@ -422,6 +428,7 @@ class BurrowApp extends StatelessWidget {
     required this.skills,
     required this.accounts,
     required this.channels,
+    required this.unlocked,
     required this.skins,
   });
 
@@ -465,6 +472,7 @@ class BurrowApp extends StatelessWidget {
               skills: skills,
               accounts: accounts,
               channels: channels,
+              unlocked: unlocked,
             ),
           );
         },
@@ -495,6 +503,7 @@ class ChatShell extends StatefulWidget {
   final SkillStore skills;
   final AccountStore accounts;
   final ChannelStore channels;
+  final ThreadUnlockSession unlocked;
 
   /// 只往下传，见 BurrowApp.skins。
   final ChatSkinStore skins;
@@ -515,6 +524,7 @@ class ChatShell extends StatefulWidget {
     required this.skills,
     required this.accounts,
     required this.channels,
+    required this.unlocked,
     required this.skins,
   });
 
@@ -580,6 +590,7 @@ class _ChatShellState extends State<ChatShell> {
       skills: widget.skills,
       accounts: widget.accounts,
       channels: widget.channels,
+      unlocked: widget.unlocked,
       skins: widget.skins,
       threadId: _threadId,
       title: _title,
@@ -620,6 +631,7 @@ class HomeShell extends StatefulWidget {
   final SkillStore skills;
   final AccountStore accounts;
   final ChannelStore channels;
+  final ThreadUnlockSession unlocked;
 
   /// 只往下传，见 BurrowApp.skins。
   final ChatSkinStore skins;
@@ -633,8 +645,7 @@ class HomeShell extends StatefulWidget {
   final ValueChanged<String> onTitleChanged;
 
   /// 抽屉消息搜索结果要求换会话并定位。
-  final Future<void> Function(String threadId, int messageId)
-      onOpenSearchHit;
+  final Future<void> Function(String threadId, int messageId) onOpenSearchHit;
 
   /// 抽屉里的搜索结果要打开的那条消息；null = 没有待定位目标。
   final int? searchTargetMessageId;
@@ -657,6 +668,7 @@ class HomeShell extends StatefulWidget {
     required this.skills,
     required this.accounts,
     required this.channels,
+    required this.unlocked,
     required this.skins,
     required this.threadId,
     required this.title,
@@ -672,7 +684,7 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell>
-    with WidgetsBindingObserver
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin
     implements AgentHost {
   late final AgentLoop _agent;
   late final TaskRuntime _runtime;
@@ -694,9 +706,50 @@ class _HomeShellState extends State<HomeShell>
   final _plusKey = GlobalKey();
   final _terminalKey = GlobalKey();
 
+  /// 页签之间的**淡出淡入**（Material 3 的 fade through）。
+  ///
+  /// 三个页签都常驻在 IndexedStack 里（那是滚动位置不丢的前提），所以做不了
+  /// 两个页面同时在场的交叉淡化 —— 那种需要把旧的留在树上。这里用的是它的
+  /// 单轨版本：**先把当前这个淡出去、换完再淡回来**，中间那一瞬间屏幕上
+  /// 只有一样东西。M3 管这个叫 fade through，正是给"两个页面之间没有空间
+  /// 关系"的切换用的 —— 对话和终端确实没有上下左右可言。
+  ///
+  /// 顺带一点点放大：只有透明度变化的话，短促的切换在眼睛里会读成"闪了一下"
+  /// 而不是"换了一个"。
+  late final AnimationController _tabFade = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 210),
+    value: 1,
+  );
+
+  Future<void> _switchTab(int tab) async {
+    if (tab == _tab) return;
+    HapticFeedback.selectionClick();
+    // 淡出用的时间比淡回来短：离开是"已经决定了"，慢慢淡出只会让人等；
+    // 而新页面淡进来那一下才是要看清的。
+    await _tabFade.animateTo(0,
+        duration: const Duration(milliseconds: 90), curve: Curves.easeOutCubic);
+    if (!mounted) return;
+    setState(() => _tab = tab);
+    unawaited(_tabFade.animateTo(1,
+        duration: const Duration(milliseconds: 210),
+        curve: Curves.easeOutCubic));
+  }
+
   /// 列表是否已经滚离顶部。皮肤的 `header:scrolled` 状态靠它。
   /// 只在**跨过阈值**时 setState，不是每帧 —— 顶栏样式没有中间态。
   bool _scrolledAway = false;
+
+  /// 用户的手指正压在列表上，或者刚甩出去还在惯性里。
+  ///
+  /// 生成过程中每 33ms 要跟一次底部，而 `animateTo` 和 `jumpTo` **都会掐掉
+  /// 用户当前的滚动**（两者都要 `beginActivity`，那会终止正在进行的 drag）。
+  /// 所以只要用户在动它，自动跟随就得整个让开。
+  ///
+  /// 光靠 [_scrolledAway] 那个 120 像素的阈值不够：跟随每 33ms 把人拽回底部
+  /// 一次，手指根本攒不够 120 像素的位移，阈值永远翻不过去 —— 表现就是
+  /// 「AI 在输出时界面划不动」。划了，33 毫秒后被打断，再划再被打断。
+  bool _userScrolling = false;
 
   /// 已经选好、还没发出去的图。存的是**拷进会话目录之后**的路径 ——
   /// 相册给的那个路径在系统缓存里，随时会被清掉。
@@ -858,8 +911,14 @@ class _HomeShellState extends State<HomeShell>
     _agent.userSystemPrompt = _effectiveSystemPrompt;
     await _restoreTerminalMode();
     await _loadHistory();
-    await _startShell();
-    if (mounted) setState(() => _runtimeReady = true);
+    if (!mounted) return;
+    // **不等 shell。** 起一个 shell 要 fork 一个 proot 进程，那是这一串里最慢
+    // 的一步，而它和"把对话画出来"没有任何关系 —— 只有终端页要用。等它等到
+    // 的是一屏转圈，而用户点进来是要看对话的。
+    setState(() => _runtimeReady = true);
+    unawaited(_startShell());
+    // 位置要等 ListView 真的建出来才摆得了 —— 见 [_applyInitialScroll]。
+    unawaited(_applyInitialScroll());
   }
 
   /// 恢复这个会话的终端模式。老会话按存的来，新会话按上次的选择来。
@@ -874,11 +933,53 @@ class _HomeShellState extends State<HomeShell>
     _agent.terminalMode = wanted && _distro != null;
   }
 
+  /// 一页装多少。**条数和 token 取先到的那个。**
+  ///
+  /// 一开始只设了 token 预算（1M），结果是它对绝大多数会话等于"全读" ——
+  /// 几千条中文消息才凑得够 1M，分页写了等于没写。日常真正决定一页多大的
+  /// 是「一屏放得下几条」：手机上也就五六条，多读的每一条都是首屏之前的
+  /// 纯等待。Telegram 系客户端首屏取 20 条，就是这个道理。
+  ///
+  /// token 预算留着管另一头：一条几十 KB 的命令输出，光它自己就该成一页，
+  /// 按条数切会让那一页大得离谱。
+  static const _pageMessages = 40;
+  static const _pageTokens = 24000;
+
+  /// 完整历史补完之前，这个 Future 没完成。
+  ///
+  /// **落盘必须等它。** `replaceMessages` 是"删掉这个会话的全部行再重插"，
+  /// 拿一份只有尾巴的历史去执行，就是把用户前面的对话删了 —— 不可恢复。
+  Future<void>? _backfill;
+
+  /// 库里比 `_visible` 更早的消息还有多少条。0 = 已经翻到头了。
+  int _olderInStore = 0;
+
+  /// 正在往上补一页。防止一次滚动触发好几轮。
+  bool _loadingOlder = false;
+
   Future<void> _loadHistory() async {
     final id = _threadId;
     if (id != null) {
-      final messages = await widget.chats.messages(id);
+      // 只读最后一段。一个聊了几个月的会话有几千条消息，全量读出来再造
+      // 几千个对象、算一遍日期分组，是首屏前唯一那段纯等待 —— 而用户打开
+      // 会话十有八九是接着最近这几句说。
+      final messages = await widget.chats.tailMessages(
+        id,
+        tokenBudget: _pageTokens,
+        messageLimit: _pageMessages,
+      );
+      final total = await widget.chats.messageCountOf(id);
+      _olderInStore = total - messages.length;
       _agent.history.addAll(messages);
+
+      // 剩下的在后台补进 history（**不进 `_visible`**）。
+      //
+      // history 必须是完整的：落盘要拿它整份重写，overflow 的 checkpoint 是
+      // 它的下标，记忆检索的语料也是它。而界面那份是另一回事 —— 用户没往上
+      // 翻，就不该为几千条看不见的消息付排版的钱。
+      if (_olderInStore > 0) {
+        _backfill = _fillOlderHistory(id, messages.first.messageId);
+      }
       // 把上一次的滚动摘要接回来。不接的话 checkpoint 归 0，这个会话的
       // 整段历史会在下一次发送时原样发出去 —— 而摘要要等那一轮**结束之后**
       // 才会重新触发，也就是说最该被压缩的那一次请求恰恰没被压缩。
@@ -897,15 +998,86 @@ class _HomeShellState extends State<HomeShell>
     }
     if (mounted) setState(() => _loadingHistory = false);
     await _refreshBranches();
+
+    // **这里只决定停在哪，不真的滚。**
+    //
+    // 这一刻 `_runtimeReady` 还是 false，界面上是一个转圈 —— ListView 压根
+    // 不存在，滚动请求发给一个没有 client 的 controller，安静地什么都不做。
+    // 「回到上次的位置」一直不生效就是因为这个；而它原本那句 `_scrollToEnd()`
+    // 其实也从来没生效过，只是"停在底部"恰好和空列表的表现一样，没人发现。
+    //
+    // 真正的滚动在 [_applyInitialScroll]，等列表建出来之后。
     final target = widget.searchTargetMessageId;
     if (target != null) {
-      _revealMessage(target);
-    } else {
-      // 打开会话直接停在最新消息——和其他聊天应用一致，也是上面"是否跟随
-      // 底部"判断成立的前提：不跳过去的话，长对话默认停在顶部，流式回复
-      // 永远判定成"用户在看历史"，无声无息地不跟随。
-      _scrollToEnd();
+      _initialAnchor = target;
+      _initialHighlight = true;
+      return;
     }
+    final anchor = id == null ? null : await widget.chats.lastReadOf(id);
+    // 上次停在最后一条 = 其实就是在底部。按底部处理，省掉一次
+    // 「贴着底边但差几像素」的定位。
+    if (anchor != null &&
+        _visible.isNotEmpty &&
+        _visible.last.messageId != anchor) {
+      _initialAnchor = anchor;
+      _readingAnchor = anchor;
+    }
+  }
+
+  /// 把首屏那一页之前的历史补进 `_agent.history`。
+  ///
+  /// 只补 history，不动 `_visible` —— 界面上要不要显示它们由用户往上翻决定。
+  Future<void> _fillOlderHistory(String threadId, int? firstLoadedId) async {
+    if (firstLoadedId == null) return;
+    try {
+      final older = await widget.chats.messages(threadId);
+      if (!mounted) return;
+      final head = <ChatMessage>[
+        for (final m in older)
+          if ((m.messageId ?? 0) < firstLoadedId) m,
+      ];
+      if (head.isEmpty) return;
+      _agent.history.insertAll(0, head);
+      // checkpoint 是 history 的下标，前面插了一段就得跟着往后挪，
+      // 否则摘要覆盖范围会指到一段完全不相干的消息上。
+      _agent.overflow.shiftBy(head.length);
+    } catch (_) {
+      // 补不上就当没有更早的。**但落盘那条路仍然被挡住** ——
+      // 见 [_persistMessages]：宁可这次不存，也不能拿残缺的历史去重写。
+      rethrow;
+    }
+  }
+
+  /// 打开这个会话时停在哪一条。null = 停在底部。
+  int? _initialAnchor;
+
+  /// 那一条要不要闪一下高亮。只有搜索命中才要 —— 每次打开会话都闪一下
+  /// 是在提醒一件用户并没有在找的事。
+  bool _initialHighlight = false;
+
+  /// 列表真的建出来之后，才把打开时的位置摆好。
+  Future<void> _applyInitialScroll() async {
+    // 等一帧：`_runtimeReady` 刚翻成 true，ListView 这一帧才第一次布局。
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    final anchor = _initialAnchor;
+    if (anchor == null) {
+      await _settleToEnd();
+      return;
+    }
+    // 摆在靠下的位置：那是"最后看见的那条"，它下面的才是没看的。
+    await _scrollToMessage(anchor, alignment: 0.82);
+    if (_initialHighlight) _flashMessage(anchor);
+  }
+
+  /// 回到最新那条。
+  ///
+  /// 倒序列表里"底"就是 offset 0 —— 一个**常量**，不用先把整个列表量一遍。
+  /// 正着排的时候这里是个循环：跳到 maxScrollExtent、等它因为多建了几行又
+  /// 变大、再跳，直到不动为止。
+  Future<void> _settleToEnd() async {
+    if (!mounted || !_scroll.hasClients) return;
+    _scroll.jumpTo(0);
   }
 
   GlobalKey? _messageKey(int? messageId) {
@@ -915,54 +1087,100 @@ class _HomeShellState extends State<HomeShell>
   }
 
   void _revealMessage(int messageId) {
-    final visibleIndex =
-        _visible.indexWhere((message) => message.messageId == messageId);
-    if (visibleIndex < 0) {
-      widget.onSearchTargetConsumed();
-      return;
-    }
+    // 在不在 `_visible` 里由 [_ensureVisible] 去管 —— 目标可能还在没显示的
+    // 那一段里，这里直接判"没有"会把搜索跳转变成一个哑动作。
+    _flashMessage(messageId);
+    unawaited(_scrollToMessage(messageId, alignment: 0.28));
+    widget.onSearchTargetConsumed();
+  }
 
+  /// 让某条消息闪一下。**只有"这是你搜的那条"才该闪** ——
+  /// 恢复阅读位置每次打开都闪一下，是在提醒一件用户并没有在找的事。
+  void _flashMessage(int messageId) {
     _highlightTimer?.cancel();
+    if (!mounted) return;
     setState(() => _highlightMessageId = messageId);
     _highlightTimer = Timer(const Duration(milliseconds: 2200), () {
       if (mounted) setState(() => _highlightMessageId = null);
     });
+  }
+
+  /// 把界面往上补，直到那条消息进来为止。
+  ///
+  /// 首屏只显示最后一页，而搜索命中和「回到上次的位置」都可能指向更早的
+  /// 消息。不补的话它们会静静地什么都不做 —— 用户点了个搜索结果，界面纹丝
+  /// 不动，看不出是"没找到"还是"点歪了"。
+  Future<bool> _ensureVisible(int messageId) async {
+    bool shown() => _visible.any((m) => m.messageId == messageId);
+    if (shown()) return true;
+    await _backfill;
+    if (!mounted) return false;
+    // 库里都没有就别白翻了。
+    if (!_agent.history.any((m) => m.messageId == messageId)) return false;
+    while (_olderInStore > 0 && !shown()) {
+      final before = _visible.length;
+      await _loadOlderPage();
+      if (!mounted || _visible.length == before) break;
+    }
+    return shown();
+  }
+
+  /// 滚到某条消息。不闪高亮。
+  ///
+  /// **要跳好几轮。** `ListView.builder` 只建视口附近的行，特别长的对话里
+  /// 目标压根还没被创建（拿不到 context 就没法精确定位）；而按行号比例估
+  /// 位置又要用 `maxScrollExtent`，那个值在只建了首屏时本身就是估出来的，
+  /// 跳过去之后还会长。一次跳到位只在短对话里成立 —— 而短对话根本不需要
+  /// 这个功能。
+  Future<void> _scrollToMessage(
+    int messageId, {
+    required double alignment,
+  }) async {
+    if (!await _ensureVisible(messageId)) return;
+    final visibleIndex =
+        _visible.indexWhere((message) => message.messageId == messageId);
+    if (visibleIndex < 0) return;
 
     final rows = _buildRows(null);
     final rowIndex = rows.indexWhere((row) => row.index == visibleIndex);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      bool reveal() {
-        final keyContext = _messageKey(messageId)?.currentContext;
-        if (keyContext != null) {
-          Scrollable.ensureVisible(
-            keyContext,
-            duration: const Duration(milliseconds: 260),
-            curve: Curves.easeOutCubic,
-            alignment: 0.28,
-          );
-          return true;
-        }
-        return false;
-      }
 
+    // [alignment] 按「从视口顶部往下数的比例」传进来，而倒序列表的
+    // "leading" 边是**底边** —— ensureVisible 的 0 在这里指底部。
+    // 在这一处翻过来，调用方就不用记住列表是倒着的。
+    final viewportAlignment = 1 - alignment;
+
+    bool reveal() {
+      final keyContext = _messageKey(messageId)?.currentContext;
+      if (keyContext == null) return false;
+      Scrollable.ensureVisible(
+        keyContext,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOutCubic,
+        alignment: viewportAlignment,
+      );
+      return true;
+    }
+
+    await WidgetsBinding.instance.endOfFrame;
+    for (var attempt = 0; attempt < 8; attempt++) {
+      if (!mounted || !_scroll.hasClients) return;
       if (reveal()) return;
-      if (!_scroll.hasClients || rowIndex < 0) return;
+      if (rowIndex < 0) return;
 
-      // ListView.builder 只会构建视口附近的行。特别长的对话里目标还没被
-      // 创建，先用行号比例估一个位置跳过去；列表落到目标附近后再用它的
-      // context 做精确滚动。
+      // rows 是倒序的，所以行号越大离底边越远 —— 和滚动 offset 同向，
+      // 按比例估位置这件事不用改。
       final maxExtent = _scroll.position.maxScrollExtent;
       final estimate =
           rows.length <= 1 ? 0.0 : maxExtent * rowIndex / (rows.length - 1);
-      _scroll.jumpTo(
-        (estimate - _scroll.position.viewportDimension * 0.28)
-            .clamp(0.0, maxExtent),
-      );
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _scroll.hasClients) reveal();
-      });
-    });
-    widget.onSearchTargetConsumed();
+      final target =
+          (estimate - _scroll.position.viewportDimension * viewportAlignment)
+              .clamp(0.0, maxExtent);
+      // 跳不动了就收手：再跳一次也是同一个位置，而目标始终建不出来说明
+      // 行号和实际布局对不上，接着试只是在空转。
+      if (attempt > 0 && (target - _scroll.offset).abs() < 1) return;
+      _scroll.jumpTo(target);
+      await WidgetsBinding.instance.endOfFrame;
+    }
   }
 
   Future<void> _startShell() async {
@@ -993,6 +1211,14 @@ class _HomeShellState extends State<HomeShell>
         rows: 24,
         cols: 80,
       );
+      // 起 shell 现在不挡着界面了（见 _prepareRuntime），于是它很可能在
+      // 用户已经切走之后才返回 —— 那时候 dispose 里的 `_shell?.killGroup()`
+      // 早就跑过了，而 `_shell` 当时还是 null。不在这里补一刀的话，
+      // 每切一次会话就漏一个 proot 进程。
+      if (!mounted) {
+        handle.killGroup();
+        return;
+      }
       _shell = handle;
 
       // 键盘 → pty
@@ -1139,6 +1365,7 @@ class _HomeShellState extends State<HomeShell>
           currentTaskId: _runtime.id,
           overflow: _agent.overflow,
           snapshots: _runtime.snapshots,
+          chats: widget.chats,
           skins: widget.skins,
           // 闭包而不是值：这一路只在会话跑着的时候才会失败，
           // 取快照的话用户改完配置回到分工表看到的还是上一次那条错误。
@@ -1389,12 +1616,44 @@ class _HomeShellState extends State<HomeShell>
     HapticFeedback.selectionClick();
   }
 
+  /// 历史被**改小**之后落盘：编辑、删除、回到某条、切分支。
+  ///
+  /// 和发送时的落盘分开，是因为只有这几条路会把消息拿走 —— 而拿走消息就
+  /// 可能留下没人要的图。发送只会加，加不出孤儿。
   Future<void> _persist() async {
     final id = _threadId;
-    if (id != null) await _persistMessages(id);
+    if (id == null) return;
+    await _persistMessages(id);
+    await _sweepOrphanImages(id);
+  }
+
+  /// 收掉这个会话里没人要的图。
+  ///
+  /// 只扫这一个会话的目录：一次编辑重发只会在一个会话里留下孤儿，没必要
+  /// 每次都走一遍全部会话的磁盘。
+  ///
+  /// 引用集合是**全库**算的，不是只算这个会话 —— 内容相同的分支段会被两个
+  /// 会话共用，按会话算的话会删掉另一个会话还在用的图。
+  Future<void> _sweepOrphanImages(String threadId) async {
+    if (!_runtimeReady) return;
+    try {
+      final referenced = await widget.chats.referencedImagePaths();
+      await reclaimOrphanImages(
+        _runtime.root.parent,
+        referenced,
+        scope: <String>[threadId],
+      );
+    } catch (_) {
+      // 回收失败只是多占点空间。用户刚做完的编辑已经存好了，
+      // 不该因为扫盘出问题就在界面上报一句他看不懂的话。
+    }
   }
 
   Future<void> _persistMessages(String id) async {
+    // **等历史补齐。** replaceMessages 是"删掉这个会话的全部行再重插"，
+    // 拿一份只有尾巴的历史去执行，就是把用户前面的对话删了 —— 不可恢复。
+    // 补齐失败时这里会跟着抛，那是对的：宁可这次不存，也不能删。
+    await _backfill;
     final persisted = await widget.chats.replaceMessages(id, _agent.history);
     // 摘要状态跟着历史一起存，而且就在这一个出口 —— 发送、编辑、回滚、
     // 切分支全都收敛到这里，分散去存的话漏掉任何一处都会留下
@@ -1677,11 +1936,15 @@ class _HomeShellState extends State<HomeShell>
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
       unawaited(_persistReadingPosition());
+      // 私密会话全部重新锁上。把手机递给别人之前，用户唯一会做的动作
+      // 就是切出去或者息屏 —— 那一刻不锁，这道锁只在第一次有用。
+      widget.unlocked.lockAll();
     }
   }
 
   @override
   void dispose() {
+    _tabFade.dispose();
     WidgetsBinding.instance.removeObserver(this);
     widget.settings.removeListener(_onSettingsChanged);
     _statusTimer?.cancel();
@@ -1802,10 +2065,13 @@ class _HomeShellState extends State<HomeShell>
       _streamPaintTimer = null;
       if (mounted) {
         setState(() {});
-        // 用户主动往上翻看历史时不该被拽回底部——那样连一次完整的滚动
-        // 手势都做不完，表现就是"生成时屏幕滑不动"。只有本来就跟在底部
-        // 的才继续跟；翻上去之后，输出照样在后台流，翻回底部会自动接上。
-        if (!_scrolledAway) _scrollToEnd(animated: true);
+        // 用户主动往上翻看历史时不该被拽回底部。只有本来就跟在底部的才
+        // 继续跟；翻上去之后输出照样在后台流，翻回底部会自动接上。
+        //
+        // **不带动画。** 每 33ms 起一次 animateTo，上一次永远跑不完，
+        // 既跟不准也更容易和用户的手势打架；而正文是往下长的，
+        // 直接跳到新的底边就是"待在底部"本身。
+        if (_canFollowBottom) _scrollToEnd();
       }
     });
   }
@@ -1842,7 +2108,7 @@ class _HomeShellState extends State<HomeShell>
       _reasoning.clear();
       _thinkStartedAt = null;
     });
-    if (!_scrolledAway) _scrollToEnd(animated: true);
+    if (_canFollowBottom) _scrollToEnd(animated: true);
   }
 
   @override
@@ -1854,7 +2120,7 @@ class _HomeShellState extends State<HomeShell>
         startedAt: DateTime.now(),
       );
     });
-    if (!_scrolledAway) _scrollToEnd(animated: true);
+    if (_canFollowBottom) _scrollToEnd(animated: true);
   }
 
   @override
@@ -1864,7 +2130,7 @@ class _HomeShellState extends State<HomeShell>
       _runningTool = null;
       _visible.add(message);
     });
-    if (!_scrolledAway) _scrollToEnd(animated: true);
+    if (_canFollowBottom) _scrollToEnd(animated: true);
   }
 
   @override
@@ -1914,6 +2180,9 @@ class _HomeShellState extends State<HomeShell>
       // 发消息是主动动作：不管发送前翻到对话哪个位置，都该跳到底部去看
       // 这句话和接下来的回复——用户没有理由发了消息却还盯着旧历史。
       _scrolledAway = false;
+      // 顺手把手势状态清干净。万一某次 ScrollStart 没等到配对的 ScrollEnd，
+      // 跟随会被永久关掉，而那种卡死没有任何迹象可查。
+      _userScrolling = false;
       _attachments.clear();
       _streaming.clear();
       _reasoning.clear();
@@ -2056,6 +2325,7 @@ class _HomeShellState extends State<HomeShell>
       _reasoning.clear();
       _thinkStartedAt = null;
       _scrolledAway = false;
+      _userScrolling = false;
     });
 
     // 先把即将被替换的这一段收进版本库，再动它。
@@ -2075,15 +2345,97 @@ class _HomeShellState extends State<HomeShell>
     );
   }
 
+  /// 往界面上再接一页更早的消息。
+  ///
+  /// 消息本身从 `_agent.history` 里取，不查库 —— 后台早就把完整历史补进去了
+  /// （见 [_fillOlderHistory]）。这里做的只是"让界面认下它们"。
+  ///
+  /// **接完要把滚动位置补回去。** 在列表**顶部**插内容会把已有内容整个往下
+  /// 推，用户正看着的那一段会瞬间跳走一屏 —— 那比停顿更让人迷惑。
+  Future<void> _loadOlderPage() async {
+    if (_loadingOlder || _olderInStore <= 0 || !mounted) return;
+    _loadingOlder = true;
+    try {
+      await _backfill;
+      if (!mounted) return;
+      final loaded = _visible.length;
+      final head = _agent.history.length - loaded;
+      if (head <= 0) {
+        _olderInStore = 0;
+        return;
+      }
+      // 按 token 预算取一段，从已显示的那条往前数。
+      var budget = _pageTokens;
+      var start = head;
+      while (start > 0 && budget > 0 && head - start < _pageMessages) {
+        start--;
+        budget -= TokenCounter.estimate(_agent.history[start].content) +
+            TokenCounter.perMessageOverhead;
+      }
+      final batch = _agent.history.sublist(start, head);
+      if (batch.isEmpty) return;
+
+      // 直接插，**不用补位置**。倒序列表里更早的消息是往列表**尾部**加的，
+      // 而尾部离锚点（底边）最远 —— 视口纹丝不动。正着排的时候这里要先记下
+      // 「离底部还有多远」、插完再跳回去，因为在顶部插内容会把用户正看的那段
+      // 整个往下推一屏。
+      setState(() {
+        _visible.insertAll(0, batch);
+        _olderInStore = start;
+      });
+    } finally {
+      _loadingOlder = false;
+    }
+  }
+
+  /// 现在可以自动跟着底部走吗。
+  ///
+  /// 两个条件缺一不可：用户没翻上去看历史，**而且**手指没在动它。
+  bool get _canFollowBottom => !_scrolledAway && !_userScrolling;
+
+  /// 用户开始 / 结束用手滚这个列表。
+  ///
+  /// 拖动一开始就立刻停掉跟随，不等 120 像素那个阈值 —— 那个阈值是给
+  /// "翻上去看历史"用的，而它在生成过程中永远翻不过去（见 [_userScrolling]）。
+  bool _onScrollNotification(ScrollNotification notification) {
+    // 只认这个列表自己的。气泡里那些能横向滚的代码块也会往上冒通知，
+    // 认了的话「横着拖一下代码」就把跟随关掉了。
+    if (notification.depth != 0) return false;
+    if (notification is ScrollStartNotification) {
+      // 只认**手指**发起的。程序自己的 jumpTo/animateTo 也会发这个通知，
+      // 认了的话跟随会把自己关掉。
+      if (notification.dragDetails != null) {
+        _userScrolling = true;
+        if (!_scrolledAway && mounted) setState(() => _scrolledAway = true);
+      }
+    } else if (notification is ScrollEndNotification) {
+      // 甩出去之后的惯性也算"用户在动它" —— ScrollEnd 要等惯性停下来才来，
+      // 正好是想要的边界。停下来之后由 [_onScroll] 的距离判定接手。
+      _userScrolling = false;
+      _onScroll();
+    }
+    return false;
+  }
+
   void _onScroll() {
     if (!_scroll.hasClients) return;
-    // 量的是「离底部还有多远」，不是绝对 offset —— 长对话正常停在底部时
-    // offset 本身就很大，拿它当「往上翻过」的判据从一开始就是错的，会让
-    // 流式输出在任何有点长度的对话里都判成"用户在看历史"，从而不跟随。
-    final distanceFromBottom =
-        _scroll.position.maxScrollExtent - _scroll.offset;
-    final away = distanceFromBottom > 120;
+    // 倒序列表里 offset **就是**「离底部还有多远」：0 = 贴着最新那条。
+    // 正着排的时候这里要拿 maxScrollExtent 去减，而那个值在长对话里是估出来
+    // 的、还会边滚边长 —— 判据本身就在抖。
+    final away = _scroll.offset > 120;
     if (away != _scrolledAway && mounted) setState(() => _scrolledAway = away);
+
+    // 快翻到顶了就提前补下一页。**提前**是关键：等真的到顶再去查库，
+    // 用户会撞上一次肉眼可见的停顿，而滚动惯性正好在那一刻最快。
+    // 一屏的余量足够在惯性停下来之前把下一页接上。
+    //
+    // 倒序列表里"顶"是 maxScrollExtent 那一头。首屏没填满时这个差值本来
+    // 就小于一屏，于是会立刻再补一页 —— 那正是想要的：先把屏幕填满。
+    final position = _scroll.position;
+    if (position.maxScrollExtent - position.pixels <
+        position.viewportDimension) {
+      unawaited(_loadOlderPage());
+    }
 
     // 「读到哪儿」300ms 采一次样。每帧都算的话，一个五百条的会话每秒要走
     // 几万次循环，而这个值的唯一用途是"下次打开停在哪"—— 它不需要精确到帧。
@@ -2101,10 +2453,13 @@ class _HomeShellState extends State<HomeShell>
   ///
   /// 取**底边**那条而不是顶边：聊天是往下长的，「我读到这儿了」指的是
   /// 最后看见的那条，不是屏幕最上面那条。
+  ///
+  /// 倒序列表里 `getOffsetToReveal(box, 0)` 给的是「把这条摆到**底边**时
+  /// 该滚到哪」，越旧的消息这个值越大。所以从最新往回找，第一条 `>= pixels`
+  /// 的就是当前压在底边上的那条 —— 比它更新的都已经滑到视口下面去了。
   int? _viewportBottomMessageId() {
     if (!_scroll.hasClients || !_scrolledAway) return null;
-    final position = _scroll.position;
-    final bottom = position.pixels + position.viewportDimension;
+    final pixels = _scroll.position.pixels;
     // 从后往前找。没被 ListView 构建出来的行 currentContext 是 null，
     // 跳过它们很快 —— 真正要量的只有视口附近那几条。
     for (var i = _visible.length - 1; i >= 0; i--) {
@@ -2114,7 +2469,7 @@ class _HomeShellState extends State<HomeShell>
       if (box is! RenderBox || !box.attached) continue;
       final viewport = RenderAbstractViewport.maybeOf(box);
       if (viewport == null) continue;
-      if (viewport.getOffsetToReveal(box, 0).offset <= bottom) return id;
+      if (viewport.getOffsetToReveal(box, 0).offset >= pixels) return id;
     }
     return null;
   }
@@ -2127,78 +2482,38 @@ class _HomeShellState extends State<HomeShell>
     final id = _threadId;
     if (id == null || !_runtimeReady) return;
     // 还挂在树上就现量一次，量不到再退回上一次采样的值。
-    final anchor = _scroll.hasClients ? _viewportBottomMessageId() : _readingAnchor;
+    final anchor =
+        _scroll.hasClients ? _viewportBottomMessageId() : _readingAnchor;
     await widget.chats.setLastRead(id, anchor);
-  }
-
-  /// 键盘弹起 / 收起时，让聊天内容跟着输入框一起走。
-  ///
-  /// Scaffold 会自己把 body 收矮（`resizeToAvoidBottomInset`），所以输入框
-  /// 确实跟着键盘上去了 —— 但列表是**锚在顶部**的，视口一矮，最后几条消息
-  /// 就被留在了折线以下。用户刚点开输入框，想说的话对着的那几条反而看不见了。
-  ///
-  /// 修法是保住「离底部还有多远」这个距离：视口高度和 maxScrollExtent 都会变，
-  /// 而这个距离才是用户眼里"我正看着哪一段"。恢复它，整段聊天就跟着输入框
-  /// 一起上移；原来贴着输入框的那条消息，之后还贴着输入框。
-  ///
-  /// 不用「直接滚到底」代替：那会把正在往回翻历史的用户一把拽回最新消息，
-  /// 而点开输入框并不表示他想离开正在看的那一段。
-  void _followKeyboard() {
-    if (!_scroll.hasClients) return;
-    // 这一刻布局还是变化**之前**的，量到的正是变化前的距离。
-    final gap = _scroll.position.maxScrollExtent - _scroll.position.pixels;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scroll.hasClients) return;
-      final position = _scroll.position;
-      final target = (position.maxScrollExtent - gap)
-          .clamp(position.minScrollExtent, position.maxScrollExtent);
-      // 差不到一像素就别动 —— jumpTo 会触发一次滚动通知，白跳只会让
-      // `_scrolledAway` 那边跟着抖。
-      if ((target - position.pixels).abs() < 0.5) return;
-      position.jumpTo(target);
-    });
   }
 
   void _scrollToEnd({bool animated = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        final end = _scroll.position.maxScrollExtent;
-        if (animated) {
-          _scroll.animateTo(end,
-              duration: const Duration(milliseconds: 90),
-              curve: Curves.easeOut);
-        } else {
-          _scroll.jumpTo(end);
-        }
+      // 排进队之后、真正跑之前，用户可能已经把手指按上去了。
+      // jumpTo/animateTo 都会掐掉他那一下。
+      if (!_scroll.hasClients || _userScrolling) return;
+      // 倒序列表里最新那条就在 offset 0。
+      if (animated) {
+        _scroll.animateTo(0,
+            duration: const Duration(milliseconds: 90), curve: Curves.easeOut);
+      } else {
+        _scroll.jumpTo(0);
       }
     });
   }
 
-  /// 上一帧的键盘高度。见 [_followKeyboard]。
-  double _keyboardInset = 0;
-
   @override
   Widget build(BuildContext context) {
-    // 键盘是一帧一帧涨上来的，所以这里每帧都会走一次 —— 那正是想要的：
-    // 列表跟着键盘一起动，而不是等它弹完再"啪"地跳一下。
-    final keyboard = MediaQuery.viewInsetsOf(context).bottom;
-    if (keyboard != _keyboardInset) {
-      _keyboardInset = keyboard;
-      _followKeyboard();
-    }
-
-    if (!_runtimeReady) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Burrow')),
-        body: const Center(child: CircularProgressIndicator()),
-      );
-    }
+    // 这里以前有一段「键盘弹起时把聊天内容跟着往上挪」。倒序列表之后不需要了
+    // ——它的 0 点就锚在底边上，视口一矮，内容自己跟着输入框走。
+    // 那段补偿是"列表锚在顶部"逼出来的，锚点一换就整个消失了。
+    if (!_runtimeReady) return _buildLoadingShell();
     // 底栏没了之后，「怎么从终端回到对话」只剩顶栏那个图标。
     // 返回键也得能回来 —— 否则用户按返回会直接退出 app。
     return PopScope(
       canPop: _tab == 0,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) setState(() => _tab = 0);
+        if (!didPop) unawaited(_switchTab(0));
       },
       child: Scaffold(
         key: _scaffoldKey,
@@ -2209,6 +2524,17 @@ class _HomeShellState extends State<HomeShell>
         drawer: ChatDrawer(
           store: widget.chats,
           currentThreadId: _threadId,
+          unlocked: widget.unlocked,
+          // 找回时那道选择题的干扰项：用用户自己渠道上的模型，
+          // 假选项才看起来同样可信。
+          modelPool: () => <String>[
+            for (final channel in widget.channels.channels) ...<String>[
+              channel.model,
+              ...widget.settings.modelsOf(channel.id),
+            ],
+          ],
+          // 每个会话一个目录，父目录就是全部会话的容器。
+          tasksRoot: _runtime.root.parent,
           onSelect: widget.onSelectThread,
           onOpenMessage: widget.onOpenSearchHit,
           onOpenSettings: _openSettings,
@@ -2291,62 +2617,107 @@ class _HomeShellState extends State<HomeShell>
             // 设置 / 技能 / 账号都在抽屉里。
           ],
         ),
-        body: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 200),
-          transitionBuilder: (child, animation) {
-            return FadeTransition(
-              opacity: animation,
-              child: child,
-            );
-          },
-          child: _tab == 0
-              ? _buildChat()
-              : _tab == 1
-                  ? Column(
-                      key: const ValueKey(1),
-                      children: [
-                        if (_distro == null)
-                          Container(
-                            width: double.infinity,
-                            color: context.chat.tintWarning.withOpacity(0.16),
-                            padding: const EdgeInsets.all(8),
-                            child: Text(
-                              '降级模式：未安装发行版基座，当前是 Android 自带的 '
-                              '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
-                              style: TextStyle(
-                                  fontSize: 11,
-                                  color: context.chat.tintPrimary),
+        // **IndexedStack，不是 AnimatedSwitcher。**
+        //
+        // 原来三个页签之间做淡入淡出，代价是切走的那个**整棵子树被拆掉**：
+        // 聊天列表的 ScrollPosition 跟着没了，切回来是一个全新的、offset 为 0
+        // 的列表 —— 表现就是"点一下检查点再回来，对话被拽回最开头"。
+        //
+        // 换成 IndexedStack 之后没有东西被拆，也就没有什么需要恢复：位置
+        // 原封不动，终端那边的滚动条同理。顺带还省掉了每次切页签重新排版
+        // 整个消息列表的开销。
+        //
+        // 代价是那 200ms 的淡入淡出没了。页签切换本来也不该有过场动画 ——
+        // 它是"看另一样东西"，不是"去另一个地方"。
+        body: FadeTransition(
+          opacity: _tabFade,
+          child: ScaleTransition(
+            // 幅度压得很小。这是"换了一个"的提示，不是一次表演 ——
+            // 页签切换一天要发生几十次，动静大了很快就烦。
+            scale: Tween<double>(begin: 0.985, end: 1).animate(_tabFade),
+            child: IndexedStack(
+              index: _tab,
+              children: <Widget>[
+                _buildChat(),
+                Column(
+                  children: [
+                    if (_distro == null)
+                      Container(
+                        width: double.infinity,
+                        color: context.chat.tintWarning.withValues(alpha: 0.16),
+                        padding: const EdgeInsets.all(8),
+                        child: Text(
+                          '降级模式：未安装发行版基座，当前是 Android 自带的 '
+                          '/system/bin/sh。没有包管理器，也没有 proot 路径隔离。',
+                          style: TextStyle(
+                              fontSize: 11, color: context.chat.tintPrimary),
+                        ),
+                      ),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: context.chat.bgSecondary,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: context.chat.borderPrimary,
+                              width: 0.5,
                             ),
                           ),
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.all(12),
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: context.chat.bgSecondary,
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: context.chat.borderPrimary,
-                                  width: 0.5,
-                                ),
-                              ),
-                              clipBehavior: Clip.antiAlias,
-                              child: InteractiveTerminal(
-                                terminal: _terminal,
-                                controller: _terminalController,
-                              ),
-                            ),
+                          clipBehavior: Clip.antiAlias,
+                          child: InteractiveTerminal(
+                            terminal: _terminal,
+                            controller: _terminalController,
                           ),
                         ),
-                      ],
-                    )
-                  : _CheckpointTimeline(
-                      key: const ValueKey(2),
-                      snapshots: _runtime.snapshots,
-                      prefixGens: widget.prefixGens,
-                      onRolledBack: _setStatus,
+                      ),
                     ),
+                  ],
+                ),
+                _CheckpointTimeline(
+                  snapshots: _runtime.snapshots,
+                  prefixGens: widget.prefixGens,
+                  onRolledBack: _setStatus,
+                ),
+              ],
+            ),
+          ),
         ),
+      ),
+    );
+  }
+
+  /// 还没准备好时的样子。
+  ///
+  /// **不是一块空白加转圈。** 那样会在点进会话和看到对话之间插一个长得完全
+  /// 不同的界面：标题变成「Burrow」、壁纸没了、输入框没了 —— 一次跳转看起来
+  /// 像去了两个地方。Telegram 系客户端从来不这么做：聊天页的外壳（标题、
+  /// 壁纸、输入框）第一帧就在，只有消息那块是空的，转圈画在那块的中间。
+  ///
+  /// 所以这里保留**同一张壁纸、同一个标题**，只把消息区留空。切过去的那一下
+  /// 只有内容在变，框架是连续的。
+  Widget _buildLoadingShell() {
+    final t = context.chat;
+    return Scaffold(
+      backgroundColor: t.bgPrimary,
+      appBar: AppBar(
+        backgroundColor: t.headerBg,
+        foregroundColor: t.tintPrimary,
+        elevation: 0,
+        // 真标题，不是 app 名。这一下切换里唯一该变的是消息，不是"我在哪"。
+        title: Text(
+          widget.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        ),
+      ),
+      body: ChatWallpaper(
+        preset: widget.settings.chatWallpaperPreset,
+        imagePath: widget.settings.chatWallpaperPath,
+        dim: widget.settings.chatWallpaperDim,
+        child: const Center(child: _DelayedSpinner()),
       ),
     );
   }
@@ -2372,76 +2743,99 @@ class _HomeShellState extends State<HomeShell>
       blur: widget.settings.chatComposerBlur,
       opacity: widget.settings.chatComposerOpacity,
       child: Stack(
-      children: <Widget>[
-        Positioned.fill(
-          child: ChatWallpaper(
-            preset: widget.settings.chatWallpaperPreset,
-            imagePath: widget.settings.chatWallpaperPath,
-            dim: widget.settings.chatWallpaperDim,
-            child: ListView.builder(
-              controller: _scroll,
-              physics: const BouncingScrollPhysics(
-                parent: AlwaysScrollableScrollPhysics(),
+        children: <Widget>[
+          Positioned.fill(
+            child: NotificationListener<ScrollNotification>(
+              onNotification: _onScrollNotification,
+              child: ChatWallpaper(
+                preset: widget.settings.chatWallpaperPreset,
+                imagePath: widget.settings.chatWallpaperPath,
+                dim: widget.settings.chatWallpaperDim,
+                child: ListView.builder(
+                  controller: _scroll,
+                  // **倒着排：第 0 项在最底下，offset 0 就是最新消息。**
+                  //
+                  // 聊天列表天生是从底部长起来的，正着排等于每次都要先问
+                  // "总高度是多少"才知道底在哪 —— 而变长条目的懒加载列表
+                  // 不量到底就不知道 maxScrollExtent，于是打开会话得反复跳。
+                  // 这一节课交过两次学费（"回到起始点"和"恢复位置不生效"）。
+                  //
+                  // 倒过来之后：打开即在底部，不用滚；键盘顶上来时内容自己
+                  // 贴着输入框走，不用补偿；往上翻是往列表**尾部**追加，
+                  // 视口纹丝不动，也不用补偿。三处补丁一起消失。
+                  reverse: true,
+                  physics: const BouncingScrollPhysics(
+                    parent: AlwaysScrollableScrollPhysics(),
+                  ),
+                  // 输入区悬浮在列表上面；给最后一条消息留下同等空间，
+                  // 否则它会停在玻璃下面，看得见却点不到。
+                  padding: context.parts.list.padded(
+                    EdgeInsets.fromLTRB(0, 8, 0, 84 + bottomInset),
+                  ),
+                  itemCount: rows.length,
+                  // 划出视口的行直接丢掉，不留一份"以后可能还要用"的副本。
+                  //
+                  // 消息里最占内存的是解码后的图 —— 一张 1600px 的截图是
+                  // 10MB 的 RGBA。翻过几十条带图的消息之后，那份缓存能顶得上
+                  // 整个 app 的其余部分。行被回收，图跟着从内存里出去；
+                  // 翻回来重新解一次是几十毫秒，而 OOM 是直接闪退。
+                  addAutomaticKeepAlives: false,
+                  itemBuilder: (_, i) => _buildRow(rows[i]),
+                ),
               ),
-              // 输入区悬浮在列表上面；给最后一条消息留下同等空间，
-              // 否则它会停在玻璃下面，看得见却点不到。
-              padding: context.parts.list.padded(
-                EdgeInsets.fromLTRB(0, 8, 0, 84 + bottomInset),
-              ),
-              itemCount: rows.length,
-              itemBuilder: (_, i) => _buildRow(rows[i]),
             ),
           ),
-        ),
-        if (_scrolledAway)
+          if (_scrolledAway)
+            Positioned(
+              right: 16,
+              bottom: 100 + bottomInset,
+              child: FloatingActionButton.small(
+                heroTag: 'scroll_to_bottom',
+                onPressed: () {
+                  _scrollToEnd(animated: true);
+                  HapticFeedback.lightImpact();
+                },
+                backgroundColor: context.chat.bgPrimary.withOpacity(0.9),
+                foregroundColor: context.chat.brand,
+                shape: const CircleBorder(),
+                child: const Icon(Icons.arrow_downward_rounded),
+              ),
+            ),
           Positioned(
-            right: 16,
-            bottom: 100 + bottomInset,
-            child: FloatingActionButton.small(
-              heroTag: 'scroll_to_bottom',
-              onPressed: () {
-                _scrollToEnd(animated: true);
-                HapticFeedback.lightImpact();
-              },
-              backgroundColor: context.chat.bgPrimary.withOpacity(0.9),
-              foregroundColor: context.chat.brand,
-              shape: const CircleBorder(),
-              child: const Icon(Icons.arrow_downward_rounded),
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                AttachmentTray(
+                  paths: _attachments,
+                  onRemove: (path) => setState(() {
+                    _attachments.remove(path);
+                    // 文件也删掉。留着的话，会话目录里会慢慢堆满"选了又取消"的图，
+                    // 而没有任何一条消息引用它们 —— 谁也不会想起来去清。
+                    unawaited(
+                        File(path).delete().catchError((_) => File(path)));
+                  }),
+                ),
+                ChatComposer(
+                  controller: _input,
+                  generating: _busy,
+                  enabled: !_busy && !_loadingHistory,
+                  hasExternalContent: _attachments.isNotEmpty,
+                  hintText:
+                      _agent.terminalMode ? '描述你希望 Agent 完成的任务' : '随便聊点什么',
+                  onSend: _send,
+                  onStop: _stop,
+                  effect: widget.settings.chatComposerEffect,
+                  blur: widget.settings.chatComposerBlur,
+                  opacity: widget.settings.chatComposerOpacity,
+                  leading: [_buildPlusButton()],
+                ),
+              ],
             ),
           ),
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 0,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              AttachmentTray(
-                paths: _attachments,
-                onRemove: (path) => setState(() {
-                  _attachments.remove(path);
-                  // 文件也删掉。留着的话，会话目录里会慢慢堆满"选了又取消"的图，
-                  // 而没有任何一条消息引用它们 —— 谁也不会想起来去清。
-                  unawaited(File(path).delete().catchError((_) => File(path)));
-                }),
-              ),
-              ChatComposer(
-                controller: _input,
-                generating: _busy,
-                enabled: !_busy && !_loadingHistory,
-                hasExternalContent: _attachments.isNotEmpty,
-                hintText: _agent.terminalMode ? '描述你希望 Agent 完成的任务' : '随便聊点什么',
-                onSend: _send,
-                onStop: _stop,
-                effect: widget.settings.chatComposerEffect,
-                blur: widget.settings.chatComposerBlur,
-                opacity: widget.settings.chatComposerOpacity,
-                leading: [_buildPlusButton()],
-              ),
-            ],
-          ),
-        ),
-      ],
+        ],
       ),
     );
   }
@@ -2486,7 +2880,10 @@ class _HomeShellState extends State<HomeShell>
     final running = _runningTool;
     if (running != null) rows.add(_ChatRow.runningTool(running));
     if (streaming != null) rows.add(_ChatRow.streaming(streaming));
-    return rows;
+    // **倒过来给列表。** 上面这一段仍然按"从旧到新"算 —— 日期分隔、分组、
+    // 摘要分隔线的判据全是"和上一条比"，正着算才读得懂。倒序只是交付方式：
+    // 列表是 reverse 的，它的第 0 项画在最底下。
+    return rows.reversed.toList();
   }
 
   Widget _buildRow(_ChatRow row) {
@@ -2714,7 +3111,7 @@ class _HomeShellState extends State<HomeShell>
       onPressed: () {
         HapticFeedback.selectionClick();
         if (inTerminal) {
-          setState(() => _tab = 0);
+          unawaited(_switchTab(0));
         } else {
           _showTerminalMenu();
         }
@@ -2738,8 +3135,7 @@ class _HomeShellState extends State<HomeShell>
         key: ValueKey(active),
         tooltip: active ? '返回对话' : tooltip,
         onPressed: () {
-          if (!active) HapticFeedback.selectionClick();
-          setState(() => _tab = active ? 0 : tab);
+          unawaited(_switchTab(active ? 0 : tab));
         },
         icon: Icon(icon, size: context.parts.headerAction.iconSizeOr(24)),
         color: active
@@ -2767,6 +3163,7 @@ class _HomeShellState extends State<HomeShell>
       sources: _catalog.sources(),
       activeSourceId: widget.channels.activeId,
       onRefresh: _catalog.refresh,
+      onToggleStar: _catalog.toggleStar,
     );
     if (picked == null || picked.model.isEmpty) return;
     final switched = picked.sourceId != widget.channels.activeId;
@@ -2777,7 +3174,8 @@ class _HomeShellState extends State<HomeShell>
       ModelRef(channelId: picked.sourceId, model: picked.model),
     );
     if (switched && mounted) {
-      final name = widget.channels.byId(picked.sourceId)?.name ?? picked.sourceId;
+      final name =
+          widget.channels.byId(picked.sourceId)?.name ?? picked.sourceId;
       _setStatus('已切换到渠道「$name」');
     }
   }
@@ -3018,7 +3416,8 @@ class _HomeShellState extends State<HomeShell>
         final yolo = _agent.mode == ApprovalMode.yolo;
         return <Widget>[
           MenuAction(
-            icon: _agent.terminalMode ? Icons.terminal : Icons.terminal_outlined,
+            icon:
+                _agent.terminalMode ? Icons.terminal : Icons.terminal_outlined,
             label: '终端模式',
             detail: _agent.terminalMode
                 ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
@@ -3092,8 +3491,7 @@ class _HomeShellState extends State<HomeShell>
                 : '手动敲命令，和模型共用同一个 ${_distro!.distro.displayName}',
             onTap: () {
               Navigator.pop(menuContext);
-              HapticFeedback.selectionClick();
-              setState(() => _tab = 1);
+              unawaited(_switchTab(1));
             },
           ),
         ];
@@ -3101,7 +3499,6 @@ class _HomeShellState extends State<HomeShell>
     );
     if (mounted) setState(() {});
   }
-
 }
 
 /// 消息列表里的一行。
@@ -3168,7 +3565,6 @@ class _CheckpointTimeline extends StatefulWidget {
   final void Function(String message) onRolledBack;
 
   const _CheckpointTimeline({
-    super.key,
     required this.snapshots,
     required this.prefixGens,
     required this.onRolledBack,
@@ -3295,4 +3691,54 @@ class _CheckpointTimelineState extends State<_CheckpointTimeline> {
     if (d.inHours < 24) return '${d.inHours} 小时前';
     return '${d.inDays} 天前';
   }
+}
+
+/// 等一会儿才出现的转圈。
+///
+/// 读一页消息通常几十毫秒。在那点时间里闪一下转圈**比什么都不显示更差** ——
+/// 用户看到的是一次没有内容的闪烁，而不是"在加载"。所以先什么都不画，
+/// 拖过这个门槛还没好，才淡进来。
+///
+/// 淡进来而不是"啪"地出现，理由一样：突然出现的东西会被眼睛当成故障。
+class _DelayedSpinner extends StatefulWidget {
+  const _DelayedSpinner();
+
+  @override
+  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
+}
+
+class _DelayedSpinnerState extends State<_DelayedSpinner> {
+  static const _threshold = Duration(milliseconds: 220);
+
+  bool _show = false;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer(_threshold, () {
+      if (mounted) setState(() => _show = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedOpacity(
+        opacity: _show ? 1 : 0,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        child: SizedBox(
+          width: 26,
+          height: 26,
+          child: CircularProgressIndicator(
+            strokeWidth: 2.4,
+            color: context.chat.brand,
+          ),
+        ),
+      );
 }

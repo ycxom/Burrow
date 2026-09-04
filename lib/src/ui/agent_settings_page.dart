@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import '../agent/agent_loop.dart';
 import '../context/overflow_manager.dart';
 import '../sandbox/sandbox_session.dart';
+import '../data/chat_store.dart';
+import '../data/task_runtime.dart';
 import '../sandbox/snapshot_store.dart';
 import '../settings/settings_store.dart';
 
@@ -500,6 +502,8 @@ class ContextSettingsPage extends StatefulWidget {
     required this.store,
     required this.overflow,
     required this.snapshots,
+    required this.chats,
+    required this.tasksRoot,
     super.key,
   });
 
@@ -508,6 +512,13 @@ class ContextSettingsPage extends StatefulWidget {
   /// 当前会话的摘要状态。只读展示 —— 让「已经摘要到第几条」这件事可见。
   final OverflowManager overflow;
   final SnapshotStore snapshots;
+
+  /// 聊天库。清理按钮要连它一起收 —— 只清快照的话，用户删掉一堆会话之后
+  /// 在系统设置里看到的占用一点没少。
+  final ChatStore chats;
+
+  /// `sandbox/tasks`。清理时要顺着它扫一遍没人引用的图。
+  final Directory tasksRoot;
 
   @override
   State<ContextSettingsPage> createState() => _ContextSettingsPageState();
@@ -679,9 +690,9 @@ class _ContextSettingsPageState extends State<ContextSettingsPage> {
           Align(
             alignment: Alignment.centerRight,
             child: TextButton.icon(
-              onPressed: () => unawaited(_gc()),
+              onPressed: _busy ? null : () => unawaited(_gc()),
               icon: const Icon(Icons.cleaning_services_outlined),
-              label: const Text('清理没被引用的快照数据'),
+              label: Text(_busy ? '清理中…' : '清理没被引用的数据'),
             ),
           ),
         ],
@@ -689,13 +700,44 @@ class _ContextSettingsPageState extends State<ContextSettingsPage> {
     );
   }
 
+  bool _busy = false;
+
+  /// 两件事一起做：收快照里没人引用的对象，收聊天库里没人引用的分支内容
+  /// 并把库文件真的缩回去。
+  ///
+  /// 分开两个按钮会让用户以为清了一次就干净了 —— 而这两处的空间来源完全
+  /// 不同（一个是文件快照，一个是对话历史），漏掉哪个都可能是占大头的那个。
+  ///
+  /// VACUUM 会锁库并整个重写一遍文件，所以只挂在这个手动按钮上，不进启动
+  /// 路径、也不跟在删除动作后面。跑的时候按钮要禁用 —— 大库上这一下要几秒，
+  /// 连点两次会排队跑两遍。
   Future<void> _gc() async {
-    final freed = await widget.snapshots.gc();
+    setState(() => _busy = true);
+    String message;
+    try {
+      final snapshots = await widget.snapshots.gc();
+      // 先扫图再整理库：整理会把没人引用的段删掉，那之后再算引用集合，
+      // 段里那些图就跟着一起变成孤儿了 —— 顺序反过来要多等一次手动清理。
+      final images = await reclaimOrphanImages(
+        widget.tasksRoot,
+        await widget.chats.referencedImagePaths(),
+      );
+      final db = await widget.chats.compact();
+      final parts = <String>[
+        if (snapshots > 0) '$snapshots 个快照对象',
+        if (db.segments > 0) '${db.segments} 段分支内容',
+        if (images + db.bytes > 0) _human(images + db.bytes),
+      ];
+      message = parts.isEmpty ? '没有可清理的数据' : '清理了 ${parts.join(' · ')}';
+    } catch (e) {
+      // 原样显示。VACUUM 在磁盘不够时会失败，而那正是用户点这个按钮的原因
+      // —— 换成一句"清理失败"等于把唯一有用的线索丢了。
+      message = '清理失败：$e';
+    }
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(freed == 0 ? '没有可清理的数据' : '清理了 $freed 个快照对象'),
-    ));
-    setState(() {});
+    setState(() => _busy = false);
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
 }
 
