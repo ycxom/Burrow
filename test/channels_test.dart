@@ -204,6 +204,18 @@ void main() {
       expect(config.streamOutput, isFalse);
     });
 
+    test('Google 项目 ID 跟着渠道进 LlmConfig', () {
+      const c = Channel(
+        id: 'c1',
+        name: 'n',
+        baseUrl: 'https://cloudcode-pa.googleapis.com/v1internal',
+        model: 'gemini-2.5-pro',
+        apiFormat: 'gemini',
+        googleProject: 'user-gcp-project',
+      );
+      expect(store.configFor(c).googleProject, 'user-gcp-project');
+    });
+
     test('普通渠道带上保存的 key', () {
       const c =
           Channel(id: 'c1', name: 'n', baseUrl: 'http://gw:3000', model: 'm');

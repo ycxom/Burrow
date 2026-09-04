@@ -38,6 +38,7 @@ class LlmConfig {
   final String baseUrl; // 例如 https://api.openai.com/v1
   final String apiKey;
   final String model;
+  final String? googleProject;
 
   /// 摘要用的模型。可以指定一个更小更便宜的 —— 摘要任务不需要旗舰模型，
   /// 而它的调用频率随对话长度线性增长。
@@ -99,6 +100,7 @@ class LlmConfig {
     required this.baseUrl,
     required this.apiKey,
     required this.model,
+    this.googleProject,
     this.summaryModel,
     this.proxy,
     this.temperature = 0.3,
@@ -120,6 +122,7 @@ class LlmConfig {
     String? baseUrl,
     String? apiKey,
     String? model,
+    String? googleProject,
     String? summaryModel,
     String? proxy,
     double? temperature,
@@ -134,6 +137,7 @@ class LlmConfig {
         baseUrl: baseUrl ?? this.baseUrl,
         apiKey: apiKey ?? this.apiKey,
         model: model ?? this.model,
+        googleProject: googleProject ?? this.googleProject,
         summaryModel: summaryModel ?? this.summaryModel,
         proxy: proxy ?? this.proxy,
         temperature: temperature ?? this.temperature,
@@ -677,6 +681,40 @@ class ConfigurableLlmClient
   /// 客户端，而项目号是跟着账号走的。
   String? _codeAssistProject;
 
+  static const _codeAssistMetadata = <String, Object?>{
+    'ideType': 'ANTIGRAVITY',
+    'pluginType': 'PLUGIN_UNSPECIFIED',
+  };
+
+  static String? _projectValue(Object? value) {
+    if (value is String) {
+      final id = value.trim();
+      return id.isEmpty ? null : id;
+    }
+    if (value is Map) {
+      return _projectValue(value['id'] ?? value['projectNumber']);
+    }
+    return null;
+  }
+
+  static Map<String, Object?>? _preferredAllowedTier(Object? value) {
+    if (value is! List) return null;
+    Map<String, Object?>? first;
+    for (final item in value) {
+      if (item is! Map) continue;
+      final id = item['id']?.toString().trim();
+      if (id == null || id.isEmpty) continue;
+      final tier = <String, Object?>{
+        'id': id,
+        if (item['userDefinedCloudaicompanionProject'] == true)
+          'userDefinedCloudaicompanionProject': true,
+      };
+      if (id == 'standard-tier') return tier;
+      first ??= tier;
+    }
+    return first;
+  }
+
   Future<String> _ensureCodeAssistProject() async {
     final cached = _codeAssistProject;
     if (cached != null) return cached;
@@ -703,7 +741,8 @@ class ConfigurableLlmClient
       http.Request('POST', Uri.parse('${config.baseUrl}:loadCodeAssist'))
         ..headers.addAll(headers())
         ..body = jsonEncode(<String, Object?>{
-          'metadata': <String, Object?>{'pluginType': 'GEMINI'},
+          'metadata': _codeAssistMetadata,
+          'mode': 'FULL_ELIGIBILITY_CHECK',
         }),
     );
     final loadedBody = await loaded.stream.bytesToString();
@@ -717,18 +756,31 @@ class ConfigurableLlmClient
 
     final json = jsonDecode(loadedBody);
     if (json is Map) {
-      final project = json['cloudaicompanionProject'];
-      if (project is String && project.isNotEmpty) {
+      final project = _projectValue(json['cloudaicompanionProject']);
+      if (project != null) {
         _codeAssistProject = project;
         return project;
       }
 
-      // 免费额度被判为不可用时**不要再去 onboard**。
-      //
-      // 实测 Google 已经把 gemini-cli 这类客户端从"个人免费额度"里切掉了，
-      // 返回里 free-tier 带着 `UNSUPPORTED_CLIENT`。这种情况下 onboardUser
-      // 一定失败，而它的报错只说"参数无效"，看不出真正的原因 —— 而真正的
-      // 原因就写在这里，原样带出去。
+      final tier = _preferredAllowedTier(json['allowedTiers']);
+      if (tier != null) {
+        final userProject = config.googleProject?.trim();
+        final needsUserProject =
+            tier['userDefinedCloudaicompanionProject'] == true;
+        if (needsUserProject && (userProject == null || userProject.isEmpty)) {
+          throw http.ClientException(
+            'Google 已允许这个账号使用 ${tier['id']}，但这个档位要绑定你自己的 GCP 项目。\n'
+            '请在渠道设置的「GCP 项目 ID」里填入项目 ID 后重试。'
+            '这不是项目编号，也不是 Vertex 区域；账号需要对这个项目有足够权限。',
+          );
+        }
+        return _onboardCodeAssist(
+          headers,
+          tierId: tier['id']! as String,
+          cloudProject: needsUserProject ? userProject : null,
+        );
+      }
+
       final ineligible = json['ineligibleTiers'];
       if (ineligible is List && ineligible.isNotEmpty) {
         final first = ineligible.first;
@@ -736,30 +788,37 @@ class ConfigurableLlmClient
             ? (first['reasonMessage'] ?? first['reasonCode'])?.toString()
             : null;
         throw http.ClientException(
-          'Google 拒绝了这个账号的 Code Assist 免费额度：\n'
+          'Google 没有返回这个账号可用的 Code Assist 档位：\n'
           '${reason ?? '未说明原因'}\n\n'
-          '可以改用「Vertex AI（自己的项目）」那种登录方式。',
+          '如果账号已订阅，请确认 Google 返回的可用档位要求都已满足；'
+          '或者改用「Vertex AI（自己的项目）」。',
         );
       }
     }
 
-    // 没有项目号、也没说不可用 = 这个账号还没开通过。走一次 onboard。
-    return _onboardCodeAssist(headers);
+    // 没有项目号、也没有档位信息 = 这个账号还没开通过。保留旧的免费档开通路径。
+    return _onboardCodeAssist(headers, tierId: 'free-tier');
   }
 
   /// 首次使用时的开通。返回 Google 分配的项目号。
   ///
   /// 它是个长时操作（LRO）：第一次调用多半返回 `done: false`，要隔几秒再问。
   /// 不轮询的话表现是"第一次登录后必失败、第二次莫名其妙就好了"。
-  Future<String> _onboardCodeAssist(Map<String, String> Function() headers) async {
+  Future<String> _onboardCodeAssist(
+    Map<String, String> Function() headers, {
+    required String tierId,
+    String? cloudProject,
+  }) async {
     const maxAttempts = 10;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       final response = await _http.send(
         http.Request('POST', Uri.parse('${config.baseUrl}:onboardUser'))
           ..headers.addAll(headers())
           ..body = jsonEncode(<String, Object?>{
-            'tierId': 'free-tier',
-            'metadata': <String, Object?>{'pluginType': 'GEMINI'},
+            'tierId': tierId,
+            if (cloudProject != null && cloudProject.isNotEmpty)
+              'cloudaicompanionProject': cloudProject,
+            'metadata': _codeAssistMetadata,
           }),
       );
       final body = await response.stream.bytesToString();
@@ -771,7 +830,8 @@ class ConfigurableLlmClient
       if (json is Map) {
         if (json['done'] == true) {
           final inner = json['response'];
-          final project = inner is Map ? inner['cloudaicompanionProject'] : null;
+          final project =
+              inner is Map ? inner['cloudaicompanionProject'] : null;
           final id = project is Map ? project['id'] : project;
           if (id is String && id.isNotEmpty) {
             _codeAssistProject = id;
@@ -829,8 +889,8 @@ class ConfigurableLlmClient
       root = root.substring(0, root.length - 1);
     }
 
-    final endpoint = Uri.parse(
-        '$root/models/${config.model}:streamGenerateContent?alt=sse');
+    final endpoint =
+        Uri.parse('$root/models/${config.model}:streamGenerateContent?alt=sse');
     final httpRequest = http.Request('POST', endpoint)
       ..headers.addAll(<String, String>{
         'Content-Type': 'application/json',
@@ -887,7 +947,8 @@ class ConfigurableLlmClient
     // 非流式也走 streamGenerateContent：这个内部接口的非流式端点行为和文档
     // 对不上（有时返回数组、有时返回单对象），而流式那条是 gemini-cli 天天在
     // 跑的路径。统一走它，非流式只是不往 onDelta 里喂增量。
-    final endpoint = Uri.parse('${config.baseUrl}:streamGenerateContent?alt=sse');
+    final endpoint =
+        Uri.parse('${config.baseUrl}:streamGenerateContent?alt=sse');
     final httpRequest = http.Request('POST', endpoint)
       ..headers.addAll(<String, String>{
         'Content-Type': 'application/json',

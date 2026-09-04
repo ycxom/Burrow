@@ -768,6 +768,7 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
           const _SectionTitle('认证'),
           _authSection(),
           if (_isVertex) _vertexSection(),
+          if (_isCodeAssist) _codeAssistProjectSection(),
           const SizedBox(height: 20),
           const _SectionTitle('代理', subtitle: '只对这个渠道生效。留空 = 直连'),
           TextField(
@@ -969,6 +970,31 @@ class _ChannelEditPageState extends State<ChannelEditPage> {
   }
 
   bool get _isVertex => _oauthProviderId == GoogleVertexFlow.providerId;
+
+  bool get _isCodeAssist => _apiFormat == 'gemini';
+
+  Widget _codeAssistProjectSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        const SizedBox(height: 16),
+        const _SectionTitle(
+          'GCP 项目',
+          subtitle: '付费档位需要你自己的项目；留空时先用 Google 托管项目',
+        ),
+        TextField(
+          controller: _googleProject,
+          autocorrect: false,
+          decoration: const InputDecoration(
+            labelText: '项目 ID',
+            helperText: 'GCP 项目 ID；standard-tier 会把它用于 Code Assist onboarding',
+            prefixIcon: Icon(Icons.cloud_outlined),
+            border: OutlineInputBorder(),
+          ),
+        ),
+      ],
+    );
+  }
 
   String _vertexUrl() {
     final project = _googleProject.text.trim();

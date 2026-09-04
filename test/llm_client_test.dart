@@ -346,8 +346,8 @@ void main() {
         'https://api.deepseek.com/v1/chat/completions',
       );
       expect(
-        resolveApiEndpoint('https://open.bigmodel.cn/api/paas/v4',
-                '/chat/completions')
+        resolveApiEndpoint(
+                'https://open.bigmodel.cn/api/paas/v4', '/chat/completions')
             .toString(),
         'https://open.bigmodel.cn/api/paas/v4/chat/completions',
       );
@@ -408,6 +408,166 @@ void main() {
       );
       expect(models.map((m) => m.id).toList(),
           <String>['gemini-2.5-pro', 'gemini-flash-latest']);
+    });
+  });
+
+  group('Code Assist paid tier onboarding', () {
+    test('uses an allowed standard tier and the configured GCP project',
+        () async {
+      final requests = <http.Request>[];
+      String? responseFor(http.Request request) {
+        final path = request.url.path;
+        if (path.endsWith(':loadCodeAssist')) {
+          return jsonEncode(<String, Object?>{
+            'allowedTiers': <Object?>[
+              <String, Object?>{
+                'id': 'standard-tier',
+                'name': 'Gemini Code Assist',
+                'userDefinedCloudaicompanionProject': true,
+              },
+            ],
+            'ineligibleTiers': <Object?>[
+              <String, Object?>{
+                'tierId': 'free-tier',
+                'reasonCode': 'UNSUPPORTED_CLIENT',
+                'reasonMessage':
+                    'This client is no longer supported for Gemini Code Assist',
+              },
+            ],
+          });
+        }
+        if (path.endsWith(':onboardUser')) {
+          return jsonEncode(<String, Object?>{
+            'done': true,
+            'response': <String, Object?>{
+              'cloudaicompanionProject': <String, Object?>{
+                'id': 'managed-project',
+              },
+            },
+          });
+        }
+        if (path.endsWith(':streamGenerateContent')) {
+          return jsonEncode(<String, Object?>{
+            'response': <String, Object?>{
+              'candidates': <Object?>[
+                <String, Object?>{
+                  'content': <String, Object?>{
+                    'parts': <Object?>[
+                      <String, Object?>{'text': 'ok'},
+                    ],
+                  },
+                },
+              ],
+            },
+          });
+        }
+        return null;
+      }
+
+      final client = ConfigurableLlmClient(
+        config: const LlmConfig(
+          apiFormat: 'gemini',
+          baseUrl: 'https://cloudcode-pa.googleapis.com/v1internal',
+          apiKey: 'token',
+          model: 'gemini-2.5-pro',
+          googleProject: 'user-gcp-project',
+          streamOutput: false,
+        ),
+        httpClient: MockClient((request) async {
+          requests.add(request);
+          final body = responseFor(request);
+          if (body == null) {
+            return http.Response('unexpected ${request.url}', 500);
+          }
+          return http.Response.bytes(
+            utf8.encode(request.url.path.endsWith(':streamGenerateContent')
+                ? 'data: $body\n\ndata: [DONE]\n\n'
+                : body),
+            200,
+          );
+        }),
+      );
+
+      final turn = await client.complete(
+        messages: <ChatMessage>[
+          ChatMessage(role: 'user', content: 'hello', at: DateTime(2026)),
+        ],
+        tools: const <ToolSpec>[],
+        onDelta: (_) {},
+      );
+
+      expect(turn.text, 'ok');
+      expect(
+          requests.map((r) => r.url.path),
+          containsAllInOrder(<String>[
+            '/v1internal:loadCodeAssist',
+            '/v1internal:onboardUser',
+            '/v1internal:streamGenerateContent',
+          ]));
+
+      final loadBody = jsonDecode(requests[0].body) as Map<String, Object?>;
+      expect(loadBody['metadata'], <String, Object?>{
+        'ideType': 'ANTIGRAVITY',
+        'pluginType': 'PLUGIN_UNSPECIFIED',
+      });
+      expect(loadBody['mode'], 'FULL_ELIGIBILITY_CHECK');
+
+      final onboardBody = jsonDecode(requests[1].body) as Map<String, Object?>;
+      expect(onboardBody['tierId'], 'standard-tier');
+      expect(onboardBody['cloudaicompanionProject'], 'user-gcp-project');
+      expect(onboardBody['metadata'], <String, Object?>{
+        'ideType': 'ANTIGRAVITY',
+        'pluginType': 'PLUGIN_UNSPECIFIED',
+      });
+
+      final generateBody = jsonDecode(requests[2].body) as Map<String, Object?>;
+      expect(generateBody['project'], 'managed-project');
+    });
+
+    test('asks for the missing GCP project instead of reporting free-tier',
+        () async {
+      final client = ConfigurableLlmClient(
+        config: const LlmConfig(
+          apiFormat: 'gemini',
+          baseUrl: 'https://cloudcode-pa.googleapis.com/v1internal',
+          apiKey: 'token',
+          model: 'gemini-2.5-pro',
+        ),
+        httpClient: MockClient((request) async {
+          if (!request.url.path.endsWith(':loadCodeAssist')) {
+            return http.Response('unexpected ${request.url}', 500);
+          }
+          return http.Response(
+            jsonEncode(<String, Object?>{
+              'allowedTiers': <Object?>[
+                <String, Object?>{
+                  'id': 'standard-tier',
+                  'userDefinedCloudaicompanionProject': true,
+                },
+              ],
+              'ineligibleTiers': <Object?>[
+                <String, Object?>{'reasonCode': 'UNSUPPORTED_CLIENT'},
+              ],
+            }),
+            200,
+          );
+        }),
+      );
+
+      await expectLater(
+        client.complete(
+          messages: <ChatMessage>[
+            ChatMessage(role: 'user', content: 'hello', at: DateTime(2026)),
+          ],
+          tools: const <ToolSpec>[],
+          onDelta: (_) {},
+        ),
+        throwsA(isA<http.ClientException>().having(
+          (error) => error.message,
+          'message',
+          allOf(contains('standard-tier'), contains('GCP 项目')),
+        )),
+      );
     });
   });
 }

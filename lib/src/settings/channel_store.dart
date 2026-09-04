@@ -881,6 +881,7 @@ class ChannelStore extends ChangeNotifier {
       apiKey: channel.usesOAuth ? '' : apiKeyOf(channel),
       model: channel.model,
       summaryModel: channel.summaryModel,
+      googleProject: channel.googleProject,
       proxy: channel.proxy,
       systemPromptStyle: channel.systemPromptStyle,
       temperature: temperature,
