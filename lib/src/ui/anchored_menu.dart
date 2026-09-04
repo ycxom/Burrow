@@ -328,9 +328,8 @@ class _AnchoredMenuState extends State<_AnchoredMenu> {
         Positioned(
           left: left,
           top: below ? widget.anchorRect.bottom + 8 : null,
-          bottom: below
-              ? null
-              : widget.screen.height - widget.anchorRect.top + 8,
+          bottom:
+              below ? null : widget.screen.height - widget.anchorRect.top + 8,
           width: width,
           child: ConstrainedBox(
             constraints: BoxConstraints(

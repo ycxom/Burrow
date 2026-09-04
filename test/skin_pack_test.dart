@@ -129,8 +129,8 @@ void main() {
     });
 
     test('导出再导入，令牌逐一相等', () {
-      final source = ChatSkinCatalog.builtIns
-          .firstWhere((s) => s.id == 'amethyst_glass');
+      final source =
+          ChatSkinCatalog.builtIns.firstWhere((s) => s.id == 'amethyst_glass');
       final round = SkinManifest.parse(_manifest(<String, Object?>{
         'tokens': <String, Object?>{
           'light': SkinManifest.exportTokens(source.lightTokens),
@@ -139,7 +139,8 @@ void main() {
       }));
       expect(round.ok, isTrue);
       for (final name in ChatTokens.tokenNames) {
-        expect(round.pack!.darkTokens.named(name), source.darkTokens.named(name),
+        expect(
+            round.pack!.darkTokens.named(name), source.darkTokens.named(name),
             reason: name);
         expect(
             round.pack!.lightTokens.named(name), source.lightTokens.named(name),
@@ -198,10 +199,10 @@ void main() {
           'header:light': <String, Object?>{'background': '#FFFFFF'},
         },
       }));
-      expect(result.pack!.darkParts.header.fillColor(),
-          const Color(0xFF000000));
-      expect(result.pack!.lightParts.header.fillColor(),
-          const Color(0xFFFFFFFF));
+      expect(
+          result.pack!.darkParts.header.fillColor(), const Color(0xFF000000));
+      expect(
+          result.pack!.lightParts.header.fillColor(), const Color(0xFFFFFFFF));
     });
 
     test('版式枚举与未知取值', () {
@@ -383,8 +384,8 @@ void main() {
         darkTokens: ChatTokens.dark,
         previewColors: <Color>[],
       );
-      final resolved =
-          ChatSkinCatalog.resolve('nekogram', installed: <ChatSkinPack>[impostor]);
+      final resolved = ChatSkinCatalog.resolve('nekogram',
+          installed: <ChatSkinPack>[impostor]);
       expect(resolved.name, 'Nekogram 经典');
     });
 

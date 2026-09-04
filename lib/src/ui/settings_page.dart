@@ -266,7 +266,8 @@ class _SettingsPageState extends State<SettingsPage> {
               title: const Text('模型分工'),
               // 副标题直接把现在的分工摊开。这一项的价值就是"各用各的"，
               // 而那件事只有摆出来才看得见 —— 点进去才知道等于没说。
-              subtitle: Text(_rolesSummary(), style: const TextStyle(fontSize: 11)),
+              subtitle:
+                  Text(_rolesSummary(), style: const TextStyle(fontSize: 11)),
               trailing: const Icon(Icons.chevron_right),
               onTap: () => _push(ModelRolesPage(
                 channels: widget.channels,
@@ -329,11 +330,15 @@ class _SettingsPageState extends State<SettingsPage> {
                 ListTile(
                   leading: const Icon(Icons.psychology_outlined),
                   title: const Text('思考强度'),
-                  // 副标题带一句"只对会思考的模型有效"：这个设置对着一个
-                  // 普通模型调是没有任何反应的，不说清楚会被当成坏了。
+                  // 两句话都得说：
+                  //   - "只对会思考的模型有效" —— 对着一个普通模型调是没有
+                  //     任何反应的，不说清楚会被当成坏了。
+                  //   - "新会话的默认值" —— 模型/思考强度/温度现在跟着会话走
+                  //     （见 settings/thread_prefs.dart），在这儿改不会动到
+                  //     已经开着的那些聊天室，不说的话同样会被当成坏了。
                   subtitle: Text(
                     '${widget.store.thinkingEffort.label} · '
-                    '只对会思考的模型有效',
+                    '新会话的默认值，只对会思考的模型有效',
                     style: const TextStyle(fontSize: 11),
                   ),
                   trailing: const Icon(Icons.chevron_right),
@@ -342,8 +347,8 @@ class _SettingsPageState extends State<SettingsPage> {
                 const Divider(height: 1),
                 ListTile(
                   leading: const Icon(Icons.thermostat_outlined),
-                  title:
-                      Text('Temperature  ${_temperature.toStringAsFixed(1)}'),
+                  title: Text('Temperature  ${_temperature.toStringAsFixed(1)}'
+                      '   · 新会话的默认值'),
                   subtitle: Slider(
                     value: _temperature,
                     min: 0,

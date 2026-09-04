@@ -33,9 +33,10 @@ import '../llm/thinking_effort.dart';
 import '../llm/vision.dart';
 import '../settings/settings_store.dart';
 import '../settings/thread_lock.dart';
+import '../settings/thread_prefs.dart';
+import 'sampling_page.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
-import '../settings/model_roles.dart';
 import '../skills/skill_store.dart';
 import 'channels_page.dart';
 import 'chat_drawer.dart';
@@ -46,6 +47,7 @@ import 'skin_parts.dart';
 import 'skin_store.dart';
 import 'skin_style.dart';
 import 'chat_theme.dart';
+import 'branch_plan.dart';
 import 'message_index.dart';
 import 'interactive_terminal.dart';
 import 'chat_view.dart';
@@ -769,6 +771,12 @@ class _HomeShellState extends State<HomeShell>
   /// 这个会话自己的系统提示词。null = 没设过，用全局那份。
   String? _threadPrompt;
 
+  /// 这个会话自己的模型策略。见 settings/thread_prefs.dart。
+  ///
+  /// 和 [_threadPrompt] 一条路子：会话还没落库时先存在内存里，
+  /// 第一条消息落库时一起写进去。
+  ThreadPrefs _prefs = const ThreadPrefs();
+
   InstalledDistro? get _distro => widget.activeDistro.value;
 
   /// 顶栏副标题上的瞬时状态。
@@ -867,20 +875,19 @@ class _HomeShellState extends State<HomeShell>
     if (_runtimeReady) {
       _agent.sandboxLevel = widget.settings.sandboxLevel;
       _agent.mode = widget.settings.approvalMode;
-      // 换渠道/换模型之后，接下来生成的助手消息要署新的来源。
-      _agent.sourceLabel = widget.settings.sourceLabel;
-      // 换到不认图的渠道之后，下一条带图的消息要自动改走前置多模态。
-      _agent.sendImagesInline = widget.settings.sendImagesInline;
-      _agent.supportsTools = widget.settings.supportsTools;
+      // 配置、署名、能不能看图、支不支持工具 —— 全部按**这个会话自己的**
+      // 渠道和模型算，而不是全局那份。见 [_applyConfig]。
+      _applyConfig();
       // 换到一个不支持工具的模型时，把已经开着的终端模式关掉。
       //
       // 不关的话下一次发送就会带着 tools 打过去，然后收到一个只说"参数错误"
       // 的 400 —— 而真正的原因（刚才换了个模型）在两步操作之前，没人会
       // 联想到那里。
-      if (_agent.terminalMode && !widget.settings.supportsTools) {
+      if (_agent.terminalMode && !_agent.supportsTools) {
         _agent.terminalMode = false;
         _setStatus('已退出终端模式：'
-            '「${widget.channels.active?.model ?? '当前模型'}」不支持工具调用');
+            '「${_effectiveModel.isEmpty ? '当前模型' : _effectiveModel}」'
+            '不支持工具调用');
       }
       // 改了全局提示词、而这个会话没有自己那份时，要当场跟上。
       _agent.userSystemPrompt = _effectiveSystemPrompt;
@@ -897,17 +904,133 @@ class _HomeShellState extends State<HomeShell>
   String get _effectiveSystemPrompt =>
       _threadPrompt ?? widget.settings.systemPrompt;
 
+  /// 当前全局设置摊成一份会话策略。新会话的起点。
+  ThreadPrefs _globalPrefs() => ThreadPrefs(
+        channelId: widget.channels.activeId,
+        model: widget.channels.active?.model,
+        thinkingEffort: widget.settings.thinkingEffort,
+        temperature: widget.settings.temperature,
+      );
+
+  /// 把这一刻真正在用的那套定死成这个会话自己的。
+  ///
+  /// 会话建出来的那一刻调一次。不定死的话，用户之后改一次全局设置，
+  /// 所有老会话会跟着变 —— 而"每个聊天室各走各的"正是要躲开这件事。
+  ThreadPrefs _pinPrefs() {
+    final resolved = _effectiveChannel;
+    return ThreadPrefs(
+      channelId: _prefs.channelId ?? resolved?.id,
+      model: _prefs.model ?? resolved?.model,
+      thinkingEffort: _prefs.thinkingEffort ?? widget.settings.thinkingEffort,
+      temperature: _prefs.temperature ?? widget.settings.temperature,
+    );
+  }
+
+  /// 这个会话发往哪个渠道。会话指定的优先，指的那个没了就退回当前渠道。
+  ///
+  /// 退回而不是报错：渠道是会被删的，而一个指向已删渠道的会话不该变成
+  /// 打不开的死会话 —— 它只是回到"跟着当前渠道"，和没设过一样。
+  Channel? get _effectiveChannel {
+    final id = _prefs.channelId;
+    return (id == null ? null : widget.channels.byId(id)) ??
+        widget.channels.active;
+  }
+
+  String get _effectiveModel {
+    final channel = _effectiveChannel;
+    final model = _prefs.model?.trim() ?? '';
+    return model.isNotEmpty ? model : (channel?.model ?? '');
+  }
+
+  ThinkingEffort get _effectiveThinking =>
+      _prefs.thinkingEffort ?? widget.settings.thinkingEffort;
+
+  double get _effectiveTemperature =>
+      _prefs.temperature ?? widget.settings.temperature;
+
+  ResolvedCapability get _effectiveCapability =>
+      widget.channels.capabilityOf(_effectiveChannel, _effectiveModel);
+
+  /// 能不能把图直接塞进请求体里。
+  ///
+  /// 「自动」这一档要问的是**这个会话用的那个模型**认不认图，不是全局那个。
+  bool get _effectiveSendImagesInline => switch (widget.settings.imageMode) {
+        ImageMode.native => true,
+        ImageMode.preprocess => false,
+        ImageMode.auto => _effectiveCapability.vision,
+      };
+
+  /// 助手消息署的名，也是底栏那行字。
+  String get _effectiveSourceLabel {
+    final channel = _effectiveChannel;
+    if (channel == null) return '';
+    final model = _effectiveModel;
+    return model.isEmpty
+        ? channel.providerLabel
+        : '${channel.providerLabel} · $model';
+  }
+
+  /// 这个会话这一刻真正要发出去的那套配置。
+  ///
+  /// 以前这里没有"这个会话"的概念：main 里挂了一条
+  /// `settings.addListener(() => llm.config = settings.config)`，全局设置一变
+  /// 就把**所有**会话的配置改掉。那条监听已经去掉了，改成由当前打开的这个
+  /// 会话自己往 client 上写 —— 同一时刻只有一个 HomeShell 活着，
+  /// 所以"当前生效的配置"和"当前打开的会话"天然是一一对应的。
+  LlmConfig get _effectiveConfig {
+    final channel = _effectiveChannel;
+    if (channel == null) return LlmConfig.empty;
+    final capability = widget.channels.capabilityOf(channel, _effectiveModel);
+    return widget.channels
+        .configFor(
+          channel,
+          temperature: _effectiveTemperature,
+          streamOutput: widget.settings.streamOutput,
+          sendImagesInline: switch (widget.settings.imageMode) {
+            ImageMode.native => true,
+            ImageMode.preprocess => false,
+            ImageMode.auto => capability.vision,
+          },
+          thinkingEffort: _effectiveThinking,
+        )
+        .copyWith(model: _effectiveModel, sampling: _prefs.sampling);
+  }
+
+  /// 把这个会话的配置推给 client，并且把跟着模型走的那几个开关同步给 agent。
+  ///
+  /// 这几样以前全读全局（`settings.sourceLabel` / `sendImagesInline` /
+  /// `supportsTools`）。会话有了自己的渠道之后那就错了：请求发往 A，
+  /// 而"能不能看图""支不支持工具"却在问 B。
+  void _applyConfig() {
+    if (!_runtimeReady) return;
+    widget.llm.config = _effectiveConfig;
+    _agent.sourceLabel = _effectiveSourceLabel;
+    _agent.sendImagesInline = _effectiveSendImagesInline;
+    _agent.supportsTools = _effectiveCapability.tools;
+  }
+
+  /// 改这个会话的策略：内存里先生效，落库看会话建了没有。
+  Future<void> _updatePrefs(ThreadPrefs next) async {
+    if (next == _prefs) return;
+    setState(() => _prefs = next);
+    _applyConfig();
+    final id = _threadId;
+    if (id != null) await widget.chats.setPrefs(id, next);
+  }
+
   Future<void> _prepareRuntime() async {
     final threadId = widget.threadId;
     if (threadId != null) {
       _threadPrompt = await widget.chats.systemPromptOf(threadId);
+      _prefs = await widget.chats.prefsOf(threadId);
+    } else {
+      // 新会话从当前的全局设置起步。**只是起步** —— 第一条消息落库时会把
+      // 这一刻的值定死（见 _pinPrefs），之后改全局不再影响它。
+      _prefs = _globalPrefs();
     }
     _runtime = await widget.runtime;
     _images = ImageAttachmentStore(Directory('${_runtime.root.path}/images'));
     _agent = widget.buildAgent(this, _runtime);
-    _agent.sourceLabel = widget.settings.sourceLabel;
-    _agent.sendImagesInline = widget.settings.sendImagesInline;
-    _agent.supportsTools = widget.settings.supportsTools;
     _agent.userSystemPrompt = _effectiveSystemPrompt;
     await _restoreTerminalMode();
     await _loadHistory();
@@ -916,6 +1039,8 @@ class _HomeShellState extends State<HomeShell>
     // 的一步，而它和"把对话画出来"没有任何关系 —— 只有终端页要用。等它等到
     // 的是一屏转圈，而用户点进来是要看对话的。
     setState(() => _runtimeReady = true);
+    // 这个会话的配置要在第一次发送之前就推给 client。
+    _applyConfig();
     unawaited(_startShell());
     // 位置要等 ListView 真的建出来才摆得了 —— 见 [_applyInitialScroll]。
     unawaited(_applyInitialScroll());
@@ -1575,21 +1700,46 @@ class _HomeShellState extends State<HomeShell>
 
     final id = 'b${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
     final tagged = anchor.copyWith(branchId: id);
-    final visibleIndex =
-        _visible.indexWhere((message) => identical(message, anchor));
     _agent.history[historyIndex] = tagged;
-    if (visibleIndex >= 0) _visible[visibleIndex] = tagged;
+    _retagVisible(historyIndex, anchor, tagged);
     return id;
+  }
+
+  /// 把 `history[historyIndex]` 上刚换好的那条同步到界面那份。
+  ///
+  /// **不能只用 `identical` 找。** 当前这一轮刚发出去的用户消息在两个列表里
+  /// 是两个不同的实例（见 message_index.dart），恒等匹配对它永远是 -1 ——
+  /// 于是分支 id 只挂到了 history 那条上，界面那条还是干净的。
+  /// `_refreshBranches` 是扫 `_visible` 收集 branchId 的，收不到就一个版本
+  /// 切换器都不画：**刚发完消息就点「重新生成」，分支数据全进了库，界面上
+  /// 却什么都没有**，而重开一次会话又好了。那正是"重新生成有时候不创建
+  /// 分支点"的原因。
+  void _retagVisible(int historyIndex, ChatMessage before, ChatMessage after) {
+    final direct = _visible.indexWhere((message) => identical(message, before));
+    if (direct >= 0) {
+      _visible[direct] = after;
+      return;
+    }
+    final mapped =
+        visibleIndexOfHistory(_visible, _agent.history, historyIndex);
+    if (mapped >= 0) _visible[mapped] = after;
   }
 
   /// 切到这个分支点的另一个版本。
   ///
   /// 换掉的是**从锚点那条用户消息开始的一整段**，不只是助手那一条 ——
   /// 编辑重发会连问话本身一起变，只换回答的话两边就对不上了。
-  Future<void> _switchVariant(String branchId, int target) async {
+  Future<void> _switchVariant(
+    String branchId,
+    int target, {
+    /// 删完一个版本之后调进来的：这时"目标序号"可能和删之前那个相同，
+    /// 但它背后已经是另一段内容了，必须真的换一次。
+    bool force = false,
+  }) async {
     if (_busy) return;
     final id = _threadId;
     if (id == null) return;
+    if (!force && _branches[branchId]?.active == target) return;
 
     final tail = await widget.chats.loadVariant(branchId, target);
     if (tail == null || !mounted) return;
@@ -1610,10 +1760,50 @@ class _HomeShellState extends State<HomeShell>
         ..removeRange(visibleAnchor, _visible.length)
         ..addAll(tail);
     });
+    // 历史换了一段，长度多半也变了。checkpoint 是 history 的下标 ——
+    // 不跟着收的话它可能落在新历史的末尾之后，那时窗口里一条消息都不剩
+    // （`history.skip(checkpoint)` 是空的），模型当场失忆；而下一次摘要
+    // 还会在 `sublist(checkpoint, …)` 上直接抛。
+    _agent.overflow.clampTo(_agent.history.length);
     await _persist();
     await widget.chats.setActiveVariant(branchId, target);
     await _refreshBranches();
     HapticFeedback.selectionClick();
+  }
+
+  /// 删掉正在看的这个版本。
+  ///
+  /// 删完要把界面换到剩下的某一版上 —— 停在一个已经不存在的版本上，屏幕上
+  /// 那段内容就没有任何东西对应得上了。全删光时锚点上的分支 id 也就没人
+  /// 引用，和从来没分过支一样。
+  Future<void> _deleteVariant(String branchId, int index) async {
+    if (_busy) return;
+    final id = _threadId;
+    if (id == null) return;
+    final before = _branches[branchId];
+    if (before == null) return;
+    // 只剩一个版本时，"删这一版"等于把这段对话删掉 —— 那是另一个动作
+    // （长按 → 删除这条及之后），有它自己的确认。这里不接这活。
+    if (before.total <= 1) return;
+
+    final ok = await _confirm(
+      '删掉这一版',
+      '这个版本会被删除，剩下的 ${before.total - 1} 版还在。'
+          '当前正在看的内容会换成其中一版。',
+    );
+    if (!ok || !mounted) return;
+
+    final left = await widget.chats.deleteVariant(branchId, index);
+    if (!mounted) return;
+    if (left <= 0) {
+      await _refreshBranches();
+      return;
+    }
+    // 换到删完之后活动的那一版上。deleteVariant 已经把序号重排成 0..n-1，
+    // 并把活动位往前退了一个 —— 这里读回来照着切，不自己算第二遍。
+    final after = await widget.chats.branchStateOf(branchId);
+    if (after == null || !mounted) return;
+    await _switchVariant(branchId, after.active, force: true);
   }
 
   /// 历史被**改小**之后落盘：编辑、删除、回到某条、切分支。
@@ -1671,9 +1861,10 @@ class _HomeShellState extends State<HomeShell>
       final original = _agent.history[i];
       final updated = persisted[i];
       _agent.history[i] = updated;
-      final visibleIndex =
-          _visible.indexWhere((message) => identical(message, original));
-      if (visibleIndex >= 0) _visible[visibleIndex] = updated;
+      // 同样不能只靠恒等匹配：这一轮自己发出去的那条用户消息在界面那份里
+      // 是另一个实例，只用 identical 的话它永远拿不到数据库 id ——
+      // 表现是"刚发的消息搜得到，点过去却定位不到"。
+      _retagVisible(i, original, updated);
     }
   }
 
@@ -1846,8 +2037,8 @@ class _HomeShellState extends State<HomeShell>
     // tools，不支持的模型收到之后要么直接 400，要么把 tools 当没看见然后
     // 用自然语言描述"我打算执行 ls" —— 后者尤其糟，看起来像在干活，
     // 实际上一条命令都没跑。
-    if (on && !widget.settings.supportsTools) {
-      final model = widget.channels.active?.model ?? '当前模型';
+    if (on && !_effectiveCapability.tools) {
+      final model = _effectiveModel.isEmpty ? '当前模型' : _effectiveModel;
       _setStatus('「$model」被标记为不支持工具调用，终端模式用不了');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -2157,6 +2348,13 @@ class _HomeShellState extends State<HomeShell>
         terminalMode: _agent.terminalMode,
       );
       _threadId = id;
+      // 会话是刚建的，之前设的那份策略还只在内存里，补写进去。
+      //
+      // 内存里那份也要换成定死之后的：不换的话它还留着一堆 null（"跟全局"），
+      // 而下一次在 `+` 里调温度会把这份带 null 的整体写回库，
+      // 刚定死的渠道和模型又变回"跟全局"了。
+      _prefs = _pinPrefs();
+      await widget.chats.setPrefs(id, _prefs);
       // 会话是刚建的，之前设的那份提示词还只在内存里，补写进去。
       if (_threadPrompt != null) {
         await widget.chats.setSystemPrompt(id, _threadPrompt);
@@ -2238,7 +2436,7 @@ class _HomeShellState extends State<HomeShell>
             role: 'assistant',
             content: _streaming.toString(),
             at: DateTime.now(),
-            source: widget.settings.sourceLabel,
+            source: _effectiveSourceLabel,
             // 思考也接上，不接的话回答断掉的瞬间那一块会整个消失，
             // 而它明明刚刚还在。
             reasoning: _reasoning.toString(),
@@ -2268,10 +2466,8 @@ class _HomeShellState extends State<HomeShell>
         final anchor = _agent.history[anchorIndex];
         if (anchor.branchId != branchId) {
           final tagged = anchor.copyWith(branchId: branchId);
-          final visibleIndex =
-              _visible.indexWhere((message) => identical(message, anchor));
           _agent.history[anchorIndex] = tagged;
-          if (visibleIndex >= 0) _visible[visibleIndex] = tagged;
+          _retagVisible(anchorIndex, anchor, tagged);
         }
       }
       await _persistMessages(id);
@@ -2293,32 +2489,54 @@ class _HomeShellState extends State<HomeShell>
     _setStatus('正在停止当前请求和命令…');
   }
 
-  /// 重新生成最后一条回复。
+  /// 重新生成界面上第 [visibleIndex] 条回复。
   ///
-  /// **那条问话原样留着**，只把它之后的内容重跑一遍。之前的做法是把用户
-  /// 那条也删掉、把原文塞回输入框再发一次，有两个毛病：每重新生成一次
-  /// 时间戳就变一次，而且它只带走了文本 —— 带图的消息重新生成之后图会
-  /// 静默消失。
+  /// 长按任意一条助手消息都能来这儿 —— 不再只有最后一条能重来。
+  Future<void> _retryVisible(int visibleIndex) async {
+    if (_busy) return;
+    final historyIndex = _historyIndexOf(visibleIndex);
+    if (historyIndex < 0) {
+      _setStatus('这条消息在上下文里对不上位置，重新生成不了');
+      return;
+    }
+    await _regenerateAt(historyIndex);
+  }
+
+  /// 重新生成 `history[targetIndex]` 这一条，以及它之后的一切。
   ///
-  /// 旧回复不会被丢掉，而是存成这个分支点的一个版本，可以切回去。
-  Future<void> _retry() async {
+  /// **锚点是它前面那一条，不是"最后一条问话"**（见 branch_plan.dart）：
+  /// 一轮里模型说了好几段、或者中间夹着工具结果时，锚在问话上会把这一轮
+  /// 已经跑出来的东西一起丢掉 —— 命令白跑一遍，而用户只是想让最后那段
+  /// 答案换个说法。
+  ///
+  /// 被换掉的那一段不会丢，而是存成这个锚点下的一个版本，可以切回去。
+  Future<void> _regenerateAt(int targetIndex) async {
     if (_busy) return;
     final id = _threadId;
     if (id == null) return;
-    final historyIndex =
-        _agent.history.lastIndexWhere((message) => message.role == 'user');
-    final visibleIndex =
-        _visible.lastIndexWhere((message) => message.role == 'user');
-    if (historyIndex < 0 || visibleIndex < 0) return;
+    if (targetIndex < 0 || targetIndex >= _agent.history.length) return;
+
+    final pivot = forkPivotIndex(_agent.history, targetIndex);
+    if (pivot < 0) {
+      // 这是对话的第一句，前面没有可锚的消息。分支没地方挂，
+      // 说一句比默默重跑一遍好 —— 后者会把旧回复直接丢掉。
+      _setStatus('这是对话的第一条，没有可以分支的位置');
+      return;
+    }
 
     HapticFeedback.mediumImpact();
     // `_busy` 要在第一个 await 之前同步落地：这里到 saveVariant 落盘之间
     // 有一段异步空档，_ensureBranchId 是同步的没问题，但下面 saveVariant
     // 要等库。锁晚一步的话，两次快速点击「重新生成」会在锁生效前都通过
     // 顶部那句 `if (_busy) return`，各自存一份旧版本、各自截断历史。
-    final branchId = _ensureBranchId(historyIndex);
+    final branchId = _ensureBranchId(pivot);
+    final visiblePivot = visibleIndexOfHistory(_visible, _agent.history, pivot);
     setState(() {
-      _visible.removeRange(visibleIndex + 1, _visible.length);
+      // 界面上对不上锚点位置时不动它，等这一轮结束后统一重画。
+      // 猜一个位置去截，会把用户看得见的消息删错。
+      if (visiblePivot >= 0) {
+        _visible.removeRange(visiblePivot + 1, _visible.length);
+      }
       _busy = true;
       _cancelRequested = false;
       _streaming.clear();
@@ -2332,16 +2550,18 @@ class _HomeShellState extends State<HomeShell>
     await widget.chats.saveVariant(
       threadId: id,
       branchId: branchId,
-      tail: _agent.history.sublist(historyIndex),
+      tail: _agent.history.sublist(pivot),
       active: false,
     );
-    _agent.history.removeRange(historyIndex + 1, _agent.history.length);
+    _agent.history.removeRange(pivot + 1, _agent.history.length);
+    // 同 [_switchVariant]：砍短了历史就得把 checkpoint 收回来。
+    _agent.overflow.clampTo(_agent.history.length);
 
     await _runTurn(
       id,
       () => _agent.regenerate(),
       branchId: branchId,
-      anchorIndex: historyIndex,
+      anchorIndex: pivot,
     );
   }
 
@@ -2953,16 +3173,17 @@ class _HomeShellState extends State<HomeShell>
       return _messageSurface(message, ServicePill(text: message.content));
     }
 
-    final isLastAssistant =
-        i == _visible.length - 1 && message.role == 'assistant' && !_busy;
     final isUser = message.role == 'user';
 
     // 这条消息该不该带版本切换器：它自己就是锚点（用户消息），或者它是
     // 某个锚点下这一轮的最后一条回复。
     String? branchOwner = message.branchId;
-    if (branchOwner == null && isLastAssistant) {
+    if (branchOwner == null && i == _visible.length - 1 && !_busy) {
+      // 往回找**最近一个真正的锚点**，而不是最近一条用户消息。
+      // 锚点现在可能是助手消息或工具结果（见 branch_plan.dart），
+      // 只认用户消息的话那几种分支一个切换器都画不出来。
       for (var j = i - 1; j >= 0; j--) {
-        if (_visible[j].role == 'user') {
+        if (_visible[j].branchId != null) {
           branchOwner = _visible[j].branchId;
           break;
         }
@@ -2992,6 +3213,9 @@ class _HomeShellState extends State<HomeShell>
           onSwitchVariant: branch == null || _busy
               ? null
               : (target) => _switchVariant(branchOwner!, target),
+          onDeleteVariant: branch == null || _busy
+              ? null
+              : () => _deleteVariant(branchOwner!, branch.active),
           isError: isError,
           lastInGroup: row.lastInGroup,
           firstInGroup: row.firstInGroup,
@@ -3001,7 +3225,15 @@ class _HomeShellState extends State<HomeShell>
                   ? widget.settings.assistantAvatarPath
                   : '',
           showAvatar: widget.settings.showMessageAvatars,
-          onRetry: isLastAssistant ? _retry : null,
+          // 任意一条回复都能重来，不只是最后一条 —— 重新生成会把它和
+          // 它之后的一切存成一个版本，切得回去。
+          //
+          // 报错那条也给：一轮挂在网络上的时候，界面最后是一条红气泡，
+          // 而它前面那条助手消息早就不是最后一条了 —— 只给最后一条的话，
+          // 恰恰是最需要重试的那一刻没有重试按钮。
+          onRetry: (message.role == 'assistant' || isError) && !_busy
+              ? () => _retryVisible(i)
+              : null,
           // 编辑对用户和助手都开放，但两者能做的事不同（见 _editMessage）：
           // 用户消息可以「保存并重发」，助手消息只能就地改内容 —— 改完模型
           // 看到的上下文也跟着变，这正是要改它的理由。
@@ -3059,7 +3291,7 @@ class _HomeShellState extends State<HomeShell>
     } else if (danger) {
       text = '⚠ 沙箱已关闭，命令直接在环境里执行';
     } else {
-      final model = widget.settings.sourceLabel;
+      final model = _effectiveSourceLabel;
       text = model.isEmpty ? '未配置模型' : model;
     }
 
@@ -3155,33 +3387,37 @@ class _HomeShellState extends State<HomeShell>
     settings: widget.settings,
   );
 
+  /// 换这个会话用的模型。**只换这一个会话。**
+  ///
+  /// 以前这里调的是 `channels.assignRole(ModelRole.chat, …)` —— 那是全局的：
+  /// 在一个会话里为了一段代码换成 Opus，另外二十个会话（包括那个只用来
+  /// 跑命令的本地小模型会话）跟着一起换了，而且不会有任何提示。
   Future<void> _pickModel() async {
     final picked = await showModelPicker(
       context,
       title: '对话模型',
-      current: widget.settings.config.model,
+      current: _effectiveModel,
       sources: _catalog.sources(),
-      activeSourceId: widget.channels.activeId,
+      activeSourceId: _effectiveChannel?.id ?? widget.channels.activeId,
       onRefresh: _catalog.refresh,
       onToggleStar: _catalog.toggleStar,
     );
     if (picked == null || picked.model.isEmpty) return;
-    final switched = picked.sourceId != widget.channels.activeId;
-    // 换渠道 + 换模型是一个动作，顺序不能反 —— 先设模型的话，那个模型会被
-    // 写到用户正想离开的那个渠道上。[ChannelStore.assignRole] 管这件事。
-    await widget.channels.assignRole(
-      ModelRole.chat,
-      ModelRef(channelId: picked.sourceId, model: picked.model),
-    );
+    final switched = picked.sourceId != _effectiveChannel?.id;
+    await _updatePrefs(_prefs.copyWith(
+      channelId: picked.sourceId,
+      model: picked.model,
+    ));
     if (switched && mounted) {
       final name =
           widget.channels.byId(picked.sourceId)?.name ?? picked.sourceId;
-      _setStatus('已切换到渠道「$name」');
+      _setStatus('这个会话已改用渠道「$name」');
     }
   }
 
   Future<void> _pickThinkingEffort() async {
     final t = context.chat;
+    final current = _effectiveThinking;
     final picked = await showModalBottomSheet<ThinkingEffort>(
       context: context,
       backgroundColor: t.bgPrimary,
@@ -3191,7 +3427,7 @@ class _HomeShellState extends State<HomeShell>
           children: <Widget>[
             for (final effort in ThinkingEffort.values)
               ListTile(
-                leading: Icon(effort == widget.settings.thinkingEffort
+                leading: Icon(effort == current
                     ? Icons.radio_button_checked
                     : Icons.radio_button_unchecked),
                 title: Text(effort.label),
@@ -3203,7 +3439,78 @@ class _HomeShellState extends State<HomeShell>
         ),
       ),
     );
-    if (picked != null) await widget.settings.setThinkingEffort(picked);
+    if (picked != null) {
+      await _updatePrefs(_prefs.copyWith(thinkingEffort: picked));
+    }
+  }
+
+  /// 温度。滑到哪儿算哪儿，松手才落库。
+  ///
+  /// 上界跟着**这个会话自己的**渠道走：Anthropic 到 1，OpenAI 兼容到 2。
+  /// 拿另一套的上界去限，滑到一半就被悄悄截断。
+  Future<void> _pickTemperature() async {
+    final t = context.chat;
+    final anthropic = _effectiveChannel?.apiFormat == 'anthropic';
+    var value = _effectiveTemperature.clamp(0.0, anthropic ? 1.0 : 2.0);
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: t.bgPrimary,
+      builder: (ctx) => SafeArea(
+        child: StatefulBuilder(
+          builder: (ctx, setSheet) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              ListTile(
+                leading: const Icon(Icons.thermostat_outlined),
+                title: Text('Temperature  ${value.toStringAsFixed(1)}'),
+                subtitle: Text(
+                  value <= 0.3
+                      ? '稳，几乎每次都给同一个答案'
+                      : value <= 0.8
+                          ? '中间档，日常够用'
+                          : '发散，适合写点东西',
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ),
+              Slider(
+                value: value,
+                min: 0,
+                max: anthropic ? 1 : 2,
+                divisions: anthropic ? 10 : 20,
+                onChanged: (v) => setSheet(() => value = v),
+                onChangeEnd: (v) => _updatePrefs(
+                  _prefs.copyWith(temperature: v),
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// `+` 里那一行的说明：设了几项，以及有没有当前渠道不认的。
+  String _samplingSummary() {
+    final sampling = _prefs.sampling;
+    if (sampling.isEmpty) return 'top_p / 输出上限 / 停止词 …（都跟默认）';
+    final format = _effectiveChannel?.apiFormat ?? 'openAI';
+    final ignored = sampling.ignoredBy(format);
+    final touched = '已设 ${sampling.touched.length} 项';
+    // 有设了却发不出去的，就在这一行直接说 —— 不说的话它只会以"毫无变化"
+    // 的形式表现出来，而那看起来像是模型的问题。
+    return ignored.isEmpty ? touched : '$touched · ${ignored.length} 项当前渠道不认';
+  }
+
+  Future<void> _editSampling() async {
+    await showSamplingPage(
+      context,
+      initial: _prefs.sampling,
+      apiFormat: _effectiveChannel?.apiFormat ?? 'openAI',
+      channelLabel: _effectiveChannel?.name ?? '当前渠道',
+      onChanged: (sampling) =>
+          _updatePrefs(_prefs.copyWith(sampling: sampling)),
+    );
   }
 
   /// 选图。相册 / 拍照两个入口摊在一个小弹层里。
@@ -3269,7 +3576,7 @@ class _HomeShellState extends State<HomeShell>
 
   /// 当前配置能不能真的把图送到模型手里。能就返回 null。
   String? _visionWarning() {
-    if (widget.settings.sendImagesInline) return null;
+    if (_effectiveSendImagesInline) return null;
     if (widget.channels.channels.any((c) => c.canDescribeImages)) {
       return widget.settings.imageMode == ImageMode.preprocess
           ? '会先用视觉模型把图描述成文字，再发给对话模型'
@@ -3335,12 +3642,12 @@ class _HomeShellState extends State<HomeShell>
   ///
   /// 按严重程度排：没模型是"整个 app 现在不能用"，排最前。
   String? get _composerWarning {
-    if (widget.settings.config.model.isEmpty) return '还没有配对话模型';
+    if (_effectiveModel.isEmpty) return '还没有配对话模型';
     final embedError = _agent.retrieval.lastEmbeddingError;
     // 指路到分工表：嵌入模型的入口从这个菜单搬走了，只说"不可用"
     // 的话用户得自己找一遍。
     if (embedError != null) return '嵌入检索不可用（设置 → 模型分工）：$embedError';
-    if (!widget.settings.sendImagesInline &&
+    if (!_effectiveSendImagesInline &&
         !widget.channels.channels.any((c) => c.canDescribeImages)) {
       return '当前渠道不认图，也没指图片转文字模型 —— 现在发不了图';
     }
@@ -3369,12 +3676,13 @@ class _HomeShellState extends State<HomeShell>
             _pickImages(camera: true);
           },
         ),
+        // 模型 / 思考强度 / 温度这三项都是**这个会话自己的**，改了不动别的
+        // 会话（见 settings/thread_prefs.dart）。设置页里的同名项现在只决定
+        // 新会话从哪儿起步。
         MenuAction(
           icon: Icons.auto_awesome,
           label: '对话模型',
-          detail: widget.settings.sourceLabel.isEmpty
-              ? '还没配'
-              : widget.settings.sourceLabel,
+          detail: _effectiveSourceLabel.isEmpty ? '还没配' : _effectiveSourceLabel,
           onTap: () {
             Navigator.pop(menuContext);
             _pickModel();
@@ -3386,10 +3694,28 @@ class _HomeShellState extends State<HomeShell>
         MenuAction(
           icon: Icons.speed_outlined,
           label: '思考强度',
-          detail: '${widget.settings.thinkingEffort.label} · 只对会思考的模型有效',
+          detail: '${_effectiveThinking.label} · 只对会思考的模型有效',
           onTap: () async {
             await _pickThinkingEffort();
             refresh();
+          },
+        ),
+        MenuAction(
+          icon: Icons.thermostat_outlined,
+          label: '温度',
+          detail: '${_effectiveTemperature.toStringAsFixed(1)} · 越高越发散',
+          onTap: () async {
+            await _pickTemperature();
+            refresh();
+          },
+        ),
+        MenuAction(
+          icon: Icons.tune,
+          label: '极客设置',
+          detail: _samplingSummary(),
+          onTap: () {
+            Navigator.pop(menuContext);
+            _editSampling();
           },
         ),
       ],
@@ -3421,10 +3747,10 @@ class _HomeShellState extends State<HomeShell>
             label: '终端模式',
             detail: _agent.terminalMode
                 ? '模型可以在 ${_distro?.distro.displayName ?? '沙箱'} 里执行命令'
-                : !widget.settings.supportsTools
+                : !_effectiveCapability.tools
                     // 说清是"哪个模型"而不是只说不支持：用户随时在换模型，
                     // 不点名的话他不知道该去改哪一条。
-                    ? '「${widget.channels.active?.model ?? '当前模型'}」'
+                    ? '「${_effectiveModel.isEmpty ? '当前模型' : _effectiveModel}」'
                         '被标记为不支持工具调用'
                     : _distro == null
                         ? '开启后会先装一个 Linux 基座（约 3–30MB）'

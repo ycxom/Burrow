@@ -9,6 +9,7 @@ import 'package:sqflite/sqflite.dart';
 import '../agent/agent_loop.dart' show TokenUsage;
 import '../context/overflow_manager.dart';
 import '../settings/thread_lock.dart';
+import '../settings/thread_prefs.dart';
 import 'db_cipher.dart';
 
 class ChatThread {
@@ -112,7 +113,7 @@ class ChatStore {
   static Future<ChatStore> openAt(String path) async {
     final db = await openDatabase(
       path,
-      version: 14,
+      version: 15,
       onUpgrade: (db, from, to) async {
         // 加列而不是重建表 —— 用户的历史对话不该因为加了个字段就被清掉。
         if (from < 2) {
@@ -198,6 +199,10 @@ class ChatStore {
           // 会话锁。NULL = 没加锁，和加这一列之前完全一样。
           await db.execute('ALTER TABLE threads ADD COLUMN lock_json TEXT');
         }
+        if (from < 15) {
+          // 这个会话自己的模型策略。NULL = 跟全局，和加这一列之前一样。
+          await db.execute('ALTER TABLE threads ADD COLUMN model_prefs TEXT');
+        }
         if (from < 8) {
           // 这一条是不是估算值。1 = 估算。
           //
@@ -220,7 +225,8 @@ class ChatStore {
             summary TEXT,
             summary_checkpoint INTEGER,
             last_read_message_id INTEGER,
-            lock_json TEXT
+            lock_json TEXT,
+            model_prefs TEXT
           )
         ''');
         await db.execute('''
@@ -458,8 +464,40 @@ class ChatStore {
   Future<void> setLock(String threadId, ThreadLock? lock) => _db.update(
         'threads',
         <String, Object?>{
-          'lock_json':
-              lock == null ? null : _seal(jsonEncode(lock.toJson())),
+          'lock_json': lock == null ? null : _seal(jsonEncode(lock.toJson())),
+        },
+        where: 'id = ?',
+        whereArgs: <Object?>[threadId],
+      );
+
+  /// 这个会话自己的模型策略。没设过时返回一份全空的。
+  Future<ThreadPrefs> prefsOf(String threadId) async {
+    final rows = await _db.query(
+      'threads',
+      columns: <String>['model_prefs'],
+      where: 'id = ?',
+      whereArgs: <Object?>[threadId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return const ThreadPrefs();
+    final raw = _open(rows.first['model_prefs'] as String?);
+    if (raw == null || raw.isEmpty) return const ThreadPrefs();
+    try {
+      return ThreadPrefs.fromJson(jsonDecode(raw));
+    } catch (_) {
+      // 这一列坏了就退回跟全局。比"打不开这个会话"好得多，
+      // 而用户能看出来的表现只是几个旋钮回到了默认值。
+      return const ThreadPrefs();
+    }
+  }
+
+  /// 存这个会话的模型策略。全空时写 NULL —— 留一个 `{}` 在库里，
+  /// 读出来和"没设过"没区别，但会让人以为设过。
+  Future<void> setPrefs(String threadId, ThreadPrefs prefs) => _db.update(
+        'threads',
+        <String, Object?>{
+          'model_prefs':
+              prefs.isEmpty ? null : _seal(jsonEncode(prefs.toJson())),
         },
         where: 'id = ?',
         whereArgs: <Object?>[threadId],
@@ -856,7 +894,8 @@ class ChatStore {
       List<String> columns,
       String idColumn,
     ) async {
-      final rows = await _db.query(table, columns: <String>[idColumn, ...columns]);
+      final rows =
+          await _db.query(table, columns: <String>[idColumn, ...columns]);
       for (final row in rows) {
         final update = <String, Object?>{};
         for (final column in columns) {
@@ -879,7 +918,14 @@ class ChatStore {
 
     await sweep(
       'threads',
-      <String>['title', 'preview', 'system_prompt', 'summary', 'lock_json'],
+      <String>[
+        'title',
+        'preview',
+        'system_prompt',
+        'summary',
+        'lock_json',
+        'model_prefs',
+      ],
       'id',
     );
     await sweep(
@@ -1116,6 +1162,64 @@ class ChatStore {
     final json = _open(rows.first['json'] as String?);
     if (json == null || json.isEmpty) return const <ChatMessage>[];
     return _decodeSegment(json);
+  }
+
+  /// 删掉一个分支点下的某个版本，返回删完之后还剩几个。
+  ///
+  /// 剩下的版本会**重新编号成连续的 0..n-1**。序号是界面上那个「2/3」里的
+  /// 数字，留着洞的话用户会看到「1/2、3/2」这种东西；而且 [saveVariant] 用
+  /// `MAX(variant_index) + 1` 取新号，留洞不影响它，重排也不会撞号。
+  ///
+  /// 删掉的是**当前正在看的那个**时，活动版本落到它前面一个 —— 界面那边
+  /// 负责把内容换过去。全部删光时把这一行清掉，锚点上的分支 id 也就没人
+  /// 引用了，和从来没分过支一样。
+  Future<int> deleteVariant(String branchId, int index) async {
+    return _db.transaction<int>((txn) async {
+      final rows = await txn.query(
+        'branches',
+        columns: <String>['variant_index', 'segment_hash', 'is_active'],
+        where: 'branch_id = ?',
+        whereArgs: <Object?>[branchId],
+        orderBy: 'variant_index ASC',
+      );
+      final victim = rows.where((row) => row['variant_index'] == index);
+      if (victim.isEmpty) return rows.length;
+
+      // 内容的引用计数要跟着减。只删指针不减计数的话，那一段会变成谁也
+      // 引用不到的孤儿，永久占着空间 —— 和 [deleteThread] 里同一件事。
+      await _releaseSegment(txn, victim.first['segment_hash']! as String);
+      await txn.delete('branches',
+          where: 'branch_id = ? AND variant_index = ?',
+          whereArgs: <Object?>[branchId, index]);
+
+      final survivors =
+          rows.where((row) => row['variant_index'] != index).toList();
+      if (survivors.isEmpty) return 0;
+
+      final wasActive = victim.first['is_active'] == 1;
+      var active = -1;
+      for (var i = 0; i < survivors.length; i++) {
+        final old = survivors[i]['variant_index']! as int;
+        if (old != i) {
+          await txn.update('branches', <String, Object?>{'variant_index': i},
+              where: 'branch_id = ? AND variant_index = ?',
+              whereArgs: <Object?>[branchId, old]);
+        }
+        if (survivors[i]['is_active'] == 1) active = i;
+      }
+      if (wasActive || active < 0) {
+        // 往前退一个，退不动就停在第一个。
+        active = index - 1;
+        if (active < 0) active = 0;
+        if (active >= survivors.length) active = survivors.length - 1;
+        await txn.update('branches', <String, Object?>{'is_active': 0},
+            where: 'branch_id = ?', whereArgs: <Object?>[branchId]);
+        await txn.update('branches', <String, Object?>{'is_active': 1},
+            where: 'branch_id = ? AND variant_index = ?',
+            whereArgs: <Object?>[branchId, active]);
+      }
+      return survivors.length;
+    });
   }
 
   /// 把某个版本标成当前正在看的那个。只记账，不动 messages 表 ——

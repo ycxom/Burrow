@@ -128,8 +128,10 @@ class ThreadFacts {
       };
 
   /// 现在还答得上的题。
-  List<LockQuestion> get available =>
-      <LockQuestion>[for (final q in LockQuestion.values) if (has(q)) q];
+  List<LockQuestion> get available => <LockQuestion>[
+        for (final q in LockQuestion.values)
+          if (has(q)) q
+      ];
 }
 
 /// 一道题。内置的，或者用户自己写的。
@@ -250,9 +252,7 @@ const _iterations = 60000;
 String derivePasscode(String password, String salt) {
   final hmac = Hmac(sha256, utf8.encode(password));
   // dkLen 等于一个块，所以只要第一块：INT(1) 大端拼在盐后面。
-  var block = hmac
-      .convert(<int>[...utf8.encode(salt), 0, 0, 0, 1])
-      .bytes;
+  var block = hmac.convert(<int>[...utf8.encode(salt), 0, 0, 0, 1]).bytes;
   final result = List<int>.from(block);
   for (var i = 1; i < _iterations; i++) {
     block = hmac.convert(block).bytes;
@@ -292,8 +292,8 @@ String normalizeAnswer(String raw) {
   final buffer = StringBuffer();
   for (final rune in raw.toLowerCase().runes) {
     // 只留字母、数字和汉字。
-    final isAscii = (rune >= 0x30 && rune <= 0x39) ||
-        (rune >= 0x61 && rune <= 0x7a);
+    final isAscii =
+        (rune >= 0x30 && rune <= 0x39) || (rune >= 0x61 && rune <= 0x7a);
     final isCjk = rune >= 0x4e00 && rune <= 0x9fff;
     // 别的语言的字母（西里尔、假名等）也留着。
     final isOtherLetter = rune > 0x7f && !_isPunctuation(rune);

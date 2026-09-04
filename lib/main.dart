@@ -333,9 +333,13 @@ Future<void> _boot({
   final unlocked = ThreadUnlockSession();
   final llm = ConfigurableLlmClient(config: settings.config);
 
-  // 设置一变就把配置推给客户端。底部那条快速切换器改的是 SettingsStore，
-  // 不接这一条的话「切了模型但还在用旧的」—— 而且切换本身看起来是成功的。
-  settings.addListener(() => llm.config = settings.config);
+  // **不在这里挂"设置一变就推配置"。**
+  //
+  // 那条监听会把全局设置推给所有会话，而模型策略现在是**按会话**的
+  // （见 settings/thread_prefs.dart）：改一次全局温度就把每个聊天室的温度
+  // 都改掉，正是要根治的事。改成由当前打开的那个会话自己往 client 上写
+  // （app.dart 的 `_applyConfig`）—— 同一时刻只有一个会话活着，
+  // "当前生效的配置"和"当前打开的会话"是一一对应的。
 
   final accounts = await AccountStore.load();
 

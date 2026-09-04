@@ -233,8 +233,7 @@ void main() {
 
       await agent.send('接着聊');
 
-      expect(overflow.checkpoint, greaterThan(0),
-          reason: '发出去之前就该压过了');
+      expect(overflow.checkpoint, greaterThan(0), reason: '发出去之前就该压过了');
       // 人格 + 摘要 + 窗口里留下的那几条。整段历史都发出去的话会远大于这个数。
       expect(llm.messagesSeen.single.length, lessThan(10),
           reason: '第一次请求就该是压缩过的，而不是等这一轮结束才压');

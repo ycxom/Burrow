@@ -173,9 +173,8 @@ String? geminiBaseUrlFix(String raw, {String apiFormat = 'openAI'}) {
   final host = Uri.tryParse(trimmed)?.host.toLowerCase() ?? '';
   if (host != _geminiHost) return null;
   // Code Assist（`gemini`）在另一个主机上，走不到这里。
-  final want = apiFormat == 'geminiNative'
-      ? geminiNativeBaseUrl
-      : geminiOpenAiBaseUrl;
+  final want =
+      apiFormat == 'geminiNative' ? geminiNativeBaseUrl : geminiOpenAiBaseUrl;
   if (trimmed.toLowerCase() == want) return null;
   return want;
 }
@@ -184,7 +183,8 @@ String? geminiBaseUrlFix(String raw, {String apiFormat = 'openAI'}) {
 ///
 /// 原生层要 `x-goog-api-key`，兼容层要 `Authorization: Bearer`。拿错了返回
 /// 401，而 401 看起来就是"密钥不对" —— 于是人会去换密钥，换多少个都没用。
-Map<String, String> geminiAuthHeaders(String apiKey, {String apiFormat = 'openAI'}) {
+Map<String, String> geminiAuthHeaders(String apiKey,
+    {String apiFormat = 'openAI'}) {
   if (apiKey.isEmpty) return <String, String>{};
   if (apiFormat == 'geminiNative') {
     return <String, String>{'x-goog-api-key': apiKey};
@@ -417,11 +417,13 @@ Future<List<FetchedModel>> fetchModels({
 
   for (final url in candidates) {
     try {
-      final response = await httpClient.get(
-        Uri.parse(url),
-        headers: geminiAuthHeaders(apiKey, apiFormat: apiFormat)
-          ..['Accept'] = 'application/json',
-      ).timeout(timeout);
+      final response = await httpClient
+          .get(
+            Uri.parse(url),
+            headers: geminiAuthHeaders(apiKey, apiFormat: apiFormat)
+              ..['Accept'] = 'application/json',
+          )
+          .timeout(timeout);
 
       if (response.statusCode == 200) {
         final models = parseModelsResponse(response.body);

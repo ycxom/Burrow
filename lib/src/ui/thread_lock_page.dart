@@ -156,8 +156,8 @@ class _ThreadLockSetupPageState extends State<ThreadLockSetupPage> {
               contentPadding: EdgeInsets.zero,
               controlAffinity: ListTileControlAffinity.leading,
               dense: true,
-              title: Text(question.label,
-                  style: const TextStyle(fontSize: 13.5)),
+              title:
+                  Text(question.label, style: const TextStyle(fontSize: 13.5)),
               subtitle:
                   Text(question.hint, style: const TextStyle(fontSize: 11)),
             ),
@@ -349,7 +349,8 @@ class _ThreadUnlockPageState extends State<ThreadUnlockPage> {
               ),
               if (_error case final text?) ...<Widget>[
                 const SizedBox(height: 10),
-                Text(text, style: TextStyle(color: t.tintError, fontSize: 12.5)),
+                Text(text,
+                    style: TextStyle(color: t.tintError, fontSize: 12.5)),
               ],
               const SizedBox(height: 16),
               SizedBox(

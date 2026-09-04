@@ -29,6 +29,7 @@ import 'system_prompt.dart';
 import '../agent/tools.dart';
 import 'gemini_protocol.dart';
 import 'reasoning.dart';
+import 'sampling.dart';
 import 'thinking_effort.dart';
 import 'oauth.dart';
 import '../context/overflow_manager.dart';
@@ -95,6 +96,12 @@ class LlmConfig {
   /// 直接说是这个旋钮的事。
   final ThinkingEffort thinkingEffort;
 
+  /// 极客设置：top_p / top_k / 输出上限 / 惩罚 / seed / 停止词。
+  ///
+  /// 默认 [SamplingParams.none] —— **一个字段都不发**，请求体和没有这个
+  /// 功能时逐字相同。哪个协议认哪几项见 sampling.dart 里那张表。
+  final SamplingParams sampling;
+
   const LlmConfig({
     this.apiFormat = 'openAI',
     required this.baseUrl,
@@ -109,6 +116,7 @@ class LlmConfig {
     this.systemPromptStyle = SystemPromptStyle.systemRole,
     this.webSearch = false,
     this.thinkingEffort = ThinkingEffort.auto,
+    this.sampling = SamplingParams.none,
   });
 
   static const empty = LlmConfig(baseUrl: '', apiKey: '', model: '');
@@ -131,6 +139,7 @@ class LlmConfig {
     SystemPromptStyle? systemPromptStyle,
     bool? webSearch,
     ThinkingEffort? thinkingEffort,
+    SamplingParams? sampling,
   }) =>
       LlmConfig(
         apiFormat: apiFormat ?? this.apiFormat,
@@ -146,6 +155,7 @@ class LlmConfig {
         systemPromptStyle: systemPromptStyle ?? this.systemPromptStyle,
         webSearch: webSearch ?? this.webSearch,
         thinkingEffort: thinkingEffort ?? this.thinkingEffort,
+        sampling: sampling ?? this.sampling,
       );
 }
 
@@ -429,6 +439,7 @@ class ConfigurableLlmClient
                 : responsesContentParts(message.content, attached),
           };
         }).toList(),
+        ...config.sampling.responsesFields(),
         'stream': true,
         'store': false,
         if (config.thinkingEffort.openAiEffort != null)
@@ -583,6 +594,7 @@ class ConfigurableLlmClient
       ..body = jsonEncode({
         'model': config.model,
         'temperature': config.temperature,
+        ...config.sampling.openAiFields(),
         'stream': config.streamOutput,
         if (config.thinkingEffort.openAiEffort != null)
           'reasoning_effort': config.thinkingEffort.openAiEffort,
@@ -861,6 +873,7 @@ class ConfigurableLlmClient
       if (wire.isNotEmpty) 'tools': wire,
       'generationConfig': <String, Object?>{
         'temperature': config.temperature,
+        ...config.sampling.geminiFields(),
         if (thoughts)
           'thinkingConfig':
               geminiThinkingConfig(config.model, config.thinkingEffort),
@@ -1060,7 +1073,13 @@ class ConfigurableLlmClient
         .where((message) => message.role == 'system')
         .map((message) => message.content)
         .join('\n\n');
-    final thinking = anthropicThinking(config.thinkingEffort);
+    // 「输出上限」在这里是**答案本身**的上限，思考预算另算 ——
+    // Anthropic 的 max_tokens 把两者算在一起，直接拿用户那个数去填的话，
+    // 开了高强度思考之后模型会把额度全烧在思考上，答案被截在半句。
+    final thinking = anthropicThinking(
+      config.thinkingEffort,
+      answerRoom: config.sampling.maxTokens ?? 4096,
+    );
     final auth = await _authValue();
     final request = http.Request(
       'POST',
@@ -1073,10 +1092,12 @@ class ConfigurableLlmClient
       })
       ..body = jsonEncode(<String, Object?>{
         'model': config.model,
-        'max_tokens': thinking?.maxTokens ?? 4096,
+        'max_tokens': config.sampling
+            .anthropicMaxTokens(thinkingMaxTokens: thinking?.maxTokens),
         // 开了扩展思考就**不能再送 temperature** —— Anthropic 要求它必须是 1，
         // 送别的值会 400。这里整个省掉，让服务端用它自己那份。
         if (thinking == null) 'temperature': config.temperature.clamp(0, 1),
+        ...config.sampling.anthropicFields(),
         if (thinking != null)
           'thinking': <String, Object?>{
             'type': 'enabled',

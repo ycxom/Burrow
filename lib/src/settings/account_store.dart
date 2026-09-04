@@ -155,7 +155,9 @@ class AccountStore extends ChangeNotifier {
   List<OAuthFamily> get families {
     final byFamily = <String, List<OAuthProvider>>{};
     for (final provider in _providers) {
-      byFamily.putIfAbsent(provider.family, () => <OAuthProvider>[]).add(provider);
+      byFamily
+          .putIfAbsent(provider.family, () => <OAuthProvider>[])
+          .add(provider);
     }
     return <OAuthFamily>[
       for (final entry in byFamily.entries)
@@ -324,8 +326,7 @@ class AccountStore extends ChangeNotifier {
     return <OAuthProvider>[
       OpenAiDeviceFlow(client: clientFor('openai_oauth')),
       XaiDeviceFlow(client: clientFor('xai_oauth')),
-      GoogleCodeAssistFlow(
-          client: client, httpClient: clientFor(googleFamily)),
+      GoogleCodeAssistFlow(client: client, httpClient: clientFor(googleFamily)),
       GoogleVertexFlow(client: client, httpClient: clientFor(googleFamily)),
     ];
   }

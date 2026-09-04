@@ -623,8 +623,7 @@ class PartStyle {
       for (final state in SkinState.values) {
         final mine = on(state);
         final theirs = other.on(state);
-        states[state.index] =
-            mine == null ? theirs : mine.merge(theirs);
+        states[state.index] = mine == null ? theirs : mine.merge(theirs);
       }
     }
     return PartStyle(

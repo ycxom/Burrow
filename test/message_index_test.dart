@@ -111,8 +111,8 @@ void main() {
       // 表现是「聊天记录上方多出一大片灰色」，看不出和摘要有任何关系。
       final a = msg('user', '你好');
       final b = msg('assistant', '你好呀');
-      expect(summaryBoundaryIndex(<ChatMessage>[a, b], <ChatMessage>[a, b], 0),
-          0);
+      expect(
+          summaryBoundaryIndex(<ChatMessage>[a, b], <ChatMessage>[a, b], 0), 0);
     });
 
     test('线画在被覆盖的最后一条之后', () {

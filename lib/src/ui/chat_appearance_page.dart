@@ -295,8 +295,7 @@ class _ChatAppearancePageState extends State<ChatAppearancePage> {
                       onPressed: () => _uninstall(skins[i]),
                     ),
                   if (widget.store.chatSkinId == skins[i].id && !suspended)
-                    Icon(Icons.check_circle_rounded,
-                        color: context.chat.brand)
+                    Icon(Icons.check_circle_rounded, color: context.chat.brand)
                   else
                     const Icon(Icons.radio_button_unchecked_rounded),
                 ],

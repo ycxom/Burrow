@@ -13,7 +13,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
-ChatMessage _msg(String role, String content, {List<String> images = const []}) =>
+ChatMessage _msg(String role, String content,
+        {List<String> images = const []}) =>
     ChatMessage(
       role: role,
       content: content,
@@ -36,7 +37,8 @@ void main() {
       final back = GoogleOAuthClient.fromJson(client.toJson());
       expect(back!.id, 'abc');
       expect(back.secret, 'xyz');
-      expect(GoogleOAuthClient.fromJson(<String, Object?>{'secret': 'x'}), isNull);
+      expect(
+          GoogleOAuthClient.fromJson(<String, Object?>{'secret': 'x'}), isNull);
     });
   });
 
@@ -93,8 +95,7 @@ void main() {
     setUp(() => googleRedirectPort = 0);
     tearDown(resetGoogleRedirectPort);
 
-    const grantedGoogleScopes =
-        'email profile openid '
+    const grantedGoogleScopes = 'email profile openid '
         'https://www.googleapis.com/auth/aicode '
         'https://www.googleapis.com/auth/cloud-platform '
         'https://www.googleapis.com/auth/userinfo.email '
@@ -156,7 +157,8 @@ void main() {
       http.Client? tokenClient,
     }) async {
       final flow = GoogleCodeAssistFlow(
-        client: const GoogleOAuthClient(id: 'test-client', secret: 'test-secret'),
+        client:
+            const GoogleOAuthClient(id: 'test-client', secret: 'test-secret'),
         httpClient: tokenClient ?? validatedGoogleClient(),
       );
       final session = await flow.start();
@@ -224,7 +226,8 @@ void main() {
       final redirect = Uri.parse(uri.queryParameters['redirect_uri']!);
       final state = uri.queryParameters['state']!;
       final page = await http.get(
-        redirect.replace(queryParameters: {'code': 'auth-code', 'state': state}),
+        redirect
+            .replace(queryParameters: {'code': 'auth-code', 'state': state}),
       );
       // 浏览器要看到一句人话，否则用户不知道该不该切回 app。
       expect(page.statusCode, 200);
@@ -395,7 +398,8 @@ void main() {
       expect(refreshed.accessToken, 'at-2');
       // 不接住旧的就等于"登录一小时后必掉线"。
       expect(refreshed.refreshToken, 'rt-keep');
-      expect(Uri.splitQueryString(captured.body)['grant_type'], 'refresh_token');
+      expect(
+          Uri.splitQueryString(captured.body)['grant_type'], 'refresh_token');
     });
 
     test('没有 refresh_token 时直接说要重登', () async {
@@ -422,7 +426,8 @@ void main() {
         const <String, InlineImage>{},
       );
       expect(contents.map((c) => c['role']), <String>['user', 'model', 'user']);
-      final system = geminiSystemInstruction(<ChatMessage>[_msg('system', '你是助手')]);
+      final system =
+          geminiSystemInstruction(<ChatMessage>[_msg('system', '你是助手')]);
       expect(system, isNotNull);
     });
 
@@ -449,7 +454,9 @@ void main() {
 
     test('图片进 inlineData', () {
       final contents = geminiContents(
-        <ChatMessage>[_msg('user', '看这个', images: <String>['/a.jpg'])],
+        <ChatMessage>[
+          _msg('user', '看这个', images: <String>['/a.jpg'])
+        ],
         <String, InlineImage>{
           '/a.jpg': const InlineImage(
             path: '/a.jpg',
@@ -559,7 +566,8 @@ void main() {
     });
 
     test('联网搜索是 tools 里另一个条目，不是一条函数声明', () {
-      const spec = ToolSpec('run', 'run it', <String, Object?>{'type': 'object'});
+      const spec =
+          ToolSpec('run', 'run it', <String, Object?>{'type': 'object'});
 
       // 只有搜索。
       expect(
@@ -573,7 +581,8 @@ void main() {
       final both = geminiTools(<ToolSpec>[spec], webSearch: true);
       expect(both, hasLength(2));
       expect(both.first.containsKey('functionDeclarations'), isTrue);
-      expect(both.last, <String, Object?>{'google_search': <String, Object?>{}});
+      expect(
+          both.last, <String, Object?>{'google_search': <String, Object?>{}});
 
       // 不开就一条都不加。
       expect(geminiTools(const <ToolSpec>[]), isEmpty);
@@ -624,7 +633,8 @@ void main() {
       expect(formatted, contains('[uefa.com](https://redirect/1)'));
 
       // 没搜索的那一轮不该凭空多出一个分隔线。
-      expect(formatGroundingSources(const <GroundingSource>[], const <String>[]),
+      expect(
+          formatGroundingSources(const <GroundingSource>[], const <String>[]),
           isEmpty);
     });
 

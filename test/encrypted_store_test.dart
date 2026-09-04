@@ -13,6 +13,7 @@ import 'package:burrow/src/context/overflow_manager.dart';
 import 'package:burrow/src/data/chat_store.dart';
 import 'package:burrow/src/data/db_cipher.dart';
 import 'package:burrow/src/settings/thread_lock.dart';
+import 'package:burrow/src/settings/thread_prefs.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -62,8 +63,8 @@ void main() {
   /// 两边都压成 latin1 就对齐了：把文件字节按 latin1 解一遍，
   /// 把要找的话先编成 UTF-8 再按 latin1 解一遍，然后比。
   Future<bool> fileContains(String secret) async {
-    final haystack = latin1.decode(await File(path).readAsBytes(),
-        allowInvalid: true);
+    final haystack =
+        latin1.decode(await File(path).readAsBytes(), allowInvalid: true);
     return haystack.contains(latin1.decode(utf8.encode(secret)));
   }
 
@@ -113,13 +114,17 @@ void main() {
     );
     await store.setLock(
       id,
-      ThreadLock(
+      const ThreadLock(
         salt: 'x',
         hash: 'y',
-        challenges: const <LockChallenge>[
+        challenges: <LockChallenge>[
           LockChallenge.custom(prompt: '那台机器叫什么', answer: 'rack-01'),
         ],
       ),
+    );
+    await store.setPrefs(
+      id,
+      const ThreadPrefs(channelId: 'ch-私人小号', model: 'moonshot-v9'),
     );
     await store.close();
 
@@ -132,6 +137,7 @@ void main() {
       '扮演一个私人助理', // threads.system_prompt
       '聊过一些私事', // threads.summary
       'rack-01', // threads.lock_json 里的自定义答案
+      'ch-私人小号', // threads.model_prefs 里的渠道
     ]) {
       expect(await fileContains(secret), isFalse, reason: '「$secret」还是明文');
     }
@@ -176,6 +182,7 @@ void main() {
       final id = await plain.createThread('老会话');
       await plain.append(id, user('这是加密之前就存在的一句话'));
       await plain.setSystemPrompt(id, '老的人格设定');
+      await plain.setPrefs(id, const ThreadPrefs(channelId: 'ch-老渠道'));
       await plain.close();
 
       // 先确认这条断言本身是有效的：加密前文件里确实找得到这句话。
@@ -189,10 +196,12 @@ void main() {
       // 内容还在。
       expect((await store.messages(id)).single.content, '这是加密之前就存在的一句话');
       expect(await store.systemPromptOf(id), '老的人格设定');
+      expect((await store.prefsOf(id)).channelId, 'ch-老渠道');
       await store.close();
 
       expect(await fileContains('这是加密之前就存在的一句话'), isFalse);
       expect(await fileContains('老的人格设定'), isFalse);
+      expect(await fileContains('ch-老渠道'), isFalse);
     });
 
     test('再跑一次不会把密文又加密一遍', () async {

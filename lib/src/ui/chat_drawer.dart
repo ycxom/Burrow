@@ -524,52 +524,53 @@ class _ChatDrawerState extends State<ChatDrawer> {
                 onLongPressStart: (details) =>
                     _showThreadMenu(thread, details.globalPosition),
                 child: ListTile(
-                dense: true,
-                visualDensity: VisualDensity.compact,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(ChatShape.radiusLg),
-                ),
-                leading: Icon(
-                  thread.terminalMode
-                      ? Icons.terminal
-                      : Icons.chat_bubble_outline,
-                  size: 18,
-                  color: active ? t.brand : t.tintTertiary,
-                ),
-                title: Text(
-                  thread.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: active ? t.brand : t.tintPrimary,
-                    fontWeight: active ? FontWeight.w500 : FontWeight.normal,
+                  dense: true,
+                  visualDensity: VisualDensity.compact,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(ChatShape.radiusLg),
                   ),
-                ),
-                subtitle: Text(
-                  // 锁着就不显示预览。列表上那一行摘要恰恰是最会泄露内容的
-                  // 地方 —— 挡住了正文却把开头一句摆在外面，这道锁就白设了。
-                  _locked.contains(thread.id) ? '已加锁' : thread.preview,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 11, color: t.tintTertiary),
-                ),
-                trailing: _locked.contains(thread.id)
-                    ? Icon(Icons.lock_rounded, size: 14, color: t.tintTertiary)
-                    : null,
-                onTap: () async {
-                  // 先把 navigator 抓在手上：过锁那一步是异步的，回来之后
-                  // 这个 context 可能已经不在树上了。
-                  final navigator = Navigator.of(context);
-                  if (thread.id == widget.currentThreadId) {
+                  leading: Icon(
+                    thread.terminalMode
+                        ? Icons.terminal
+                        : Icons.chat_bubble_outline,
+                    size: 18,
+                    color: active ? t.brand : t.tintTertiary,
+                  ),
+                  title: Text(
+                    thread.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: active ? t.brand : t.tintPrimary,
+                      fontWeight: active ? FontWeight.w500 : FontWeight.normal,
+                    ),
+                  ),
+                  subtitle: Text(
+                    // 锁着就不显示预览。列表上那一行摘要恰恰是最会泄露内容的
+                    // 地方 —— 挡住了正文却把开头一句摆在外面，这道锁就白设了。
+                    _locked.contains(thread.id) ? '已加锁' : thread.preview,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: t.tintTertiary),
+                  ),
+                  trailing: _locked.contains(thread.id)
+                      ? Icon(Icons.lock_rounded,
+                          size: 14, color: t.tintTertiary)
+                      : null,
+                  onTap: () async {
+                    // 先把 navigator 抓在手上：过锁那一步是异步的，回来之后
+                    // 这个 context 可能已经不在树上了。
+                    final navigator = Navigator.of(context);
+                    if (thread.id == widget.currentThreadId) {
+                      navigator.pop();
+                      return;
+                    }
+                    if (!await _passGate(thread)) return;
+                    if (!mounted) return;
                     navigator.pop();
-                    return;
-                  }
-                  if (!await _passGate(thread)) return;
-                  if (!mounted) return;
-                  navigator.pop();
-                  widget.onSelect(thread.id);
-                },
+                    widget.onSelect(thread.id);
+                  },
                 ),
               ),
             );
@@ -643,11 +644,8 @@ class _ChatDrawerState extends State<ChatDrawer> {
       model: model,
       title: thread.title,
       persona: persona,
-      opening: messages
-              .where((m) => m.role == 'user')
-              .firstOrNull
-              ?.content ??
-          '',
+      opening:
+          messages.where((m) => m.role == 'user').firstOrNull?.content ?? '',
       spoken: <String>[
         for (final m in messages)
           if (m.role == 'user' || m.role == 'assistant') m.content,

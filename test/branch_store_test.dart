@@ -508,7 +508,6 @@ void main() {
     });
   });
 
-
   group('删会话之后库里还剩什么', () {
     late Directory tmp;
     late ChatStore store;
@@ -687,8 +686,7 @@ void main() {
       final id = await store.createThread('甲');
       await store.append(id, toolStep('echo hi', ms: 5));
       final full = (await store.messages(id)).last;
-      final paged =
-          (await store.tailMessages(id, tokenBudget: 1000000)).last;
+      final paged = (await store.tailMessages(id, tokenBudget: 1000000)).last;
 
       expect(paged.messageId, full.messageId);
       expect(paged.role, full.role);

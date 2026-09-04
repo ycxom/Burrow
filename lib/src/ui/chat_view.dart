@@ -738,9 +738,8 @@ class _SummaryDividerState extends State<SummaryDivider> {
             duration: const Duration(milliseconds: 160),
             curve: Curves.easeOut,
             alignment: Alignment.topCenter,
-            child: _expanded
-                ? _card(t)
-                : const SizedBox(width: double.infinity),
+            child:
+                _expanded ? _card(t) : const SizedBox(width: double.infinity),
           ),
         ],
       ),
@@ -825,6 +824,9 @@ class ChatBubble extends StatelessWidget {
   /// 这条消息所在分支点一共有几个版本。1 或 0 = 没得选，不画切换器。
   final int variantCount;
 
+  /// 删掉正在看的那个版本。null = 不给删。
+  final VoidCallback? onDeleteVariant;
+
   /// 正在看第几个版本，从 0 数。
   final int variantIndex;
 
@@ -865,6 +867,7 @@ class ChatBubble extends StatelessWidget {
     this.reasoningStartedAt,
     this.reasoningMs = 0,
     this.variantCount = 0,
+    this.onDeleteVariant,
     this.variantIndex = 0,
     this.onSwitchVariant,
     this.lastInGroup = true,
@@ -1016,6 +1019,7 @@ class ChatBubble extends StatelessWidget {
             total: variantCount,
             color: timeColor,
             onSwitch: onSwitchVariant!,
+            onDelete: onDeleteVariant,
           )
         : null;
 
@@ -1989,12 +1993,16 @@ class _VariantSwitcher extends StatelessWidget {
     required this.total,
     required this.color,
     required this.onSwitch,
+    this.onDelete,
   });
 
   final int index;
   final int total;
   final Color color;
   final ValueChanged<int> onSwitch;
+
+  /// 删掉正在看的这一版。null = 不给删。
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -2029,6 +2037,16 @@ class _VariantSwitcher extends StatelessWidget {
           enabled: enabled,
           disabled: disabled,
         ),
+        // 删掉这一版。压得很轻、而且只在这个切换器里出现 ——
+        // 没有多个版本的时候它不该存在，那时"删这一版"就是"删这条消息"，
+        // 那是另一个动作，有它自己的入口和确认。
+        if (onDelete != null)
+          _Arrow(
+            icon: Icons.delete_outline,
+            onTap: onDelete,
+            enabled: enabled,
+            disabled: disabled,
+          ),
       ],
     );
   }

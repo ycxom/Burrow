@@ -26,7 +26,8 @@ void main() {
       final sealed = cipher.seal(plain)!;
       // 这就是整件事的意义：拿到 .db 文件的人不该读得出内容。
       expect(sealed, isNot(contains(plain)));
-      expect(utf8.decode(base64.decode(sealed.substring(3)), allowMalformed: true),
+      expect(
+          utf8.decode(base64.decode(sealed.substring(3)), allowMalformed: true),
           isNot(contains(plain)));
     });
 

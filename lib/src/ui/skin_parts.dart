@@ -321,28 +321,43 @@ class SkinPartsResolver {
 
     return _copy(
       base,
-      bubbleLayout: pick('bubble', const <String, SkinBubbleLayout>{
-        'tail': SkinBubbleLayout.tail,
-        'plain': SkinBubbleLayout.plain,
-        'card': SkinBubbleLayout.card,
-      }, base.bubbleLayout),
-      timePosition: pick('time', const <String, SkinTimePosition>{
-        'inside': SkinTimePosition.inside,
-        'outside': SkinTimePosition.outside,
-        'hidden': SkinTimePosition.hidden,
-      }, base.timePosition),
-      avatarPosition: pick('avatar', const <String, SkinAvatarPosition>{
-        'side': SkinAvatarPosition.side,
-        'none': SkinAvatarPosition.none,
-      }, base.avatarPosition),
-      composerMode: pick('composer', const <String, SkinComposerMode>{
-        'floating': SkinComposerMode.floating,
-        'docked': SkinComposerMode.docked,
-      }, base.composerMode),
-      headerStyle: pick('header', const <String, SkinHeaderStyle>{
-        'bar': SkinHeaderStyle.bar,
-        'transparent': SkinHeaderStyle.transparent,
-      }, base.headerStyle),
+      bubbleLayout: pick(
+          'bubble',
+          const <String, SkinBubbleLayout>{
+            'tail': SkinBubbleLayout.tail,
+            'plain': SkinBubbleLayout.plain,
+            'card': SkinBubbleLayout.card,
+          },
+          base.bubbleLayout),
+      timePosition: pick(
+          'time',
+          const <String, SkinTimePosition>{
+            'inside': SkinTimePosition.inside,
+            'outside': SkinTimePosition.outside,
+            'hidden': SkinTimePosition.hidden,
+          },
+          base.timePosition),
+      avatarPosition: pick(
+          'avatar',
+          const <String, SkinAvatarPosition>{
+            'side': SkinAvatarPosition.side,
+            'none': SkinAvatarPosition.none,
+          },
+          base.avatarPosition),
+      composerMode: pick(
+          'composer',
+          const <String, SkinComposerMode>{
+            'floating': SkinComposerMode.floating,
+            'docked': SkinComposerMode.docked,
+          },
+          base.composerMode),
+      headerStyle: pick(
+          'header',
+          const <String, SkinHeaderStyle>{
+            'bar': SkinHeaderStyle.bar,
+            'transparent': SkinHeaderStyle.transparent,
+          },
+          base.headerStyle),
     );
   }
 }

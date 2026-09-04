@@ -132,7 +132,8 @@ class ChatSkinStore extends ChangeNotifier {
       ));
       return null;
     } on FileSystemException catch (e) {
-      _broken.add(BrokenSkin(directory: name, reasons: <String>['读取失败：${e.message}']));
+      _broken.add(
+          BrokenSkin(directory: name, reasons: <String>['读取失败：${e.message}']));
       return null;
     }
   }

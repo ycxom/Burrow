@@ -47,8 +47,7 @@ const _envelope = 'b1:';
 const _iterations = 120000;
 
 class DbCipher {
-  DbCipher(this._key)
-      : assert(_key.length == 32, '要 256 位密钥');
+  DbCipher(this._key) : assert(_key.length == 32, '要 256 位密钥');
 
   final Uint8List _key;
 
@@ -103,7 +102,8 @@ class DbCipher {
       List<int>.generate(12, (_) => _random.nextInt(256)),
     );
     final cipher = GCMBlockCipher(AESEngine())
-      ..init(true, AEADParameters(KeyParameter(_key), 128, nonce, Uint8List(0)));
+      ..init(
+          true, AEADParameters(KeyParameter(_key), 128, nonce, Uint8List(0)));
     final sealed = cipher.process(Uint8List.fromList(utf8.encode(plain)));
     return '$_envelope${base64.encode(<int>[...nonce, ...sealed])}';
   }

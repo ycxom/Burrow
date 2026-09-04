@@ -189,8 +189,7 @@ class AccountQuota {
   static AccountQuota? fromJson(Map<String, Object?> j) {
     final plan = j['plan'] as String?;
     if (plan == null || plan.isEmpty) return null;
-    DateTime? at(Object? raw) =>
-        raw is String ? DateTime.tryParse(raw) : null;
+    DateTime? at(Object? raw) => raw is String ? DateTime.tryParse(raw) : null;
     return AccountQuota(
       plan: plan,
       detail: j['detail'] as String?,

@@ -117,3 +117,60 @@ int summaryBoundaryIndex(
   }
   return 0;
 }
+
+/// [historyIndexOfVisible] 的反向：`history` 的下标对回界面上的位置。
+///
+/// **这个方向也需要兜底，理由和正向完全一样。** 上面那段说过，当前这一轮
+/// 刚发出去的用户消息在两个列表里是**两个不同的实例** —— 界面在 `_send` 里
+/// new 了一条，AgentLoop 在自己那边又 new 了一条。
+///
+/// 只用 `identical` 找的话，这一条永远找不到界面上的对应位置。它造成过一个
+/// 很难查的 bug：刚发完消息就点「重新生成」，分支 id 只挂到了 `history` 那条
+/// 上，界面那条还是干净的 —— 于是分支数据全都存进了库，界面却一个版本切换器
+/// 都不画，看起来就是"重新生成不创建分支点"。而**重开一次会话就好了**（那时
+/// 两个列表装的是同一批实例），于是它表现得像个随机故障。
+///
+/// 兜底的规则和正向逐字相同：只对用户和助手消息按序号找，助手消息还要求两边
+/// 条数一致。对不上就返回 -1，让调用方放弃 —— 猜错的后果是把分支 id 挂到
+/// 另一条消息上。
+int visibleIndexOfHistory(
+  List<ChatMessage> visible,
+  List<ChatMessage> history,
+  int historyIndex,
+) {
+  if (historyIndex < 0 || historyIndex >= history.length) return -1;
+  final target = history[historyIndex];
+
+  for (var i = 0; i < visible.length; i++) {
+    if (identical(visible[i], target)) return i;
+  }
+
+  final role = target.role;
+  if (role != 'user' && role != 'assistant') return -1;
+
+  // 助手消息只在两边条数相同时才兜底，理由和正向那个判断逐字相同：
+  // 工具循环里 history 会有 assistant/tool/assistant 好几条而界面上合并成
+  // 一条，条数对不上就说明发生过合并，序号不可信。
+  if (role == 'assistant' &&
+      _countOf(visible, 'assistant') != _countOf(history, 'assistant')) {
+    return -1;
+  }
+
+  // **从后往前数，不是从前往后。**
+  //
+  // `visible` 是 `history` 的一段尾巴（分页加载只往界面上接最近的那些），
+  // 从前往后数的话，前面缺了几条就整体偏移几位，挂到一条更早的消息上 ——
+  // 而从末尾数起，两个列表的尾部是对齐的。
+  var after = 0;
+  for (var i = historyIndex + 1; i < history.length; i++) {
+    if (history[i].role == role) after++;
+  }
+
+  var seen = 0;
+  for (var i = visible.length - 1; i >= 0; i--) {
+    if (visible[i].role != role) continue;
+    if (seen == after) return i;
+    seen++;
+  }
+  return -1;
+}

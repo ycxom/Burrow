@@ -67,8 +67,8 @@ void main() {
       // 删除对话框明确承诺了这两样不受影响，而那个承诺是对的：workspace 是
       // 任务的产物，用户可能还要用里面的文件。
       expect(await File('${tasks.path}/t1/workspace/main.py').exists(), isTrue);
-      expect(await File('${tasks.path}/t1/meta/snapshots.json').exists(),
-          isTrue);
+      expect(
+          await File('${tasks.path}/t1/meta/snapshots.json').exists(), isTrue);
     });
 
     test('只动指定的那个会话', () async {
@@ -109,8 +109,7 @@ void main() {
     });
 
     Future<int> segments() async {
-      final r =
-          await store.raw.rawQuery('SELECT COUNT(*) AS n FROM segments');
+      final r = await store.raw.rawQuery('SELECT COUNT(*) AS n FROM segments');
       return r.first['n']! as int;
     }
 
@@ -229,7 +228,9 @@ void main() {
       await store.saveVariant(
         threadId: id,
         branchId: 'b1',
-        tail: <ChatMessage>[withImages('上一版带着图', <String>[inVariant])],
+        tail: <ChatMessage>[
+          withImages('上一版带着图', <String>[inVariant])
+        ],
       );
 
       await reclaimOrphanImages(tasks, await store.referencedImagePaths());
@@ -276,7 +277,8 @@ void main() {
       final path = await image(id, 'x');
       await store.append(id, withImages('一条', <String>[path]));
       // 把那一列改成解析不了的东西。
-      await store.raw.update('messages', <String, Object?>{'images': '不是 JSON'});
+      await store.raw
+          .update('messages', <String, Object?>{'images': '不是 JSON'});
 
       await reclaimOrphanImages(tasks, await store.referencedImagePaths());
 

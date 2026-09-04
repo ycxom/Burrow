@@ -234,7 +234,8 @@ class OverflowManager {
   /// checkpoint 是历史的下标，所以要按当前历史长度夹一次：编辑重发、
   /// 回到某条消息、切换分支都会把历史截短，而存下来的那个下标不知道。
   /// 越界的话 `history.skip()` 会安静地返回空窗口 —— 模型当场失忆。
-  void restore({String? summary, required int checkpoint, required int historyLength}) {
+  void restore(
+      {String? summary, required int checkpoint, required int historyLength}) {
     _summary = (summary?.trim().isEmpty ?? true) ? null : summary!.trim();
     _checkpoint = checkpoint.clamp(0, historyLength);
     _lastError = null;

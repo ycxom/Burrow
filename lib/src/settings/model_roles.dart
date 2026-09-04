@@ -98,9 +98,7 @@ class ModelRef {
 
   @override
   bool operator ==(Object other) =>
-      other is ModelRef &&
-      other.channelId == channelId &&
-      other.model == model;
+      other is ModelRef && other.channelId == channelId && other.model == model;
 
   @override
   int get hashCode => Object.hash(channelId, model);

@@ -37,8 +37,7 @@ Widget host({
                   anchor: anchor,
                   builder: items ??
                       (menuContext, refresh) => <Widget>[
-                            const MenuAction(
-                                icon: Icons.image, label: '从相册选择'),
+                            const MenuAction(icon: Icons.image, label: '从相册选择'),
                             const MenuAction(
                               icon: Icons.auto_awesome,
                               label: '对话模型',
@@ -85,8 +84,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final menu = tester.getRect(find.text('从相册选择'));
-    expect(menu.bottom, lessThan(button.top),
-        reason: '往下长就会盖住用户正盯着的那个按钮');
+    expect(menu.bottom, lessThan(button.top), reason: '往下长就会盖住用户正盯着的那个按钮');
     // 贴着按钮那一侧对齐 —— 长在屏幕另一头的话，手指和视线就分家了。
     expect(menu.left, lessThan(tester.view.physicalSize.width / 2));
   });

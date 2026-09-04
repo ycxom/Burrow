@@ -237,9 +237,7 @@ class _GateScreenState extends State<_GateScreen> {
                 ],
                 const SizedBox(height: 14),
                 Text(
-                  _creating
-                      ? '记不住就写下来。没有后门，也没有找回 —— 有的话备份就不安全了。'
-                      : '',
+                  _creating ? '记不住就写下来。没有后门，也没有找回 —— 有的话备份就不安全了。' : '',
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodySmall,
                 ),

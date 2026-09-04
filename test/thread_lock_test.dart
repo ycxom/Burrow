@@ -149,8 +149,7 @@ void main() {
     });
 
     test('自定义题用存下来的那个答案', () {
-      const custom =
-          LockChallenge.custom(prompt: '那台机器叫什么', answer: 'rack-01');
+      const custom = LockChallenge.custom(prompt: '那台机器叫什么', answer: 'rack-01');
       expect(challengeMatches(custom, facts, 'RACK 01'), isTrue);
       expect(challengeMatches(custom, facts, 'rack-02'), isFalse);
     });
@@ -180,7 +179,8 @@ void main() {
         isFalse,
       );
       // 少答一道也不行。
-      expect(challengesMatch(lock, facts, <int, String>{0: 'glm-4.6'}), isFalse);
+      expect(
+          challengesMatch(lock, facts, <int, String>{0: 'glm-4.6'}), isFalse);
     });
 
     test('一道题都没设的锁，找回这条路走不通', () {
@@ -216,7 +216,9 @@ void main() {
         random: Random(3),
       );
       // 两个看起来一样的选项，用户选哪个都对 —— 那道题就废了。
-      expect(choices.where((c) => normalizeAnswer(c) == normalizeAnswer('glm-4.6')),
+      expect(
+          choices
+              .where((c) => normalizeAnswer(c) == normalizeAnswer('glm-4.6')),
           hasLength(1));
     });
 
