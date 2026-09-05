@@ -1,5 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 生成中把进程钉住，见 GenerationService。没有这两条的话，用户按一下
+         Home 键，正在跑的那一轮就可能连同进程一起被系统收走。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 前台服务那条通知要显示出来需要它。**没授权也不影响服务本身跑**，
+         只是那条通知不出现 —— 所以不主动弹权限框去打断第一次使用。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 让用户能把 Burrow 加进「不受电池优化限制」的名单。
+         前台服务只挡得住系统标准的那套回收；国内那几家 ROM（以及三星的
+         「深度睡眠应用」）会在锁屏几分钟后照样把后台进程冻住，唯一的解法
+         是让用户亲手放行。**只在他主动点的时候才弹**，见 BatteryPolicy。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <application
         android:label="Burrow"
         android:name="${applicationName}"
@@ -28,6 +40,10 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <service
+            android:name=".GenerationService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

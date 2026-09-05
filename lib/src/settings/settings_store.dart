@@ -139,6 +139,8 @@ class SettingsStore extends ChangeNotifier {
 
   static const _prefix = 'burrow.llm.';
   static const _keyTerminalDefault = 'burrow.terminalMode.default';
+  static const _keyLastThread = 'burrow.ui.lastThread';
+  static const _keyBatteryHint = 'burrow.ui.batteryHintShown';
   static const _keyImageMode = 'burrow.llm.imageMode';
   static const _keySystemPrompt = 'burrow.llm.systemPrompt';
   static const _keyThinkingEffort = 'burrow.llm.thinkingEffort';
@@ -521,6 +523,36 @@ class SettingsStore extends ChangeNotifier {
       if (v.name == name) return v;
     }
     return fallback;
+  }
+
+  /// 上次打开的是哪个会话。null = 上次停在新对话上。
+  ///
+  /// **这条存在是因为 app 会被系统回收。** 切出去几分钟再回来，Android
+  /// 很可能已经把进程杀了；不记这一条的话，回来永远是一个空白的「新对话」
+  /// —— 用户看到的是"用着用着自己退出去了"，而聊天记录其实一条没少，
+  /// 只是没人把他送回原来那间屋子。
+  ///
+  /// 不进构造函数、也不 notifyListeners：它只在启动那一刻读一次，
+  /// 之后就是纯粹的写入。
+  String? get lastThreadId => _prefs?.getString(_keyLastThread);
+
+  Future<void> setLastThreadId(String? id) async {
+    if (id == null) {
+      await _prefs?.remove(_keyLastThread);
+      return;
+    }
+    await _prefs?.setString(_keyLastThread, id);
+  }
+
+  /// 「后台可能被冻住」那句提示是不是已经说过了。
+  ///
+  /// **只说一次。** 它问的是"要不要让这个 app 一直在后台耗电"，反复问
+  /// 只会把人逼到把整个 app 的通知和权限一起关掉；而且第一次说完之后，
+  /// 设置里那一行一直在那儿，想开随时能开。
+  bool get batteryHintShown => _prefs?.getBool(_keyBatteryHint) ?? false;
+
+  Future<void> markBatteryHintShown() async {
+    await _prefs?.setBool(_keyBatteryHint, true);
   }
 
   Future<void> setTemperature(double value) async {

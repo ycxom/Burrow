@@ -344,6 +344,63 @@ void _modelRoleTests() {
       expect(channels.byId('c1')!.model, 'glm-5');
     });
 
+    test('投影出来的配置带着渠道身份', () async {
+      // 客户端上挂着的那几个回调（取密钥、记配额）要靠它知道"这次请求属于
+      // 谁"。不带的话它们只能去问"当前渠道"，而那在每个聊天室各有各的模型
+      // 策略之后就是错的答案。
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      expect(channels.configFor(channels.byId('c2')).channelId, 'c2');
+      expect(LlmConfig.empty.channelId, isNull);
+    });
+
+    test('配角配置带的也是它自己那个渠道的身份', () async {
+      final channels = ChannelStore.forTest(
+        channels: [a, b],
+        activeId: 'c1',
+        keys: {'c2': 'sk-openai'},
+      );
+      await channels.assignRole(ModelRole.vision,
+          const ModelRef(channelId: 'c2', model: 'gpt-5-vision'));
+      final config =
+          channels.configForRole(channels.resolveRole(ModelRole.vision)!);
+      expect(config.channelId, 'c2');
+    });
+
+    test('"这份配置属于谁"问的是配置，不是当前渠道', () async {
+      // **这一条是一个真实 bug 的墓碑。** 每个聊天室有了自己的模型策略之后，
+      // 主客户端的配置跟着当前打开的会话走，而取密钥那几个回调还在问
+      // `active` —— 于是请求发往 B 的地址、密钥取的却是 A 的，那个渠道
+      // 怎么配都是 401，而渠道管理里它看起来完全正常。
+      final channels = ChannelStore.forTest(
+        channels: [a, b],
+        activeId: 'c1',
+        keys: {'c1': 'sk-local', 'c2': 'sk-openai'},
+      );
+      final usingB = channels.configFor(channels.byId('c2'));
+      expect(channels.channelOf(usingB)!.id, 'c2');
+      expect(channels.apiKeyOf(channels.channelOf(usingB)!), 'sk-openai');
+      // 全局那个当前渠道没被碰过。
+      expect(channels.activeId, 'c1');
+    });
+
+    test('认不出身份的配置退回当前渠道', () async {
+      // LlmConfig.empty 和旧的迁移路径没有这个字段，那时的行为要和加它
+      // 之前一样 —— 否则升级的人会在第一次发送时撞上"没有渠道"。
+      final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
+      expect(channels.channelOf(LlmConfig.empty)!.id, 'c1');
+      expect(
+        channels
+            .channelOf(const LlmConfig(
+              channelId: '已经删掉的渠道',
+              baseUrl: '',
+              apiKey: '',
+              model: '',
+            ))!
+            .id,
+        'c1',
+      );
+    });
+
     test('删掉渠道会连指向它的分工一起清掉', () async {
       final channels = ChannelStore.forTest(channels: [a, b], activeId: 'c1');
       await channels.assignRole(ModelRole.embedding,

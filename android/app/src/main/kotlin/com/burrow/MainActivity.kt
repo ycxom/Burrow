@@ -5,6 +5,8 @@ import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.os.PowerManager
+import android.provider.Settings
 import com.burrow.bridge.PtyBridge
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -60,6 +62,37 @@ class MainActivity : FlutterActivity() {
                     confirmDeviceCredential(call.argument<String>("reason"), result)
                 }
 
+                // 生成期间把进程钉住，见 GenerationService。
+                "keepAliveStart" -> {
+                    try {
+                        GenerationService.start(this, call.argument<String>("text"))
+                        result.success(true)
+                    } catch (e: Exception) {
+                        // 起不来不该让这一轮对话失败：没有前台服务只是"退到
+                        // 后台可能被杀"，而抛上去会变成一条看不懂的报错气泡。
+                        result.success(false)
+                    }
+                }
+
+                // 这个 app 现在受不受电池优化限制。
+                "batteryOptimizationIgnored" -> {
+                    result.success(isIgnoringBatteryOptimizations())
+                }
+
+                // 弹系统那个「允许后台运行？」的框。
+                "requestIgnoreBatteryOptimizations" -> {
+                    result.success(requestIgnoreBatteryOptimizations())
+                }
+
+                "keepAliveStop" -> {
+                    try {
+                        GenerationService.stop(this)
+                    } catch (_: Exception) {
+                        // 停不掉最多是通知多留一会儿，不值得打断任何事。
+                    }
+                    result.success(true)
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -106,6 +139,46 @@ class MainActivity : FlutterActivity() {
      * 没设锁屏时返回 `unavailable` 而不是失败：那种情况用户怎么试都过不了，
      * 界面上要能说清楚"去系统设置里加一个锁屏"。
      */
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val power = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return power.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    /**
+     * 请求把这个 app 放进「不受电池优化限制」的名单。
+     *
+     * 两条路，按顺序试：
+     *
+     * 1. `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` —— 一个系统弹窗，
+     *    点一下就完事。**但有些 ROM 把它锁了**（Google Play 也对这个 action
+     *    有品类限制），那时 startActivity 会直接抛。
+     * 2. `ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS` —— 那份名单的设置页。
+     *    要用户自己在列表里找到 Burrow，麻烦，但哪儿都能开。
+     *
+     * 返回值只表示"界面弹出来了"，**不表示用户点了允许** —— 系统不会把结果
+     * 回调给我们。Dart 侧要在回到前台之后重新查一次
+     * [isIgnoringBatteryOptimizations]，那才是真话。
+     */
+    private fun requestIgnoreBatteryOptimizations(): Boolean {
+        if (isIgnoringBatteryOptimizations()) return true
+        val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            .setData(android.net.Uri.parse("package:$packageName"))
+        try {
+            startActivity(direct)
+            return true
+        } catch (_: Exception) {
+            // 落到设置页那条路。
+        }
+        return try {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            true
+        } catch (_: Exception) {
+            // 两条都开不了（某些定制 ROM 把这两个页面都删了）。
+            // Dart 侧会退回一句"到系统设置里手动找"。
+            false
+        }
+    }
+
     private fun confirmDeviceCredential(reason: String?, result: MethodChannel.Result) {
         if (pendingCredentialResult != null) {
             result.error("auth_busy", "已经在验证了", null)

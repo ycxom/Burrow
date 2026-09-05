@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import '../agent/agent_loop.dart';
+import '../net/battery_policy.dart';
 import '../context/overflow_manager.dart';
 import '../sandbox/sandbox_session.dart';
 import '../data/chat_store.dart';
@@ -68,9 +70,50 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage>
+    with WidgetsBindingObserver {
   late double _temperature = widget.store.temperature;
   late bool _streamOutput = widget.store.streamOutput;
+
+  /// 这个 app 现在受不受电池优化限制。null = 还没查出来。
+  bool? _batteryFree;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_refreshBatteryPolicy());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 那个系统弹窗没有回调 —— 用户点没点允许，只能等他回到这一页之后
+    // 重新查一次。不查的话这一行会一直停在"受限制"，看起来像点了没用。
+    if (state == AppLifecycleState.resumed) unawaited(_refreshBatteryPolicy());
+  }
+
+  Future<void> _refreshBatteryPolicy() async {
+    final free = await BatteryPolicy.isIgnored();
+    if (mounted) setState(() => _batteryFree = free);
+  }
+
+  Future<void> _requestBatteryPolicy() async {
+    final opened = await BatteryPolicy.request();
+    if (opened || !mounted) return;
+    // 两条系统路径都开不了（某些定制 ROM 把这两个页面都删了）。
+    // 说清楚该去哪儿找，比弹一句"失败"有用。
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('这台设备打不开那个系统页面。'
+          '请到「设置 → 应用 → Burrow → 电池」里选「无限制」。'),
+      duration: Duration(seconds: 6),
+    ));
+  }
 
   /// 子页改的是同一批 store，回来时要重建 —— 否则列表里的副标题
   /// 还停在旧值上，看起来像"改了没生效"。
@@ -423,6 +466,66 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
             ),
           ),
+          if (BatteryPolicy.supported) ...<Widget>[
+            const SizedBox(height: 18),
+            const _Header(
+              icon: Icons.battery_saver_outlined,
+              title: '后台运行',
+              subtitle: '切出去之后，这一轮还能不能跑完',
+            ),
+            Card(
+              clipBehavior: Clip.antiAlias,
+              child: Column(
+                children: <Widget>[
+                  ListTile(
+                    leading: Icon(
+                      _batteryFree == false
+                          ? Icons.battery_alert_outlined
+                          : Icons.battery_charging_full_outlined,
+                      color: _batteryFree == false ? scheme.error : null,
+                    ),
+                    title: const Text('不受电池优化限制'),
+                    subtitle: Text(
+                      switch (_batteryFree) {
+                        // 说清楚"会发生什么"，而不是复述开关名。用户要判断的
+                        // 是"我现在切出去会不会丢东西"。
+                        null => '正在检查…',
+                        true => '已放行。切到别的 app 或者息屏，'
+                            '正在生成的那一轮会继续跑完',
+                        false => '受限制。生成中切出去或者息屏几分钟，'
+                            '系统可能把这一轮冻住 —— 回来看到的是半句话',
+                      },
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                    trailing: _batteryFree == false
+                        ? const Icon(Icons.chevron_right)
+                        : null,
+                    onTap: _batteryFree == false ? _requestBatteryPolicy : null,
+                  ),
+                  if (_batteryFree == false) ...<Widget>[
+                    const Divider(height: 1),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
+                      child: Text(
+                        // 把代价说在前面。这一项换来的是"生成不被打断"，
+                        // 代价是这个 app 在后台有耗电的自由 —— 不说清楚
+                        // 就是在骗用户点同意。
+                        '生成中 Burrow 会挂一条通知把进程钉住，但小米、华为、'
+                        '三星这些系统还有自己一层后台冻结，前台服务挡不住它。'
+                        '放行之后 Burrow 才能在后台把话说完；'
+                        '代价是它在后台有耗电的自由 —— 不生成时它不做任何事。',
+                        style: TextStyle(
+                          fontSize: 11,
+                          height: 1.5,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           Text(
             'API Key 保存在设备安全区域。模型可调用终端和文件工具，写入与高风险命令仍受审批和检查点保护。',

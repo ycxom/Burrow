@@ -375,10 +375,14 @@ Future<void> _boot({
     providerName: legacyPrefs.getString('burrow.llm.provider') ?? '',
   );
 
+  /// 主客户端**这一刻**指着哪个渠道。规则见 [ChannelStore.channelOf] ——
+  /// 一句话：不是 `channels.active`，是这个会话自己选的那个。
+  Channel? clientChannel() => channels.channelOf(llm.config);
+
   // OAuth 渠道的 access_token 每次请求前现取 —— 存进配置就等于存了一份
   // 马上失效的副本。
   llm.bearerProvider = () async {
-    final channel = channels.active;
+    final channel = clientChannel();
     if (channel == null || !channel.usesOAuth) {
       return channel == null ? '' : channels.apiKeyOf(channel);
     }
@@ -388,17 +392,17 @@ Future<void> _boot({
     return accounts.validToken(account);
   };
   llm.chatGptAccountIdProvider = () async {
-    final channel = channels.active;
+    final channel = clientChannel();
     return channel == null ? null : accounts.credentialFor(channel)?.accountId;
   };
 
   // ChatGPT 的真实余量只出现在聊天响应头上，没有独立的查询接口。所以它是
   // 反向推进来的：客户端读到头就回调，我们记到**当时那个渠道绑的账号**上。
   //
-  // 现取 channels.active 而不是闭包里存一份：一次请求发出去到响应回来之间，
-  // 用户完全可能已经切了渠道，记到新渠道头上就是错的账。
+  // 现取而不是闭包里存一份：一次请求发出去到响应回来之间，用户完全可能
+  // 已经切了会话，记到别人头上就是错的账。
   llm.onRateLimit = (quota) {
-    final channel = channels.active;
+    final channel = clientChannel();
     if (channel == null || !channel.usesOAuth) return;
     unawaited(accounts.noteQuota(
       channel.oauthProviderId!,
@@ -418,9 +422,13 @@ Future<void> _boot({
   /// 而摘要在长对话里会反复发生。
   Future<String> summarize(String systemPrompt, String payload) async {
     final bound = role(ModelRole.summary);
+    // 比的是**主客户端现在指着哪个渠道**，不是全局那个当前渠道。比错的话，
+    // 一条指向 A 的摘要指派会在"这个会话用 B"时走主客户端 —— 于是 A 的
+    // 摘要模型名被发到 B 的地址上，而 summarize 出错时返回空串不抛，
+    // 表现是"摘要一直摘不出东西"，没有任何迹象。
     if (bound == null ||
         bound.inherited ||
-        bound.channel.id == channels.activeId) {
+        bound.channel.id == llm.config.channelId) {
       return llm.summarize(systemPrompt, payload);
     }
     final client = ConfigurableLlmClient(

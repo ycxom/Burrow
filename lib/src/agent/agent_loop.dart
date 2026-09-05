@@ -616,9 +616,9 @@ class AgentLoop {
     if (index < 0) return;
     final input = history[index].content;
     history.removeRange(index, history.length);
-    // 历史短了，摘要的 checkpoint 要跟着收 —— 它是个下标，落在末尾之后的话
-    // 窗口里一条消息都不剩，模型当场失忆。
-    overflow.clampTo(history.length);
+    // 历史短了，摘要状态要跟着收。砍进摘要覆盖的那一段时它会整份作废 ——
+    // 见 [OverflowManager.truncateTo]。
+    overflow.truncateTo(history.length);
     await send(input);
   }
 
@@ -636,7 +636,7 @@ class AgentLoop {
     final target = history[index];
     final dropped = history.sublist(index).toList(growable: false);
     history.removeRange(index, history.length);
-    overflow.clampTo(history.length);
+    overflow.truncateTo(history.length);
 
     // 老会话的消息没有检查点记录（v3 之前的库）。这时只截对话，
     // 并让调用方知道文件没回滚 —— 假装回滚过才是危险的。

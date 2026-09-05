@@ -6,6 +6,8 @@
 ///   - 摘要状态不落盘 —— 重开会话就归零，整段历史重新原样发出去
 library;
 
+import 'dart:async';
+
 import 'package:burrow/src/context/overflow_manager.dart';
 import 'package:burrow/src/llm/llm_client.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -233,33 +235,77 @@ void main() {
       expect(overflow.hasSummary, isFalse);
     });
 
-    test('前面补进一段历史时 checkpoint 跟着往后挪', () {
-      // 打开会话只先读最后一页，剩下的在后台补进历史**开头**。checkpoint 是
-      // 历史的下标 —— 不跟着挪的话，「摘要覆盖到第几条」会指到一段完全不
-      // 相干的消息上：窗口里冒出一批本该被摘要盖住的原文，而真正该显示的
-      // 那几条反而没了。
+    test('历史补齐之后装的是那个绝对下标，不是加出来的', () {
+      // **这里以前是 `shiftBy(补进来多少条)`，双重计数。**
+      //
+      // 100 条历史、存的 checkpoint = 60、首屏读 40 条：老做法先按那 40 条
+      // 把 60 夹成 40，补完再 +60 = 100 —— 正好是历史长度，
+      // `history.skip(100)` 是空的，窗口里一条消息都不剩。
       final overflow = OverflowManager(summarize: (_, __) async => '');
-      final log = history(10);
-      overflow.restore(summary: '摘要', checkpoint: 4, historyLength: log.length);
-
-      overflow.clampTo(30); // 历史变长了，夹不动
-      overflow.shiftBy(20);
-      expect(overflow.checkpoint, 24);
+      // 首屏只有 40 条，那一刻先当成"什么都没被摘要盖住"。
+      overflow.restore(summary: '摘要', checkpoint: 0, historyLength: 40);
+      expect(overflow.checkpoint, 0);
+      // 历史补齐到 100 条，把存下来的那个绝对下标装回去。
+      overflow.adoptCheckpoint(60, 100);
+      expect(overflow.checkpoint, 60);
     });
 
-    test('没摘过的时候不挪 —— 0 不是一个位置', () {
+    test('装回去的下标越界时夹住', () {
       final overflow = OverflowManager(summarize: (_, __) async => '');
-      overflow.shiftBy(20);
-      // checkpoint 为 0 表示"一条都没被摘要盖住"。把它挪到 20 就等于凭空
-      // 声称前 20 条已经被摘要覆盖了，而摘要压根不存在。
+      overflow.adoptCheckpoint(500, 100);
+      expect(overflow.checkpoint, 100);
+      overflow.adoptCheckpoint(-3, 100);
       expect(overflow.checkpoint, 0);
     });
 
-    test('历史被截短后 clampTo 把 checkpoint 拉回来', () {
+    test('截断点在摘要范围之后：摘要留着，checkpoint 不动', () {
       final overflow = OverflowManager(summarize: (_, __) async => '');
       overflow.restore(summary: '摘要', checkpoint: 8, historyLength: 20);
-      overflow.clampTo(3);
-      expect(overflow.checkpoint, 3);
+      expect(overflow.truncateTo(12), isFalse);
+      expect(overflow.checkpoint, 8);
+      expect(overflow.summary, '摘要');
+    });
+
+    test('正好截到边界上也算没动', () {
+      final overflow = OverflowManager(summarize: (_, __) async => '');
+      overflow.restore(summary: '摘要', checkpoint: 8, historyLength: 20);
+      // history[0..8) 被摘要盖住，截到 8 条 = 那一段一条不少。
+      expect(overflow.truncateTo(8), isFalse);
+      expect(overflow.summary, '摘要');
+    });
+
+    test('截进摘要覆盖的那一段：整份作废', () async {
+      // **这一条是"反复重新生成把压缩系统搞坏"的修复。**
+      //
+      // 摘要是一整块滚动文本，没法从中间减掉一段。留着它，被丢弃的那个
+      // 回答就会在下一次压缩时作为「已有摘要」原样喂回去 —— 每重新生成
+      // 一次叠一层，最后模型看到的前情提要里有好几个互相矛盾的版本。
+      final overflow = OverflowManager(summarize: (_, __) async => '');
+      overflow.restore(summary: '摘要', checkpoint: 8, historyLength: 20);
+      expect(overflow.truncateTo(5), isTrue);
+      expect(overflow.checkpoint, 0);
+      expect(overflow.summary, isNull);
+      expect(overflow.hasSummary, isFalse);
+    });
+
+    test('作废之后在途的那次摘要不会把旧状态复活', () async {
+      // 重新生成时旧的那次摘要请求可能还在路上。它是照着旧历史算的，
+      // 回来之后写进去就等于把刚作废的东西又装了回来。
+      final gate = Completer<String>();
+      final overflow = OverflowManager(
+        summarize: (_, __) => gate.future,
+        trigger: OverflowTrigger.messageCount,
+        messageThreshold: 2,
+      );
+      final log = history(20);
+      final pending = overflow.onMessageAdded(log);
+      // 这一刻 checkpoint 还是 0（摘要没落地），但在途那次正打算推进到
+      // 18 —— 把历史砍到 5 条就是把它正在读的那一段切了。
+      overflow.truncateTo(5);
+      gate.complete('一段照着旧历史算出来的摘要');
+      expect(await pending, isFalse);
+      expect(overflow.hasSummary, isFalse);
+      expect(overflow.checkpoint, 0);
     });
   });
 }

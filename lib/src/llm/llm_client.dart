@@ -35,6 +35,20 @@ import 'oauth.dart';
 import '../context/overflow_manager.dart';
 
 class LlmConfig {
+  /// 这份配置是从**哪个渠道**投影出来的。null = 不知道（[LlmConfig.empty]、
+  /// 手搓的配置、以及旧版迁移那条路）。
+  ///
+  /// 存在的理由是一件很容易漏掉的事：挂在客户端上的那几个回调
+  /// （`bearerProvider`、`chatGptAccountIdProvider`、`onRateLimit`）要知道
+  /// "这一次请求属于哪个渠道"，才能取对密钥、记对账。以前它们一律去问
+  /// `channels.active` —— 在"全局只有一个当前渠道"的年代那是对的，而每个
+  /// 聊天室有了自己的模型策略之后就错了：请求发往 B 的地址，密钥却取的 A
+  /// 的，表现是**在聊天框里换到另一个渠道之后，那个渠道怎么配都用不了**。
+  ///
+  /// 存 id 不存渠道对象：配置是被到处传的快照，塞一个可变对象进去，
+  /// 用户改一次渠道设置就有一堆过期副本在飞。
+  final String? channelId;
+
   final String apiFormat;
   final String baseUrl; // 例如 https://api.openai.com/v1
   final String apiKey;
@@ -103,6 +117,7 @@ class LlmConfig {
   final SamplingParams sampling;
 
   const LlmConfig({
+    this.channelId,
     this.apiFormat = 'openAI',
     required this.baseUrl,
     required this.apiKey,
@@ -126,6 +141,7 @@ class LlmConfig {
   bool get isChatGptOAuth => apiFormat == 'chatgptOAuth';
 
   LlmConfig copyWith({
+    String? channelId,
     String? apiFormat,
     String? baseUrl,
     String? apiKey,
@@ -142,6 +158,7 @@ class LlmConfig {
     SamplingParams? sampling,
   }) =>
       LlmConfig(
+        channelId: channelId ?? this.channelId,
         apiFormat: apiFormat ?? this.apiFormat,
         baseUrl: baseUrl ?? this.baseUrl,
         apiKey: apiKey ?? this.apiKey,

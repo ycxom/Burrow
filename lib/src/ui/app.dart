@@ -22,6 +22,8 @@ import '../context/overflow_manager.dart';
 import '../context/token_counter.dart';
 import '../data/chat_store.dart';
 import '../data/task_runtime.dart';
+import '../net/battery_policy.dart';
+import '../net/process_guard.dart';
 import '../sandbox/exec_policy.dart';
 import '../sandbox/interactive_shell.dart';
 import '../sandbox/prefix_generations.dart';
@@ -34,7 +36,6 @@ import '../llm/vision.dart';
 import '../settings/settings_store.dart';
 import '../settings/thread_lock.dart';
 import '../settings/thread_prefs.dart';
-import 'sampling_page.dart';
 import '../settings/account_store.dart';
 import '../settings/channel_store.dart';
 import '../skills/skill_store.dart';
@@ -49,6 +50,7 @@ import 'skin_style.dart';
 import 'chat_theme.dart';
 import 'branch_plan.dart';
 import 'message_index.dart';
+import 'sampling_page.dart';
 import 'interactive_terminal.dart';
 import 'chat_view.dart';
 import 'image_attachments.dart';
@@ -534,35 +536,205 @@ class ChatShell extends StatefulWidget {
   State<ChatShell> createState() => _ChatShellState();
 }
 
+/// 一间还开着的聊天室：它是哪个会话、用哪个 runtime、标题是什么。
+///
+/// 「还开着」不等于「在屏幕上」—— 正在生成的那间会留在后台继续跑，
+/// 见 [_ChatShellState._rooms]。
+@immutable
+class _Room {
+  const _Room({required this.runtimeId, this.threadId, this.title = '新对话'});
+
+  final String runtimeId;
+  final String? threadId;
+  final String title;
+
+  _Room withTitle(String value) =>
+      _Room(runtimeId: runtimeId, threadId: threadId, title: value);
+}
+
 class _ChatShellState extends State<ChatShell> {
-  String? _threadId;
-  String _title = '新对话';
   int? _searchTargetMessageId;
 
-  /// 未存盘会话的 runtime id。每开一个新会话换一个 ——
-  /// 复用的话两个草稿会共用同一个 workspace，互相看到对方的文件。
-  late String _draftId = _newDraftId();
+  /// 当前在屏幕上的那间。
+  late _Room _active = _Room(runtimeId: _newDraftId());
+
+  /// 已经切走、但**还在生成**的那些房间，按 runtimeId 存。
+  ///
+  /// 它们照样挂在 widget 树上，只是 [Offstage] 起来不画 —— 于是那一轮请求、
+  /// 流式回调、落盘全都照常跑完，切回去就能看到完整的回答。
+  ///
+  /// 以前切一下会话就把整个 State 换掉（`key: ValueKey(runtimeId)`），
+  /// 正在生成的那一轮连同已经付过钱的 token 一起丢掉，而且**没有任何提示**
+  /// —— 用户切回来看到的是半句话，或者干脆什么都没有。
+  ///
+  /// 数量天然有上界：一间屋子只有在用户亲手发出一句话之后才会进来，
+  /// 生成完就自己出去。
+  final Map<String, _Room> _background = <String, _Room>{};
+
+  String? get _threadId => _active.threadId;
+
+  /// `buildRuntime` 每调一次就新建一个 SnapshotStore 并 open 一遍。
+  /// 同一间屋子在重建时不能再走一次 —— 缓存住。
+  final Map<String, Future<TaskRuntime>> _runtimes =
+      <String, Future<TaskRuntime>>{};
+
+  Future<TaskRuntime> _runtimeFor(String id) =>
+      _runtimes.putIfAbsent(id, () => widget.buildRuntime(id));
 
   static String _newDraftId() =>
       'draft_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
 
+  /// 还没决定要开哪间屋子。
+  ///
+  /// 这一小段不能省：不等就得先摆一间草稿出来，而那会**当场建一个 runtime
+  /// 目录、开一个 pty**，然后在几十毫秒后恢复出上次那间时整个扔掉。
+  /// 每次启动都留一个空的 draft_xxx 目录在沙箱里。
+  bool _booting = true;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_restoreLastThread());
+  }
+
+  /// 回到上次待着的那间屋子。
+  ///
+  /// 不恢复的话，被系统回收一次就掉回空白的「新对话」—— 那正是
+  /// 「用着用着自己退出去了」的全部内容（见 SettingsStore.lastThreadId）。
+  ///
+  /// **上锁的会话不恢复。** 那道锁是在抽屉里过的（chat_drawer.dart），
+  /// 直接把它摆到屏幕上等于绕过去了 —— 而且 app 一挂起就会 lockAll，
+  /// 启动这一刻它必然是锁着的。
+  Future<void> _restoreLastThread() async {
+    try {
+      final id = widget.settings.lastThreadId;
+      if (id == null) return;
+      final threads = await widget.chats.threads();
+      final match = threads.where((t) => t.id == id);
+      if (match.isEmpty) {
+        // 会话已经被删了。把这条记录清掉，免得每次启动都白查一遍。
+        await widget.settings.setLastThreadId(null);
+        return;
+      }
+      final locked = await widget.chats.lockedThreadIds();
+      if (locked.contains(id) || !mounted) return;
+      _active = _Room(
+        runtimeId: id,
+        threadId: id,
+        title: match.first.title,
+      );
+    } catch (_) {
+      // 读不出来就从新对话开始。为了"记得上次在哪"把 app 卡在启动界面上，
+      // 这笔交换划不来。
+    } finally {
+      if (mounted) setState(() => _booting = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    // 整个外壳都没了，那几间屋子也就跟着没了。计数不还回去的话，
+    // 前台服务会一直挂着一条通知，而它保护的那些请求早就不存在了。
+    for (var i = 0; i < _busy.length; i++) {
+      unawaited(ProcessGuard.release());
+    }
+    _busy.clear();
+    super.dispose();
+  }
+
   Future<void> _select(String? threadId) async {
+    if (threadId == _active.threadId && threadId != null) return;
     if (threadId == null) {
       setState(() {
-        _threadId = null;
-        _draftId = _newDraftId();
-        _title = '新对话';
+        _park(_active);
+        _active = _Room(runtimeId: _newDraftId());
       });
+      await widget.settings.setLastThreadId(null);
       return;
     }
     // 标题从库里取。抽屉传过来也行，但那会让「重命名后立刻切过去」
     // 拿到旧标题 —— 多查一次的代价可以忽略。
     final threads = await widget.chats.threads();
     final match = threads.where((t) => t.id == threadId);
+    if (!mounted) return;
     setState(() {
-      _threadId = threadId;
-      _title = match.isEmpty ? '对话' : match.first.title;
+      _park(_active);
+      _background.remove(threadId);
+      _active = _Room(
+        runtimeId: threadId,
+        threadId: threadId,
+        title: match.isEmpty ? '对话' : match.first.title,
+      );
     });
+    await widget.settings.setLastThreadId(threadId);
+  }
+
+  /// 把要离开的这间屋子留在后台，或者让它散掉。
+  ///
+  /// 只有**正在生成**的才留。不生成的留着纯属白占内存：一间屋子背后是一份
+  /// 完整历史、一个终端视图，还有一个 pty 进程。
+  void _park(_Room room) {
+    if (_busy.contains(room.runtimeId)) {
+      _background[room.runtimeId] = room;
+    } else {
+      _background.remove(room.runtimeId);
+      _runtimes.remove(room.runtimeId);
+    }
+  }
+
+  String _titleOf(String runtimeId) => runtimeId == _active.runtimeId
+      ? _active.title
+      : _background[runtimeId]?.title ?? '正在回话';
+
+  /// 草稿变成了真会话。
+  ///
+  /// 只更新记账用的那份 id，**不换 runtimeId** —— 换了 key 就变了，
+  /// 整棵子树会在用户刚发出第一句话的那一刻被重建。
+  void _onThreadCreated(String runtimeId, String threadId) {
+    if (!mounted) return;
+    if (_active.runtimeId == runtimeId) {
+      setState(() => _active = _Room(
+            runtimeId: runtimeId,
+            threadId: threadId,
+            title: _active.title,
+          ));
+      unawaited(widget.settings.setLastThreadId(threadId));
+      return;
+    }
+    final parked = _background[runtimeId];
+    if (parked != null) {
+      _background[runtimeId] = _Room(
+        runtimeId: runtimeId,
+        threadId: threadId,
+        title: parked.title,
+      );
+    }
+  }
+
+  /// 哪些 runtimeId 正在生成。HomeShell 自己报上来。
+  final Set<String> _busy = <String>{};
+
+  /// **busy 那一支不许 setState。** 它是在子 widget 的 build 里同步调过来的
+  /// （见 `_HomeShellState._reportBusy`），在那儿标脏会直接抛。
+  void _onBusyChanged(String runtimeId, bool busy) {
+    if (!mounted) return;
+    if (busy) {
+      if (_busy.add(runtimeId)) {
+        // 生成期间把进程钉住，否则按一下 Home 键这一轮就可能连同进程
+        // 一起被系统收走（见 net/process_guard.dart）。
+        unawaited(ProcessGuard.acquire(text: _titleOf(runtimeId)));
+      }
+      return;
+    }
+    if (_busy.remove(runtimeId)) unawaited(ProcessGuard.release());
+    // 后台那间跑完了就可以散了。留着的话它会一直占着 pty 和内存，
+    // 而用户已经不在那间屋子里了。
+    if (_background.containsKey(runtimeId)) {
+      setState(() {
+        _background.remove(runtimeId);
+        _runtimes.remove(runtimeId);
+      });
+    }
   }
 
   Future<void> _openSearchHit(String threadId, int messageId) async {
@@ -573,13 +745,46 @@ class _ChatShellState extends State<ChatShell> {
 
   @override
   Widget build(BuildContext context) {
-    final runtimeId = _threadId ?? _draftId;
-    return HomeShell(
-      // key 变了 Flutter 就重建整棵子树，连同 pty 会话一起收干净。
-      key: ValueKey(runtimeId),
+    // 空底色，不放转圈：这一步是一次数据库查询，几十毫秒，
+    // 转圈只会闪一下，比什么都不放更像出了问题。
+    if (_booting) return ColoredBox(color: context.chat.bgPrimary);
+    // 后台那几间排在前面、当前这间排最后：Stack 里后面的画在上面，
+    // 而 Offstage 起来的那几间本来就不参与布局。
+    final rooms = <_Room>[
+      for (final room in _background.values)
+        if (room.runtimeId != _active.runtimeId) room,
+      _active,
+    ];
+    return Stack(
+      children: <Widget>[
+        for (final room in rooms)
+          _buildRoom(room, room.runtimeId == _active.runtimeId),
+      ],
+    );
+  }
+
+  /// 一间屋子。
+  ///
+  /// ## key 挂在**最外层**，而且两种状态的层级完全一样
+  ///
+  /// 这两件事一起才成立，少一样这个 Stack 就会在切换的那一刻**把正在生成的
+  /// 那间屋子整个拆掉** —— 而拆掉之后重建出来的是一间空屋子，用户看到的是
+  /// "AI 回着回着突然跳到了新会话"。
+  ///
+  /// 原因在 Flutter 的多子节点 diff：它按**同一层**的 key + 类型配对。以前
+  /// 当前那间返回的是裸 `HomeShell(key: …)`，后台那间返回的是
+  /// `Offstage(无 key) > TickerMode > HomeShell(key: …)`。于是一间屋子从
+  /// 当前变成后台时，那一层的 widget 从 `HomeShell(keyA)` 换成了
+  /// `Offstage(null)` —— 类型和 key 都对不上，旧 element 直接被丢弃，
+  /// State 跟着 dispose，那一轮请求连同已经付过的 token 一起没了。
+  ///
+  /// 所以：外层永远是同一个 `Offstage`，key 永远挂在它身上，
+  /// 当前和后台的差别只有两个布尔。
+  Widget _buildRoom(_Room room, bool active) {
+    final shell = HomeShell(
       buildAgent: widget.buildAgent,
-      runtime: widget.buildRuntime(runtimeId),
-      runtimeId: runtimeId,
+      runtime: _runtimeFor(room.runtimeId),
+      runtimeId: room.runtimeId,
       capabilities: widget.capabilities,
       prefixGens: widget.prefixGens,
       spawner: widget.spawner,
@@ -594,15 +799,28 @@ class _ChatShellState extends State<ChatShell> {
       channels: widget.channels,
       unlocked: widget.unlocked,
       skins: widget.skins,
-      threadId: _threadId,
-      title: _title,
-      onSelectThread: _select,
-      onTitleChanged: (title) => setState(() => _title = title),
-      onOpenSearchHit: _openSearchHit,
-      searchTargetMessageId: _searchTargetMessageId,
+      threadId: room.threadId,
+      title: room.title,
+      onThreadCreated: (id) => _onThreadCreated(room.runtimeId, id),
+      onBusyChanged: (busy) => _onBusyChanged(room.runtimeId, busy),
+      // 后台那间的这几个回调一律不接：它已经不在屏幕上了，让它改标题、
+      // 换会话、弹搜索结果，用户会看到当前这间屋子无缘无故变样。
+      onSelectThread: active ? _select : (_) async {},
+      onTitleChanged: active
+          ? (title) => setState(() => _active = _active.withTitle(title))
+          : (_) {},
+      onOpenSearchHit: active ? _openSearchHit : (_, __) async {},
+      searchTargetMessageId: active ? _searchTargetMessageId : null,
       onSearchTargetConsumed: () {
         if (mounted) setState(() => _searchTargetMessageId = null);
       },
+    );
+    // 后台那间：不画、不布局、也不跑动画 —— 但 State 还活着，定时器、
+    // 流式回调和落盘照常。这正是"后台继续"要的那种活法。
+    return Offstage(
+      key: ValueKey(room.runtimeId),
+      offstage: !active,
+      child: TickerMode(enabled: active, child: shell),
     );
   }
 }
@@ -653,6 +871,21 @@ class HomeShell extends StatefulWidget {
   final int? searchTargetMessageId;
   final VoidCallback onSearchTargetConsumed;
 
+  /// 这间屋子第一次落库、拿到会话 id 时报一声。
+  ///
+  /// 新对话在发出第一句话之前是没有 id 的（runtime 目录已经建好，库里
+  /// 还没有那一行）。不报的话，外面永远不知道这间草稿变成了哪个会话 ——
+  /// 「记住上次待在哪」就漏掉了所有**新开的**对话，而那恰恰是最可能被
+  /// 系统回收打断的一类。
+  final ValueChanged<String>? onThreadCreated;
+
+  /// 这间屋子开始/结束生成时报一声。
+  ///
+  /// 外面拿它决定切走之后要不要把这间留在后台继续跑
+  /// （见 [_ChatShellState._park]），Android 那边还拿它决定要不要开前台
+  /// 服务把进程钉住。
+  final ValueChanged<bool>? onBusyChanged;
+
   const HomeShell({
     super.key,
     required this.buildAgent,
@@ -679,6 +912,8 @@ class HomeShell extends StatefulWidget {
     required this.onOpenSearchHit,
     required this.searchTargetMessageId,
     required this.onSearchTargetConsumed,
+    this.onThreadCreated,
+    this.onBusyChanged,
   });
 
   @override
@@ -1110,9 +1345,16 @@ class _HomeShellState extends State<HomeShell>
       // 才会重新触发，也就是说最该被压缩的那一次请求恰恰没被压缩。
       final memory = await widget.chats.memoryOf(id);
       if (memory != null) {
+        // 存下来的 checkpoint 是**完整历史**里的下标，而这一刻 history 只有
+        // 最后一页。所以先按"这一页里什么都没被摘要盖住"接住摘要文本，
+        // 真正的下标等历史补齐了再装（[_fillOlderHistory] → adoptCheckpoint）。
+        //
+        // 全都读进来了就直接装 —— 那时下标本来就对得上。
+        final complete = _olderInStore <= 0;
+        _pendingCheckpoint = complete ? null : memory.checkpoint;
         _agent.overflow.restore(
           summary: memory.summary,
-          checkpoint: memory.checkpoint,
+          checkpoint: complete ? memory.checkpoint : 0,
           historyLength: messages.length,
         );
       }
@@ -1163,15 +1405,27 @@ class _HomeShellState extends State<HomeShell>
       ];
       if (head.isEmpty) return;
       _agent.history.insertAll(0, head);
-      // checkpoint 是 history 的下标，前面插了一段就得跟着往后挪，
-      // 否则摘要覆盖范围会指到一段完全不相干的消息上。
-      _agent.overflow.shiftBy(head.length);
+      // 历史齐了，把存下来的那个**绝对** checkpoint 装回去。
+      //
+      // 补历史之前不能装：那时 history 只有最后一页，一个"全量里的第 460
+      // 条"拿去夹一段 40 条的尾巴毫无意义。以前这里是 `shiftBy(head.length)`
+      // 配上一次按首页夹过的值，两步双重计数 —— 见 adoptCheckpoint。
+      final pending = _pendingCheckpoint;
+      if (pending != null) {
+        _pendingCheckpoint = null;
+        _agent.overflow.adoptCheckpoint(pending, _agent.history.length);
+      }
     } catch (_) {
       // 补不上就当没有更早的。**但落盘那条路仍然被挡住** ——
       // 见 [_persistMessages]：宁可这次不存，也不能拿残缺的历史去重写。
       rethrow;
     }
   }
+
+  /// 存下来的 checkpoint，等历史补齐了再装进 overflow。
+  ///
+  /// null = 没有待装的（历史本来就是全的，或者已经装过了）。
+  int? _pendingCheckpoint;
 
   /// 打开这个会话时停在哪一条。null = 停在底部。
   int? _initialAnchor;
@@ -1760,11 +2014,11 @@ class _HomeShellState extends State<HomeShell>
         ..removeRange(visibleAnchor, _visible.length)
         ..addAll(tail);
     });
-    // 历史换了一段，长度多半也变了。checkpoint 是 history 的下标 ——
-    // 不跟着收的话它可能落在新历史的末尾之后，那时窗口里一条消息都不剩
-    // （`history.skip(checkpoint)` 是空的），模型当场失忆；而下一次摘要
-    // 还会在 `sublist(checkpoint, …)` 上直接抛。
-    _agent.overflow.clampTo(_agent.history.length);
+    // 历史换了一段，摘要状态要跟着收。切到一个比摘要边界还靠前的版本时，
+    // 摘要会整份作废 —— 它描述的是另一条分支（见 truncateTo）。
+    if (_agent.overflow.truncateTo(_agent.history.length)) {
+      _setStatus('切到了长期记忆覆盖范围之前，摘要已重置');
+    }
     await _persist();
     await widget.chats.setActiveVariant(branchId, target);
     await _refreshBranches();
@@ -2122,6 +2376,9 @@ class _HomeShellState extends State<HomeShell>
     super.deactivate();
   }
 
+  /// 上一次切出去的时候，这间屋子正在生成。
+  bool _leftWhileBusy = false;
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive ||
@@ -2130,7 +2387,40 @@ class _HomeShellState extends State<HomeShell>
       // 私密会话全部重新锁上。把手机递给别人之前，用户唯一会做的动作
       // 就是切出去或者息屏 —— 那一刻不锁，这道锁只在第一次有用。
       widget.unlocked.lockAll();
+      // 只认 paused：inactive 在弹个系统框、下拉通知栏的时候也会来，
+      // 拿它当"切出去了"会误报一堆。
+      if (state == AppLifecycleState.paused && _busy) _leftWhileBusy = true;
+      return;
     }
+    if (state == AppLifecycleState.resumed && _leftWhileBusy) {
+      _leftWhileBusy = false;
+      unawaited(_offerBatteryExemption());
+    }
+  }
+
+  /// 「刚才你在生成中切出去了」这一刻，问一次要不要放行后台。
+  ///
+  /// **挑这个时机，是因为这是唯一说得清的时候。** 一进 app 就弹这个框，
+  /// 用户还不知道自己需不需要；而在他刚做过那件会被打断的事之后再问，
+  /// 这句话才有对应的经历。
+  ///
+  /// 只问一次（见 SettingsStore.batteryHintShown）。他要是拒了，
+  /// 设置里那一行一直在，想开随时能开。
+  Future<void> _offerBatteryExemption() async {
+    if (widget.settings.batteryHintShown) return;
+    if (await BatteryPolicy.isIgnored()) return;
+    if (!mounted) return;
+    await widget.settings.markBatteryHintShown();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: const Text('生成中切到后台，系统可能把这一轮冻住。'
+          '放行后台运行就不会被打断。'),
+      duration: const Duration(seconds: 8),
+      action: SnackBarAction(
+        label: '去放行',
+        onPressed: () => unawaited(BatteryPolicy.request()),
+      ),
+    ));
   }
 
   @override
@@ -2355,6 +2645,7 @@ class _HomeShellState extends State<HomeShell>
       // 刚定死的渠道和模型又变回"跟全局"了。
       _prefs = _pinPrefs();
       await widget.chats.setPrefs(id, _prefs);
+      widget.onThreadCreated?.call(id);
       // 会话是刚建的，之前设的那份提示词还只在内存里，补写进去。
       if (_threadPrompt != null) {
         await widget.chats.setSystemPrompt(id, _threadPrompt);
@@ -2554,8 +2845,14 @@ class _HomeShellState extends State<HomeShell>
       active: false,
     );
     _agent.history.removeRange(pivot + 1, _agent.history.length);
-    // 同 [_switchVariant]：砍短了历史就得把 checkpoint 收回来。
-    _agent.overflow.clampTo(_agent.history.length);
+    // **这一句是"反复重新生成会把压缩系统搞坏"的修复。**
+    //
+    // 砍掉的这一段要是落在摘要覆盖范围之内，摘要就作废了：它的文字里还留着
+    // 刚被丢弃的那个回答，而下一次压缩会把「已有摘要」原样喂回去 ——
+    // 于是每重新生成一次就往里叠一层从没发生过的对话。见 truncateTo。
+    if (_agent.overflow.truncateTo(_agent.history.length)) {
+      _setStatus('回退到了长期记忆覆盖范围之前，摘要已重置');
+    }
 
     await _runTurn(
       id,
@@ -2698,6 +2995,38 @@ class _HomeShellState extends State<HomeShell>
   ///
   /// 落盘而不是只留在内存里：切出去一趟、或者被系统回收之后再回来，
   /// 内存里那份早没了 —— 而那恰恰是最需要它的时候。
+  /// 上一次报上去的忙碌状态。
+  bool? _reportedBusy;
+
+  /// `_busy` 一翻就往上报一声。
+  ///
+  /// 在 build 里比对而不是在每一处赋值旁边加一行：`_busy = true` 散落在
+  /// 发送、重新生成、切分支好几条路上，逐个加迟早漏掉一处 —— 而漏掉的
+  /// 表现是"这间屋子切走之后就没了"，和这个功能本身长得一模一样。
+  void _reportBusy() {
+    if (_busy == _reportedBusy) return;
+    _reportedBusy = _busy;
+    final report = widget.onBusyChanged;
+    if (report == null) return;
+    if (_busy) {
+      // **变忙要当场报，不能等下一帧。**
+      //
+      // "切走的这一刻这间屋子忙不忙"决定了它是被留在后台继续跑、还是当场
+      // 拆掉。而发完消息随手就切走是很正常的操作 —— 晚一帧报上去，那一轮
+      // 连同已经付过的 token 一起没了，用户切回来看到的是一条没有回答的
+      // 提问。
+      //
+      // 这条路径不碰父级的 setState（见 `_ChatShellState._onBusyChanged`
+      // 的 busy 分支），所以在 build 期间调是安全的。
+      report(true);
+      return;
+    }
+    // 变闲那一头会 setState（把后台那间收掉），build 期间不能调，排到帧后。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) report(false);
+    });
+  }
+
   Future<void> _persistReadingPosition() async {
     final id = _threadId;
     if (id == null || !_runtimeReady) return;
@@ -2724,6 +3053,7 @@ class _HomeShellState extends State<HomeShell>
 
   @override
   Widget build(BuildContext context) {
+    _reportBusy();
     // 这里以前有一段「键盘弹起时把聊天内容跟着往上挪」。倒序列表之后不需要了
     // ——它的 0 点就锚在底边上，视口一矮，内容自己跟着输入框走。
     // 那段补偿是"列表锚在顶部"逼出来的，锚点一换就整个消失了。

@@ -545,6 +545,20 @@ class ChannelStore extends ChangeNotifier {
 
   String apiKeyOf(Channel channel) => _keys[channel.id] ?? '';
 
+  /// 一份配置是从哪个渠道投影出来的。
+  ///
+  /// **这不是 [active]。** 每个聊天室有了自己的模型策略之后，客户端上挂着的
+  /// 配置跟着**当前打开的那个会话**走，而 [active] 退化成了新会话的起点。
+  /// 取密钥、记配额这类"这次请求属于谁"的问题必须问这个，不能问 [active] ——
+  /// 问错的表现是请求发往 B 的地址、密钥取的却是 A 的，那个渠道**怎么配都是
+  /// 401**，而渠道管理里它看起来完全正常。
+  ///
+  /// 认不出来时退回 [active]：[LlmConfig.empty] 和旧的迁移路径没有这个字段。
+  Channel? channelOf(LlmConfig config) {
+    final id = config.channelId;
+    return (id == null ? null : byId(id)) ?? active;
+  }
+
   Channel? byId(String id) {
     for (final c in _channels) {
       if (c.id == id) return c;
@@ -874,6 +888,9 @@ class ChannelStore extends ChangeNotifier {
       ThinkingEffort thinkingEffort = ThinkingEffort.auto}) {
     if (channel == null) return LlmConfig.empty;
     return LlmConfig(
+      // 带上渠道身份。挂在客户端上的那几个回调要靠它取对密钥、记对账 ——
+      // 见 [LlmConfig.channelId]。
+      channelId: channel.id,
       apiFormat: channel.oauthProviderId == 'openai_oauth'
           ? 'chatgptOAuth'
           : channel.apiFormat,

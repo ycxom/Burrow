@@ -198,6 +198,11 @@ class OverflowManager {
 
   bool _summarizing = false;
 
+  /// 在途那次摘要打算推进到哪个下标。只在 [_summarizing] 为真时有意义。
+  ///
+  /// [truncateTo] 靠它判断"这次截断有没有把在途摘要正在读的那一段切掉"。
+  int _pendingUpTo = 0;
+
   /// 最近一次摘要失败的原因。null = 从没失败过，或者上一次成功了。
   ///
   /// 留着是为了让「压缩为什么没生效」在界面上答得出来。失败本身是安静的
@@ -234,6 +239,11 @@ class OverflowManager {
   /// checkpoint 是历史的下标，所以要按当前历史长度夹一次：编辑重发、
   /// 回到某条消息、切换分支都会把历史截短，而存下来的那个下标不知道。
   /// 越界的话 `history.skip()` 会安静地返回空窗口 —— 模型当场失忆。
+  ///
+  /// **[checkpoint] 必须是相对于完整历史的绝对下标。** 打开长会话时界面只先
+  /// 读最后一页，那时不要把存下来的下标装进来（见 [adoptCheckpoint]）——
+  /// 拿一个"全量历史里的第 460 条"去夹一段只有 40 条的尾巴，夹出来的 40
+  /// 和 460 没有任何关系。
   void restore(
       {String? summary, required int checkpoint, required int historyLength}) {
     _summary = (summary?.trim().isEmpty ?? true) ? null : summary!.trim();
@@ -243,23 +253,61 @@ class OverflowManager {
     _failedAt = -1;
   }
 
-  /// 历史**前面**插进来一段之后，把 checkpoint 往后挪。
+  /// 历史补全之后，把存下来的那个**绝对**下标装回去。
   ///
-  /// 打开会话时只先读最后一页，剩下的在后台补进历史开头（见 app.dart 的
-  /// `_fillOlderHistory`）。checkpoint 是历史的下标 —— 前面多了 n 条，
-  /// 它就得 +n，否则"摘要覆盖到第几条"会指到一段完全不相干的消息上：
-  /// 窗口里会冒出一批本该被摘要盖住的原文，而真正该显示的那几条反而没了。
-  void shiftBy(int count) {
-    if (count <= 0 || _checkpoint <= 0) return;
-    _checkpoint += count;
+  /// ## 这里以前是 `shiftBy(前面补进来多少条)`，而那是错的
+  ///
+  /// 打开会话时只先读最后一页，剩下的在后台补进历史开头（app.dart 的
+  /// `_fillOlderHistory`）。老做法是：先拿存下来的下标按**那一页**夹一次，
+  /// 补完再加上补进来的条数。两步都在动同一个数，结果双重计数：
+  ///
+  ///   100 条历史、存的 checkpoint = 60、首屏读 40 条
+  ///   → restore 夹成 40 → 补进 60 条 → 40 + 60 = **100**
+  ///
+  /// 100 就是历史长度：`history.skip(100)` 是空的，**窗口里一条消息都不剩**，
+  /// 模型只看得到一段摘要。而且两步的先后没有保证（补历史是异步的），
+  /// 先补后夹会得到另一个同样错的数 —— 所以它表现得像是随机的。
+  ///
+  /// 现在只有一步：历史齐了，把那个绝对下标原样装回去。
+  void adoptCheckpoint(int checkpoint, int historyLength) {
+    _checkpoint = checkpoint.clamp(0, historyLength);
   }
 
-  /// 历史被截短之后把 checkpoint 拉回来。
+  /// 历史被截短到 [historyLength] 条之后，把摘要状态跟着收。
+  /// 返回 true 表示**摘要被作废了**。
   ///
-  /// 「回到这条消息」和分支切换都会砍掉一截历史。不跟着收的话，checkpoint
-  /// 可能落在新历史的末尾之后，窗口里就一条消息都不剩了。
-  void clampTo(int historyLength) {
-    if (_checkpoint > historyLength) _checkpoint = historyLength;
+  /// ## 为什么截进摘要覆盖范围就必须整份作废
+  ///
+  /// 摘要是一整块滚动文本，覆盖 `history[0.._checkpoint)`，**没法从中间减掉
+  /// 一段**。截断点落在 checkpoint 之前时，被砍掉的那些消息仍然留在摘要文字
+  /// 里 —— 而它们已经不属于这条对话了。
+  ///
+  /// 不作废的后果不是"多了点没用的信息"，是**每重新生成一次就往摘要里叠一层
+  /// 被丢弃的分支**：下一次压缩会把「已有摘要」原样喂回给摘要模型，于是那些
+  /// 从没发生过的回答被一轮轮固化成"更早的对话"。反复重新生成几次之后，
+  /// 模型看到的前情提要里有好几个互相矛盾的版本，而原文早就没了。
+  ///
+  /// chatbox 那边是同一条规则的另一种写法：它的压缩点记的是**边界消息的
+  /// id**，边界消息不在列表里了，这个压缩点就不再适用（见
+  /// `findLatestApplicableCompactionPoint`）。这里记的是下标，所以要自己
+  /// 判断"边界有没有被砍掉"。
+  bool truncateTo(int historyLength) {
+    // 在途的那一次摘要，覆盖范围是**旧历史**的 [_checkpoint, _pendingUpTo)。
+    // 截断把这一段切了的话，它落地时会带来两个错的东西：一段描述已消失内容
+    // 的文字，和一个按旧长度算出来的下标。丢掉它。
+    if (_summarizing && historyLength < _pendingUpTo) _epoch++;
+
+    if (historyLength >= _checkpoint) {
+      // 摘要覆盖的那一段一条没动，摘要仍然是对的。
+      return false;
+    }
+    _summary = null;
+    _checkpoint = 0;
+    _lastError = null;
+    _errorUnreported = false;
+    _failedAt = -1;
+    _epoch++;
+    return true;
   }
 
   /// 构造要发给 LLM 的消息序列。
@@ -334,6 +382,7 @@ class OverflowManager {
     try {
       final newCheckpoint = _findCheckpoint(history);
       if (newCheckpoint <= _checkpoint) return false;
+      _pendingUpTo = newCheckpoint;
 
       final batch = history.sublist(_checkpoint, newCheckpoint);
       final payload = StringBuffer();
@@ -386,6 +435,7 @@ class OverflowManager {
       return true;
     } finally {
       _summarizing = false;
+      _pendingUpTo = 0;
     }
   }
 
