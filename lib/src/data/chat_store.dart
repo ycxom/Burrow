@@ -40,6 +40,35 @@ class ChatThread {
   final String? systemPrompt;
 }
 
+/// 库里存着的一个版本，连同它的内容。画分支树用。
+///
+/// 带上整段内容而不是只带条数：树上每一行要写一句"这一版说了什么"，
+/// 而那句话只能从内容里摘；顺带还要找出**套在这一版里的其它分支点**
+/// （见 ui/branch_tree.dart），那也得读内容。
+class BranchVariant {
+  const BranchVariant({
+    required this.branchId,
+    required this.index,
+    required this.active,
+    required this.createdAt,
+    required this.tail,
+  });
+
+  final String branchId;
+  final int index;
+
+  /// 这一版是这个分支点当前选中的那个。
+  ///
+  /// **不等于"你在这里"** —— 它所在的那个分支点自己也可能没被选中
+  /// （套在另一个分支的某一版里）。整条链算下来才是"你在这里"。
+  final bool active;
+
+  final DateTime createdAt;
+
+  /// 从锚点那条消息开始、一直到这一版结尾。
+  final List<ChatMessage> tail;
+}
+
 /// 一个分支点的现状：一共几个版本、正在看第几个（都从 0 数）。
 class BranchState {
   const BranchState({required this.total, required this.active});
@@ -1266,6 +1295,45 @@ class ChatStore {
       }
     }
     return BranchState(total: rows.length, active: active);
+  }
+
+  /// 这个会话里所有的分支版本，连内容一起。画分支树用。
+  ///
+  /// 一次读完而不是逐个 `loadVariant`：树要算的是版本之间的**嵌套关系**，
+  /// 那要求同时看到全部内容。分支数天然很小（每一个都得用户亲手点一次
+  /// 「重新生成」或「编辑重发」才会出现），所以一次读完是划算的。
+  ///
+  /// 解不开的段整条跳过 —— 树上少一根枝比画一根看不懂的枝好。
+  Future<List<BranchVariant>> variantsOf(String threadId) async {
+    final rows = await _db.rawQuery(
+      'SELECT b.branch_id AS branch_id, b.variant_index AS variant_index, '
+      'b.is_active AS is_active, b.created_at AS created_at, '
+      's.messages_json AS json '
+      'FROM branches b JOIN segments s ON s.hash = b.segment_hash '
+      'WHERE b.thread_id = ? '
+      'ORDER BY b.branch_id ASC, b.variant_index ASC',
+      <Object?>[threadId],
+    );
+    final out = <BranchVariant>[];
+    for (final row in rows) {
+      final raw = _open(row['json'] as String?);
+      if (raw == null || raw.isEmpty) continue;
+      List<ChatMessage> tail;
+      try {
+        tail = _decodeSegment(raw);
+      } catch (_) {
+        continue;
+      }
+      out.add(BranchVariant(
+        branchId: row['branch_id']! as String,
+        index: row['variant_index']! as int,
+        active: (row['is_active'] as int? ?? 0) == 1,
+        createdAt:
+            DateTime.fromMillisecondsSinceEpoch(row['created_at'] as int? ?? 0),
+        tail: tail,
+      ));
+    }
+    return out;
   }
 
   /// 取出某个版本的内容。序号不存在时返回 null。

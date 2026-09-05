@@ -381,6 +381,31 @@ void main() {
       expect(rows, isEmpty);
     });
 
+    test('锚点不在活动路径上时，照样删得掉', () async {
+      // **这一条是"分支树里点删除没反应"的墓碑。**
+      //
+      // 界面上那份分支缓存只装**看得见的**消息涉及的分支，而分支树画的是
+      // 整个会话 —— 一大半分支的锚点压根不在当前这一屏里，甚至不在活动
+      // 路径上。拿那份缓存去查会一律查不到，然后静默返回。
+      //
+      // 库这边不该有这个限制：状态只跟 branches 表有关，和 messages 表里
+      // 现在剩着什么无关。
+      final id = await store.createThread('甲', preferredId: 't1');
+      for (final text in <String>['第一版', '第二版']) {
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[msg('user', '问'), msg('assistant', text)],
+        );
+      }
+      // 活动路径上一条带 branchId 的消息都没有。
+      await store.replaceMessages(id, <ChatMessage>[msg('user', '别的话')]);
+
+      expect((await store.branchStateOf('b1'))!.total, 2);
+      expect(await store.deleteVariant('b1', 0), 1);
+      expect((await store.branchStateOf('b1'))!.total, 1);
+    });
+
     test('删一个不存在的序号：什么都不动', () async {
       await seed(2);
       expect(await store.deleteVariant('b1', 7), 2);

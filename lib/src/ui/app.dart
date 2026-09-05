@@ -50,6 +50,8 @@ import 'skin_store.dart';
 import 'skin_style.dart';
 import 'chat_theme.dart';
 import 'branch_plan.dart';
+import 'branch_tree.dart';
+import 'branch_tree_page.dart';
 import 'message_index.dart';
 import 'sampling_page.dart';
 import 'interactive_terminal.dart';
@@ -2142,6 +2144,68 @@ class _HomeShellState extends State<HomeShell>
     }
   }
 
+  /// 打开分支树。
+  ///
+  /// 气泡下面那个「2/3」只翻得动**当前这条链**上的岔口；岔套岔之后，
+  /// 里层那些分支在界面上根本无从抵达 —— 数据一直在库里，只是没有入口。
+  Future<void> _showBranchTree() async {
+    final id = _threadId;
+    if (id == null || _busy) return;
+
+    Future<List<BranchPoint>> read() async =>
+        buildBranchTree(_agent.history, await widget.chats.variantsOf(id));
+
+    final tree = ValueNotifier<List<BranchPoint>>(await read());
+    if (!mounted) {
+      tree.dispose();
+      return;
+    }
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (route) => ValueListenableBuilder<List<BranchPoint>>(
+        valueListenable: tree,
+        builder: (_, value, __) => BranchTreePage(
+          tree: value,
+          // 跳过去要关掉这一页：用户要看的是对话本身。
+          onJump: (branchId, index) async {
+            Navigator.of(route).pop();
+            await _jumpToVariant(branchId, index);
+          },
+          // 删除**不关页**，就地刷新那棵树。
+          //
+          // 关掉的话用户看到的是"点了删除，然后回到了聊天界面" —— 删没删掉
+          // 得自己再开一次才知道。而删版本这件事往往要连着做好几次。
+          onDelete: (branchId, index) async {
+            await _deleteVariant(branchId, index);
+            if (mounted) tree.value = await read();
+          },
+        ),
+      ),
+    ));
+    tree.dispose();
+  }
+
+  /// 跳到树上的某一版。
+  ///
+  /// **从外往里一层层切。** 只切它自己是不够的：它可能长在一个当前没被
+  /// 选中的版本里，那时候它的锚点压根不在活动路径上，`_switchVariant`
+  /// 找不到锚点会直接返回 —— 表现是"点了没反应"。
+  Future<void> _jumpToVariant(String branchId, int index) async {
+    final id = _threadId;
+    if (id == null) return;
+    final variants = await widget.chats.variantsOf(id);
+    if (!mounted) return;
+    final steps =
+        pathTo(buildBranchTree(_agent.history, variants), branchId, index);
+    if (steps.isEmpty) {
+      _setStatus('这一版在树上找不到位置了');
+      return;
+    }
+    for (final step in steps) {
+      if (!mounted) return;
+      await _switchVariant(step.branchId, step.index);
+    }
+  }
+
   /// 删掉正在看的这个版本。
   ///
   /// 删完要把界面换到剩下的某一版上 —— 停在一个已经不存在的版本上，屏幕上
@@ -2151,22 +2215,39 @@ class _HomeShellState extends State<HomeShell>
     if (_busy) return;
     final id = _threadId;
     if (id == null) return;
-    final before = _branches[branchId];
-    if (before == null) return;
+    // **现从库里读，不用 `_branches` 那份缓存。**
+    //
+    // 那份缓存只装**界面上看得见的**那些消息涉及的分支（`_refreshBranches`
+    // 扫的是 `_visible`）。而分支树画的是整个会话 —— 里面有一大半分支的锚点
+    // 压根不在当前这一屏里，甚至不在活动路径上。拿缓存去查，那些分支一律
+    // 查不到，然后这里静默 return：**用户点了删除，什么都没发生。**
+    final before = await widget.chats.branchStateOf(branchId);
+    if (before == null || !mounted) return;
     // 只剩一个版本时，"删这一版"等于把这段对话删掉 —— 那是另一个动作
     // （长按 → 删除这条及之后），有它自己的确认。这里不接这活。
     if (before.total <= 1) return;
 
+    // 这一版在不在当前这条路径上，决定删完之后屏幕会不会跟着变 ——
+    // 而那正是用户在确认框上最想知道的事。不在路径上的分支删掉，
+    // 聊天界面一个像素都不动，说成"会换成其中一版"就是在吓唬人。
+    final onPath = _agent.history.any((m) => m.branchId == branchId);
     final ok = await _confirm(
       '删掉这一版',
       '这个版本会被删除，剩下的 ${before.total - 1} 版还在。'
-          '当前正在看的内容会换成其中一版。',
+          '${onPath ? '当前正在看的内容会换成其中一版。' : '它不在当前这条路径上，聊天界面不会变。'}',
     );
     if (!ok || !mounted) return;
 
     final left = await widget.chats.deleteVariant(branchId, index);
     if (!mounted) return;
     if (left <= 0) {
+      await _refreshBranches();
+      return;
+    }
+    // 不在当前路径上的分支：库里删掉就完事了，活动路径本来就没它的份。
+    // 硬去切一下的话，_switchVariant 找不到锚点会直接返回 —— 只是白跑，
+    // 但那一步之后的 _refreshBranches 也跟着不执行了。
+    if (!onPath) {
       await _refreshBranches();
       return;
     }
@@ -3764,6 +3845,9 @@ class _HomeShellState extends State<HomeShell>
           onDeleteVariant: branch == null || _busy
               ? null
               : () => _deleteVariant(branchOwner!, branch.active),
+          // 那个「2/3」只翻得动当前这条链上的岔口。旁边这个入口通向整棵树
+          // —— 岔套岔之后，里层那些版本只有从那儿才够得着。
+          onOpenBranchTree: branch == null || _busy ? null : _showBranchTree,
           isError: isError,
           lastInGroup: row.lastInGroup,
           firstInGroup: row.firstInGroup,

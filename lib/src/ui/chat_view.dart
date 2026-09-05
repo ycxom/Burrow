@@ -827,6 +827,9 @@ class ChatBubble extends StatelessWidget {
   /// 删掉正在看的那个版本。null = 不给删。
   final VoidCallback? onDeleteVariant;
 
+  /// 打开整棵分支树。null = 不给开。
+  final VoidCallback? onOpenBranchTree;
+
   /// 正在看第几个版本，从 0 数。
   final int variantIndex;
 
@@ -868,6 +871,7 @@ class ChatBubble extends StatelessWidget {
     this.reasoningMs = 0,
     this.variantCount = 0,
     this.onDeleteVariant,
+    this.onOpenBranchTree,
     this.variantIndex = 0,
     this.onSwitchVariant,
     this.lastInGroup = true,
@@ -1020,6 +1024,7 @@ class ChatBubble extends StatelessWidget {
             color: timeColor,
             onSwitch: onSwitchVariant!,
             onDelete: onDeleteVariant,
+            onOpenTree: onOpenBranchTree,
           )
         : null;
 
@@ -1994,6 +1999,7 @@ class _VariantSwitcher extends StatelessWidget {
     required this.color,
     required this.onSwitch,
     this.onDelete,
+    this.onOpenTree,
   });
 
   final int index;
@@ -2003,6 +2009,9 @@ class _VariantSwitcher extends StatelessWidget {
 
   /// 删掉正在看的这一版。null = 不给删。
   final VoidCallback? onDelete;
+
+  /// 打开整棵分支树。null = 不给开。
+  final VoidCallback? onOpenTree;
 
   @override
   Widget build(BuildContext context) {
@@ -2037,6 +2046,15 @@ class _VariantSwitcher extends StatelessWidget {
           enabled: enabled,
           disabled: disabled,
         ),
+        // 整棵树。左右箭头只翻得动**当前这条链**上的岔口，而岔是会套岔的
+        // —— 里层那些版本只有从树里才够得着。
+        if (onOpenTree != null)
+          _Arrow(
+            icon: Icons.account_tree_outlined,
+            onTap: onOpenTree,
+            enabled: enabled,
+            disabled: disabled,
+          ),
         // 删掉这一版。压得很轻、而且只在这个切换器里出现 ——
         // 没有多个版本的时候它不该存在，那时"删这一版"就是"删这条消息"，
         // 那是另一个动作，有它自己的入口和确认。
