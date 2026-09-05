@@ -994,6 +994,7 @@ class _HomeShellState extends State<HomeShell>
   /// 在屏幕上的位置（见 anchored_menu.dart）。
   final _plusKey = GlobalKey();
   final _terminalKey = GlobalKey();
+  final _historyKey = GlobalKey();
 
   /// 页签之间的**淡出淡入**（Material 3 的 fade through）。
   ///
@@ -2187,6 +2188,10 @@ class _HomeShellState extends State<HomeShell>
             await _deleteVariant(branchId, index);
             if (mounted) tree.value = await widget.chats.variantsOf(id);
           },
+          onDeleteMessage: (node) async {
+            await _deleteGraphMessage(id, node);
+            if (mounted) tree.value = await widget.chats.variantsOf(id);
+          },
         ),
       ),
     ));
@@ -2215,6 +2220,70 @@ class _HomeShellState extends State<HomeShell>
     }
   }
 
+  /// 删掉分支图上的**一条**消息。
+  ///
+  /// 两条完全不同的路：
+  ///
+  ///   - 活动路径上那些是**活的**消息，改 history 再整段落盘就行；
+  ///   - 旁支上那些只存在于某一版的快照里，改不了 history —— 只能把那一版
+  ///     的内容整段重写一遍（[ChatStore.updateVariant]）。
+  ///
+  /// 分不清的话，删旁支里的一条会去 history 上找一个根本不在那儿的 id，
+  /// 然后静默什么都不做。
+  Future<void> _deleteGraphMessage(String threadId, GraphNode node) async {
+    if (_busy) return;
+    final ok = await _confirm(
+      '删除这一条',
+      '${node.detail.isEmpty ? '这条消息' : '「${node.detail}」'}会被删除。'
+          '${node.onActivePath ? '' : '\n\n它在${node.versionLabel}里，删完那一版会少一条。'}',
+    );
+    if (!ok || !mounted) return;
+
+    if (node.onActivePath) {
+      final messageId = node.messageId;
+      if (messageId == null) {
+        _setStatus('这条消息还没落库，删不了 —— 等这一轮结束再试');
+        return;
+      }
+      final at = _agent.history.indexWhere((m) => m.messageId == messageId);
+      if (at < 0) {
+        _setStatus('这条消息在上下文里对不上位置，删不了');
+        return;
+      }
+      final gone = _agent.history.removeAt(at);
+      // 摘要覆盖范围要跟着收：少了一条，checkpoint 之后的下标全变了。
+      _agent.overflow.truncateTo(_agent.history.length);
+      setState(() {
+        _visible.removeWhere((m) => identical(m, gone));
+      });
+      await _persist();
+      return;
+    }
+
+    // 旁支：把那一版的内容整段重写。
+    final branchId = node.branchId;
+    if (branchId == null || node.tailPos < 0) return;
+    final tail = await widget.chats.loadVariant(branchId, node.index);
+    if (tail == null || !mounted) return;
+    if (node.tailPos >= tail.length) {
+      _setStatus('这一版已经变过了，刷新一下再试');
+      return;
+    }
+    // 锚点那条不能删 —— 它是这一版的头，删了这一版就没有起点了。
+    if (node.tailPos == 0) {
+      _setStatus('这是这一版的开头，删它请用「删掉整版」');
+      return;
+    }
+    final next = <ChatMessage>[...tail]..removeAt(node.tailPos);
+    await widget.chats.updateVariant(
+      threadId: threadId,
+      branchId: branchId,
+      index: node.index,
+      tail: next,
+    );
+    if (mounted) await _refreshBranches();
+  }
+
   /// 删掉正在看的这个版本。
   ///
   /// 删完要把界面换到剩下的某一版上 —— 停在一个已经不存在的版本上，屏幕上
@@ -2239,11 +2308,26 @@ class _HomeShellState extends State<HomeShell>
     // 这一版在不在当前这条路径上，决定删完之后屏幕会不会跟着变 ——
     // 而那正是用户在确认框上最想知道的事。不在路径上的分支删掉，
     // 聊天界面一个像素都不动，说成"会换成其中一版"就是在吓唬人。
-    final onPath = _agent.history.any((m) => m.branchId == branchId);
+    final anchorIndex =
+        _agent.history.indexWhere((m) => m.branchId == branchId);
+    final onPath = anchorIndex >= 0;
+
+    // **删的是你正站着的那一版时，跟着走的东西比想象的多。**
+    //
+    // 库里那份快照只记到"分岔的那一刻"；在那之后又聊的每一句都只在活动
+    // 路径上。所以删掉当前这一版，一起没的是**它下面到现在为止的整段
+    // 对话** —— 可能是几十条，而快照上只有两条。
+    //
+    // 不说这一句的话，用户以为自己只是丢掉了一个"备选答案"。
+    final livingAfter = onPath && before.active == index
+        ? _agent.history.length - anchorIndex - 1
+        : 0;
+
     final ok = await _confirm(
-      '删掉这一版',
+      '删掉版本 ${index + 1}',
       '这个版本会被删除，剩下的 ${before.total - 1} 版还在。'
-          '${onPath ? '当前正在看的内容会换成其中一版。' : '它不在当前这条路径上，聊天界面不会变。'}',
+          '${onPath ? '当前正在看的内容会换成其中一版。' : '它不在当前这条路径上，聊天界面不会变。'}'
+          '${livingAfter > 0 ? '\n\n你正站在这一版上：它下面那 $livingAfter 条对话会一起删掉。' : ''}',
     );
     if (!ok || !mounted) return;
 
@@ -3477,7 +3561,7 @@ class _HomeShellState extends State<HomeShell>
               ),
               onPressed: _editThreadPrompt,
             ),
-            _tabAction(2, Icons.history_outlined, '检查点'),
+            _buildHistoryAction(),
             _buildTerminalAction(),
             // 设置 / 技能 / 账号都在抽屉里。
           ],
@@ -4080,21 +4164,68 @@ class _HomeShellState extends State<HomeShell>
     );
   }
 
-  Widget _tabAction(int tab, IconData icon, String tooltip) {
-    final active = _tab == tab;
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 200),
-      child: IconButton(
-        key: ValueKey(active),
-        tooltip: active ? '返回对话' : tooltip,
-        onPressed: () {
-          unawaited(_switchTab(active ? 0 : tab));
-        },
-        icon: Icon(icon, size: context.parts.headerAction.iconSizeOr(24)),
-        color: active
-            ? context.chat.brand
-            : context.parts.headerAction.icon?.color,
+  /// 顶栏那个「回溯」图标。点开是二级菜单，不是直接跳页。
+  ///
+  /// 检查点和分支树是**同一件事的两半**：一个能把文件退回某一刻，一个能把
+  /// 对话退回某一版。它们本来就该在一起 —— 而分支树以前唯一的入口是气泡
+  /// 底下那个「2/3」旁边的小图标，只有已经在看多版本的时候才看得见，
+  /// 想主动去翻一眼根本找不到门。
+  Widget _buildHistoryAction() {
+    final active = _tab == 2;
+    return IconButton(
+      key: _historyKey,
+      tooltip: '回溯',
+      onPressed: _showHistoryMenu,
+      icon: Icon(
+        active ? Icons.history : Icons.history_outlined,
+        size: context.parts.headerAction.iconSizeOr(24),
       ),
+      color:
+          active ? context.chat.brand : context.parts.headerAction.icon?.color,
+    );
+  }
+
+  Future<void> _showHistoryMenu() async {
+    // 岔过几次要现查一次：菜单要在打开的那一刻说实话，而这个数在每次
+    // 重新生成之后都会变。
+    final id = _threadId;
+    final forks = id == null
+        ? 0
+        : (await widget.chats.variantsOf(id))
+            .map((v) => v.branchId)
+            .toSet()
+            .length;
+    if (!mounted) return;
+
+    await showAnchoredMenu<void>(
+      context: context,
+      anchor: _historyKey,
+      builder: (menuContext, refresh) => <Widget>[
+        MenuAction(
+          icon: _tab == 2 ? Icons.chat_bubble_outline : Icons.history_outlined,
+          label: _tab == 2 ? '返回对话' : '检查点',
+          detail: _tab == 2 ? '回到聊天' : '把 workspace 里的文件退回到某一刻',
+          onTap: () {
+            Navigator.pop(menuContext);
+            unawaited(_switchTab(_tab == 2 ? 0 : 2));
+          },
+        ),
+        MenuAction(
+          icon: Icons.account_tree_outlined,
+          label: '分支树',
+          detail: id == null
+              ? '这个会话还没开始'
+              : forks == 0
+                  ? '还没岔过。重新生成或编辑重发之后，旧的那一版会留在这里'
+                  : '岔过 $forks 处 · 看整棵树、跳回任意一版',
+          onTap: id == null
+              ? null
+              : () {
+                  Navigator.pop(menuContext);
+                  unawaited(_showBranchTree());
+                },
+        ),
+      ],
     );
   }
 

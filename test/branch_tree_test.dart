@@ -595,6 +595,90 @@ void main() {
       expect(here.parentId, nodes.firstWhere((n) => n.detail == '第二版答').id);
     });
 
+    test('旁支上每个节点都答得出自己属于第几版、那一支有多长', () {
+      // **这一条是"删错分支"的墓碑。**
+      //
+      // 菜单是从任意一个节点长按出来的。中间那些节点的 label 是它的角色
+      // （「回复」「命令」），照着 label 写标题就成了「删掉回复」——
+      // 而按下去删掉的是它所在的**整个版本**。那不是误操作，是那行字骗人。
+      final nodes = graph(<ChatMessage>[
+        msg('user', '甲', branchId: 'b1'),
+        msg('assistant', '答二'),
+      ], <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '甲', branchId: 'b1'),
+          msg('assistant', '答一'),
+          msg('assistant', '还有一句'),
+          msg('assistant', '第三句'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '甲', branchId: 'b1'),
+              msg('assistant', '答二'),
+            ],
+            active: true),
+      ]);
+      for (final text in <String>['答一', '还有一句', '第三句']) {
+        final node = nodes.firstWhere((n) => n.detail == text);
+        expect(node.versionLabel, '版本 1', reason: text);
+        expect(node.chainLength, 3, reason: text);
+      }
+      // 主干上的没有版本身份 —— 它们不属于任何一个可删的版本。
+      expect(nodes.firstWhere((n) => n.detail == '甲').versionLabel, '');
+    });
+
+    test('旁支上的节点知道自己在那一版里排第几', () {
+      // 旁支不在活动路径上，改不了 history —— 删它里面一条只能把那一版
+      // 整段重写。所以每个节点都得答得出自己在那一段里的下标。
+      final nodes = graph(<ChatMessage>[
+        msg('user', '甲', branchId: 'b1'),
+        msg('assistant', '答二'),
+      ], <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '甲', branchId: 'b1'),
+          msg('assistant', '答一'),
+          msg('assistant', '还有一句'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '甲', branchId: 'b1'),
+              msg('assistant', '答二'),
+            ],
+            active: true),
+      ]);
+      // 共享前缀是 1（那句问话画在主干上），所以旁支第一条在整段里是第 1 条。
+      expect(nodes.firstWhere((n) => n.detail == '答一').tailPos, 1);
+      expect(nodes.firstWhere((n) => n.detail == '还有一句').tailPos, 2);
+      // 主干上那些改 history 就行，用不着这个下标。
+      expect(nodes.firstWhere((n) => n.detail == '答二').tailPos, -1);
+    });
+
+    test('编辑重发那种：旁支的头就是整段的第 0 条', () {
+      // 那一条是这一版的锚点，删了这一版就没有起点了 —— 界面据此不让删。
+      final nodes = graph(<ChatMessage>[
+        msg('assistant', '在的'),
+        msg('user', '改过的问法', branchId: 'b1'),
+      ], <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '原来的问法', branchId: 'b1'),
+          msg('assistant', '旧答'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '改过的问法', branchId: 'b1'),
+            ],
+            active: true),
+      ]);
+      expect(nodes.firstWhere((n) => n.detail == '原来的问法').tailPos, 0);
+      expect(nodes.firstWhere((n) => n.detail == '旧答').tailPos, 1);
+    });
+
     test('每个节点都找得到自己的父亲', () {
       // 连线是按 parentId 找的，找不到就少画一段 —— 而缺一段线的图看起来
       // 像是有几个节点凭空飘着。

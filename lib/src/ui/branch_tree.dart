@@ -324,6 +324,9 @@ class GraphNode {
     this.total = 0,
     this.onActivePath = false,
     this.branchHead = false,
+    this.chainLength = 0,
+    this.messageId,
+    this.tailPos = -1,
   });
 
   final String id;
@@ -356,6 +359,50 @@ class GraphNode {
   /// 这是一支旁支的**第一个**节点。只有它挂「版本 N」那个标签 ——
   /// 每个节点都挂的话，一支上会重复十几遍同一句话。
   final bool branchHead;
+
+  /// 这一支一共几个节点。
+  ///
+  /// 长按菜单要用它说清"删的是整整 N 条"。**不说清就会删错** ——
+  /// 一个节点的标题是它的角色（「回复」「命令」），长按看到「删掉回复」
+  /// 的人会以为删的是这一条消息，而实际删掉的是它所在的**整个版本**。
+  final int chainLength;
+
+  /// 这一条在数据库里的行 id。**只有活动路径上那些有** —— 旁支画的是
+  /// 从段里解出来的快照，那些消息没有行 id。
+  ///
+  /// 删单条消息时靠它定位。
+  final int? messageId;
+
+  /// 这一条在**那一版存下来的那一段**里排第几。旁支才有，主干是 -1。
+  ///
+  /// 删旁支里的单条消息时靠它定位 —— 那一支不在活动路径上，改不了
+  /// history，只能把那一版的内容整段重写一遍。
+  final int tailPos;
+
+  /// 「版本 2」。主干上的消息没有。
+  ///
+  /// 每个节点都算得出来，而不是只有头节点有：菜单是从任意一个节点长按
+  /// 出来的，它必须能说出自己属于第几版。
+  String get versionLabel => branchId == null ? '' : '版本 ${index + 1}';
+
+  GraphNode withChain(int length) => GraphNode(
+        id: id,
+        kind: kind,
+        col: col,
+        row: row,
+        parentId: parentId,
+        label: label,
+        detail: detail,
+        role: role,
+        branchId: branchId,
+        index: index,
+        total: total,
+        onActivePath: onActivePath,
+        branchHead: branchHead,
+        chainLength: length,
+        messageId: messageId,
+        tailPos: tailPos,
+      );
 
   /// 点它能跳过去。主干上的消息不用跳，你已经在上面了。
   bool get jumpable => branchId != null && !onActivePath;
@@ -449,6 +496,7 @@ List<GraphNode> layoutBranchGraph(
     bool onPath = true,
     String? headLabel,
     Set<String> open = const <String>{},
+    int tailOffset = 0,
   }) {
     var id = parentId;
     var col = parentCol;
@@ -456,7 +504,7 @@ List<GraphNode> layoutBranchGraph(
     var first = true;
     var end = (id: id, col: col, row: row);
 
-    void emit(ChatMessage message, {String? head}) {
+    void emit(ChatMessage message, {String? head, int pos = -1}) {
       col += 1;
       final nodeId = 'n${uid++}';
       out.add(GraphNode(
@@ -473,6 +521,9 @@ List<GraphNode> layoutBranchGraph(
         total: total,
         onActivePath: onPath,
         branchHead: head != null,
+        messageId: message.messageId,
+        // 主干那些改 history 就行，用不着这个下标。
+        tailPos: onPath ? -1 : pos,
       ));
       id = nodeId;
       end = (id: id, col: col, row: row);
@@ -501,7 +552,9 @@ List<GraphNode> layoutBranchGraph(
         // 各版本一开头共有的那几条只画一遍，画在主干上。
         final common = _commonPrefix(siblings);
         for (var k = 0; k < common && mi + k < messages.length; k++) {
-          emit(messages[mi + k], head: first && k == 0 ? headLabel : null);
+          emit(messages[mi + k],
+              head: first && k == 0 ? headLabel : null,
+              pos: tailOffset + mi + k);
           first = false;
         }
         // 挂点：有共享前缀就挂在最后一条共享的下面，没有就挂在岔口**前面**
@@ -548,6 +601,8 @@ List<GraphNode> layoutBranchGraph(
             onPath: live,
             headLabel: '版本 ${variant.index + 1}',
             open: <String>{...open, anchor},
+            // 旁支画的是 tail[common..]，它的第 k 条在整段里是 common + k。
+            tailOffset: live ? 0 : common,
           );
           if (live) activeEnd = tip;
         }
@@ -563,7 +618,9 @@ List<GraphNode> layoutBranchGraph(
       final straight = j - mi;
       if (straight > _collapseRun) {
         for (var k = 0; k < _keepEnds; k++) {
-          emit(messages[mi + k], head: first && k == 0 ? headLabel : null);
+          emit(messages[mi + k],
+              head: first && k == 0 ? headLabel : null,
+              pos: tailOffset + mi + k);
           first = false;
         }
         col += 1;
@@ -588,7 +645,7 @@ List<GraphNode> layoutBranchGraph(
         continue;
       }
 
-      emit(message, head: first ? headLabel : null);
+      emit(message, head: first ? headLabel : null, pos: tailOffset + mi);
       first = false;
     }
     return end;
@@ -609,7 +666,21 @@ List<GraphNode> layoutBranchGraph(
     label: '当前位置',
     onActivePath: true,
   ));
-  return out;
+
+  // 收尾：告诉每个节点它那一支有多长。菜单要拿它说清"删的是整整 N 条"。
+  final counts = <String, int>{};
+  for (final node in out) {
+    if (node.branchId == null) continue;
+    final key = '${node.branchId}#${node.index}';
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return <GraphNode>[
+    for (final node in out)
+      if (node.branchId == null)
+        node
+      else
+        node.withChain(counts['${node.branchId}#${node.index}'] ?? 1),
+  ];
 }
 
 /// 这几个版本一开头共有多少条一模一样的消息。

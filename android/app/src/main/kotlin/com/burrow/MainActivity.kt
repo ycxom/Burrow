@@ -11,6 +11,7 @@ import android.view.WindowManager
 import com.burrow.bridge.PtyBridge
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 
@@ -44,11 +45,43 @@ class MainActivity : FlutterActivity() {
     private fun secureStore() =
         getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE)
 
+    /**
+     * **引擎存在进程里，不跟着 Activity 走。**
+     *
+     * 默认的 FlutterActivity 自己建引擎、自己在 onDestroy 里销毁它。于是
+     * Activity 一被重建，Dart 虚拟机就整个没了：内存里那份会话、正在跑的
+     * 那一轮请求、滚动位置，全部从零开始 —— 用户看到的是"什么都没操作，
+     * 自己回到了新对话"。
+     *
+     * 而 Activity 重建是**系统随时可以做的事**，不需要用户动一根手指：
+     * 没在 `configChanges` 里声明的配置项变一次就重建一次，而那张清单
+     * 永远列不全（mcc/mnc、colorMode、以后新增的那些）。所以真正的解法
+     * 不是把清单补齐，是让引擎不依赖 Activity 活着。
+     *
+     * 代价是引擎会一直占着内存直到进程结束。那正是我们要的：后台那一轮
+     * 生成也靠它继续跑（见 GenerationService）。
+     */
+    override fun provideFlutterEngine(context: Context): FlutterEngine {
+        val cached = FlutterEngineCache.getInstance().get(ENGINE_ID)
+        if (cached != null) return cached
+        val engine = FlutterEngine(applicationContext)
+        FlutterEngineCache.getInstance().put(ENGINE_ID, engine)
+        return engine
+    }
+
+    /** 引擎是我们自己存着的，Activity 没了也不许销毁它。 */
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
         // PtyBridge 不是一个 pub 插件，所以不会被自动注册，必须手动加。
-        flutterEngine.plugins.add(PtyBridge())
+        //
+        // 引擎复用之后这个方法每次挂载都会走一遍，加之前先看有没有 ——
+        // 重复 add 会把上一个实例 detach 掉，而它手里正握着 pty。
+        if (!flutterEngine.plugins.has(PtyBridge::class.java)) {
+            flutterEngine.plugins.add(PtyBridge())
+        }
 
         // Dart 侧要知道 APK 解出来的 .so 放在哪，才能把 libburrow-launch.so
         // 复制成 $PREFIX/libexec/burrow-launch（见 BootstrapInstaller）。
@@ -439,6 +472,9 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val MEDIA_PICKER_CHANNEL = "com.burrow/media_picker"
+        /** 缓存引擎的 key。整个进程只有这一个引擎。 */
+        private const val ENGINE_ID = "burrow.engine"
+
         private const val SECURE_PREFS = "burrow_window"
         private const val KEY_SECURE = "secure"
 

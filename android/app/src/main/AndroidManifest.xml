@@ -18,13 +18,21 @@
         android:usesCleartextTraffic="true"
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher">
+        <!-- **mcc|mnc 这两条是后补的，而且它们是关键。**
+             没声明的配置项一变，系统就重建 Activity。mcc/mnc 是移动网络的
+             国家码和运营商码 —— 手机在信号格之间切换、双卡换网、进出电梯，
+             都会让它们变一次。而重建 Activity 在默认的 FlutterActivity 下
+             等于把 Dart 虚拟机整个销毁重来：用户什么都没操作，会话却回到了
+             一个空白的新对话。
+             （真正兜底的是下面那个缓存引擎，见 MainActivity。这里少重建一次
+             仍然是赚的：重建要重新布局、重新走一遍启动路径。） -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode|mcc|mnc|navigation|touchscreen|colorMode|fontWeightAdjustment"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
             <!-- Specifies an Android theme to apply to this Activity as soon as

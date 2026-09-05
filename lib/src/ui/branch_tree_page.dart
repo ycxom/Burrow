@@ -39,12 +39,19 @@ const double _nodeRadius = 15;
 const double _minScale = 0.35;
 const double _maxScale = 2.5;
 
+/// 视口之外还建多远的节点。
+///
+/// 一屏多一点：手指划过去的时候下一批已经在了，不会看到节点一个个"长"
+/// 出来；再大就白建了。
+const double _preloadMargin = 600;
+
 class BranchTreePage extends StatefulWidget {
   const BranchTreePage({
     required this.history,
     required this.variants,
     required this.onJump,
     required this.onDelete,
+    required this.onDeleteMessage,
     super.key,
   });
 
@@ -57,8 +64,11 @@ class BranchTreePage extends StatefulWidget {
   /// 跳到某一版。调用方负责把整条路径依次切过去。
   final Future<void> Function(String branchId, int index) onJump;
 
-  /// 删掉某一版。
+  /// 删掉某一版。**只从版头进** —— 见 [_NodeTile._menu]。
   final Future<void> Function(String branchId, int index) onDelete;
+
+  /// 删掉单独一条消息。
+  final Future<void> Function(GraphNode node) onDeleteMessage;
 
   @override
   State<BranchTreePage> createState() => _BranchTreePageState();
@@ -67,14 +77,63 @@ class BranchTreePage extends StatefulWidget {
 class _BranchTreePageState extends State<BranchTreePage> {
   final _transform = TransformationController();
 
-  /// 已经自动缩过一次了。**只缩一次** —— 之后每次重建都强行摆正的话，
+  /// 已经摆过一次了。**只摆一次** —— 之后每次重建都强行摆正的话，
   /// 用户放大看某一支时会被反复推回原位。
-  bool _fitted = false;
+  bool _placed = false;
+
+  /// 视口大小。虚拟化要靠它算"现在看得见哪一块"。
+  Size _viewport = Size.zero;
 
   @override
   void dispose() {
     _transform.dispose();
     super.dispose();
+  }
+
+  /// 一进来先落在「当前位置」上。
+  ///
+  /// 图是按对话顺序从左往右长的，而「当前位置」在最右端 —— 从起点开始看
+  /// 等于每次打开都要先划过整条对话。用户打开这一页想问的是"我现在在
+  /// 哪儿、旁边还有什么"，那就直接摆到那儿。
+  void _centerOn(GraphNode node, Size viewport) {
+    if (viewport.isEmpty) return;
+    const scale = 1.0;
+    final x = (node.col + 0.5) * _cellWidth + 16;
+    final y = (node.row + 0.5) * _cellHeight + 12;
+    _transform.value = Matrix4.identity()
+      ..translateByDouble(
+        viewport.width / 2 - x * scale,
+        viewport.height / 2 - y * scale,
+        0,
+        1,
+      )
+      ..scaleByDouble(scale, scale, 1, 1);
+  }
+
+  /// 这一刻**画得出来**的那几格：视口范围往外放一圈。
+  ///
+  /// 视口是屏幕坐标，节点是图坐标，中间隔着 InteractiveViewer 那个矩阵 ——
+  /// 所以要拿它的逆把视口映射回图上。视口还没量出来时全画（第一帧，
+  /// 那时图往往也还小）。
+  List<GraphNode> _visibleNodes(List<GraphNode> nodes) {
+    if (_viewport.isEmpty) return nodes;
+    final matrix = _transform.value;
+    if (matrix.determinant() == 0) return nodes;
+    final inverse = Matrix4.inverted(matrix);
+    final topLeft = MatrixUtils.transformPoint(inverse, Offset.zero);
+    final bottomRight = MatrixUtils.transformPoint(
+        inverse, Offset(_viewport.width, _viewport.height));
+    final view = Rect.fromPoints(topLeft, bottomRight).inflate(_preloadMargin);
+    return <GraphNode>[
+      for (final node in nodes)
+        if (view.overlaps(Rect.fromLTWH(
+          node.col * _cellWidth,
+          node.row * _cellHeight,
+          _cellWidth,
+          _cellHeight,
+        )))
+          node,
+    ];
   }
 
   /// 把整张图塞进屏幕。
@@ -148,15 +207,24 @@ class _BranchTreePageState extends State<BranchTreePage> {
               builder: (context, constraints) {
                 // 图比屏幕宽的时候先自动缩一次，让人一进来看到的是全貌。
                 // 排完版才知道有多宽，所以只能排到这一帧之后再摆。
-                if (!_fitted && constraints.hasBoundedWidth) {
-                  _fitted = true;
-                  final viewport =
-                      Size(constraints.maxWidth, constraints.maxHeight);
-                  if (content.width > viewport.width) {
-                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                      if (mounted) _fit(viewport, content);
-                    });
-                  }
+                _viewport = Size(constraints.maxWidth, constraints.maxHeight);
+                if (!_placed && constraints.hasBoundedWidth) {
+                  _placed = true;
+                  final viewport = _viewport;
+                  final here = nodes.lastWhere(
+                    (n) => n.kind == GraphNodeKind.here,
+                    orElse: () => nodes.first,
+                  );
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (!mounted) return;
+                    // 整张图本来就装得下就摆正中间，装不下就落在当前位置上。
+                    if (content.width <= viewport.width &&
+                        content.height <= viewport.height) {
+                      _fit(viewport, content);
+                    } else {
+                      _centerOn(here, viewport);
+                    }
+                  });
                 }
                 return GestureDetector(
                   // 双击回到 100%。InteractiveViewer 自己不接双击，
@@ -190,18 +258,33 @@ class _BranchTreePageState extends State<BranchTreePage> {
                                 ),
                               ),
                             ),
-                            for (final node in nodes)
-                              Positioned(
-                                left: node.col * _cellWidth,
-                                top: node.row * _cellHeight,
-                                width: _cellWidth,
-                                height: _cellHeight,
-                                child: _NodeTile(
-                                  node: node,
-                                  onJump: widget.onJump,
-                                  onDelete: widget.onDelete,
-                                ),
+                            // **只建看得见的那几格**，外加一圈预载。
+                            //
+                            // 一条聊了几百轮的对话有几百个节点。全部建出来
+                            // 是几百个 widget 一次性布局 —— 那就是打开这
+                            // 一页时那一下卡顿。而屏幕上同时装得下的从来
+                            // 只有十几格。
+                            ValueListenableBuilder<Matrix4>(
+                              valueListenable: _transform,
+                              builder: (_, __, ___) => Stack(
+                                clipBehavior: Clip.none,
+                                children: <Widget>[
+                                  for (final node in _visibleNodes(nodes))
+                                    Positioned(
+                                      left: node.col * _cellWidth,
+                                      top: node.row * _cellHeight,
+                                      width: _cellWidth,
+                                      height: _cellHeight,
+                                      child: _NodeTile(
+                                        node: node,
+                                        onJump: widget.onJump,
+                                        onDelete: widget.onDelete,
+                                        onDeleteMessage: widget.onDeleteMessage,
+                                      ),
+                                    ),
+                                ],
                               ),
+                            ),
                           ],
                         ),
                       ),
@@ -290,11 +373,13 @@ class _NodeTile extends StatelessWidget {
     required this.node,
     required this.onJump,
     required this.onDelete,
+    required this.onDeleteMessage,
   });
 
   final GraphNode node;
   final Future<void> Function(String branchId, int index) onJump;
   final Future<void> Function(String branchId, int index) onDelete;
+  final Future<void> Function(GraphNode node) onDeleteMessage;
 
   @override
   Widget build(BuildContext context) {
@@ -378,8 +463,8 @@ class _NodeTile extends StatelessWidget {
       // 而"点了没反应"永远会被当成坏了。
       onTap: node.jumpable ? () => onJump(node.branchId!, node.index) : null,
       // 只剩一版时不给删：那等于删这段对话，是另一个动作。
-      onLongPress:
-          node.branchId != null && node.total > 1 ? () => _menu(context) : null,
+      // 任何一条消息都能长按：版头管整版，其余管自己那一条。
+      onLongPress: () => _menu(context),
       child: _Labelled(
         label: node.label,
         color: node.branchHead ? t.tintWarning : accent,
@@ -415,8 +500,21 @@ class _NodeTile extends StatelessWidget {
         _ => Icons.info_outline,
       };
 
+  /// 长按弹出来的那个。
+  ///
+  /// ## 「删掉整版」只从**版头**进
+  ///
+  /// 早先随便一个节点长按都能删整版，而中间那些节点的标题是它的角色
+  /// （「回复」「命令」）—— 长按第三条看到「删掉回复」，谁都会读成
+  /// "删这一条"，按下去却把整支都删了。
+  ///
+  /// 现在分开：**版头**那一格才管整版（它本来就代表"这一支"），中间那些
+  /// 只管自己那一条。想删整版的人会先找到那一支的开头，而那正是他脑子里
+  /// "这一版"的样子。
   Future<void> _menu(BuildContext context) async {
     final t = context.chat;
+    final version = node.versionLabel;
+    final head = node.branchHead && node.total > 1;
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: t.bgPrimary,
@@ -424,30 +522,64 @@ class _NodeTile extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  version.isEmpty
+                      ? node.detail
+                      : '$version · 共 ${node.chainLength} 条',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: t.tintSecondary,
+                  ),
+                ),
+              ),
+            ),
             if (node.jumpable)
               ListTile(
                 leading: const Icon(Icons.my_location),
-                title: Text('跳到${node.label}'),
+                title: Text('跳到$version'),
+                subtitle:
+                    const Text('把对话换成这一版', style: TextStyle(fontSize: 11)),
                 onTap: () {
                   Navigator.pop(ctx);
                   onJump(node.branchId!, node.index);
                 },
               ),
-            ListTile(
-              leading: Icon(Icons.delete_outline, color: t.tintError),
-              title:
-                  Text('删掉${node.label}', style: TextStyle(color: t.tintError)),
-              subtitle: Text(
-                node.detail.isEmpty ? '这一版的内容会被删除' : node.detail,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 11),
+            if (head)
+              ListTile(
+                leading: Icon(Icons.delete_sweep_outlined, color: t.tintError),
+                title: Text('删掉$version', style: TextStyle(color: t.tintError)),
+                subtitle: Text(
+                  '这一版的 ${node.chainLength} 条内容会一起删掉',
+                  style: const TextStyle(fontSize: 11),
+                ),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDelete(node.branchId!, node.index);
+                },
+              )
+            else
+              ListTile(
+                leading: Icon(Icons.delete_outline, color: t.tintError),
+                title: Text('删除这一条', style: TextStyle(color: t.tintError)),
+                subtitle: Text(
+                  node.detail.isEmpty ? '只删这一条，别的不动' : node.detail,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11),
+                ),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteMessage(node);
+                },
               ),
-              onTap: () {
-                Navigator.pop(ctx);
-                onDelete(node.branchId!, node.index);
-              },
-            ),
+            const SizedBox(height: 8),
           ],
         ),
       ),
