@@ -24,6 +24,7 @@ import '../data/chat_store.dart';
 import '../data/task_runtime.dart';
 import '../net/battery_policy.dart';
 import '../net/process_guard.dart';
+import '../net/screen_guard.dart';
 import '../sandbox/exec_policy.dart';
 import '../sandbox/interactive_shell.dart';
 import '../sandbox/prefix_generations.dart';
@@ -609,6 +610,10 @@ class _ChatShellState extends State<ChatShell> {
     try {
       final id = widget.settings.lastThreadId;
       if (id == null) return;
+      // 上次待的那间可能是加密会话。native 那边已经按上次的状态遮过了
+      // （见 MainActivity.onCreate），这里再确认一次 —— 两条路都走通了，
+      // 冷启动才真的不会漏帧。
+      _guardBeforeEntering(id);
       final threads = await widget.chats.threads();
       final match = threads.where((t) => t.id == id);
       if (match.isEmpty) {
@@ -649,9 +654,13 @@ class _ChatShellState extends State<ChatShell> {
         _park(_active);
         _active = _Room(runtimeId: _newDraftId());
       });
+      _applySecure();
       await widget.settings.setLastThreadId(null);
       return;
     }
+    // **先遮再查。** 下面这一串 await 之后界面就换屋子了，
+    // 而那间屋子有没有开防截屏，要等它自己读完库才知道。
+    _guardBeforeEntering(threadId);
     // 标题从库里取。抽屉传过来也行，但那会让「重命名后立刻切过去」
     // 拿到旧标题 —— 多查一次的代价可以忽略。
     final threads = await widget.chats.threads();
@@ -666,6 +675,10 @@ class _ChatShellState extends State<ChatShell> {
         title: match.isEmpty ? '对话' : match.first.title,
       );
     });
+    // 换了屋子，窗口那个标志要跟着换。切进一个防截屏的会话要加上，
+    // 切出来要撤掉 —— 撤不掉的话截屏会在**所有**会话里一直失效，
+    // 而用户只在其中一个会话里开过它。
+    _applySecure();
     await widget.settings.setLastThreadId(threadId);
   }
 
@@ -713,6 +726,38 @@ class _ChatShellState extends State<ChatShell> {
 
   /// 哪些 runtimeId 正在生成。HomeShell 自己报上来。
   final Set<String> _busy = <String>{};
+
+  /// 每间屋子想不想防截屏。
+  final Map<String, bool> _secure = <String, bool>{};
+
+  void _onSecureChanged(String runtimeId, bool secure) {
+    _secure[runtimeId] = secure;
+    _applySecure();
+  }
+
+  /// 把**当前那间**的意愿落到窗口上。
+  ///
+  /// 只看当前那间：`FLAG_SECURE` 是窗口的属性，后台还挂着别的会话时，
+  /// 让它们也参与投票的话，一间后台屋子就能把当前这间的保护撤掉 ——
+  /// 而用户完全看不出发生了什么。
+  ///
+  /// **还不知道就一个字都别撤。** 一间刚打开的屋子要等数据库读完才知道
+  /// 自己该不该保护；这段时间里按"默认不保护"处理，就会先把窗口敞开、
+  /// 等内容画出来之后再遮上 —— 中间那一下是真的能截到图的。
+  /// 多保护几百毫秒没有任何代价，漏一帧有。
+  void _applySecure() {
+    final known = _secure[_active.runtimeId];
+    if (known == null) return;
+    unawaited(ScreenGuard.setSecure(known));
+  }
+
+  /// 切进一间还不知道底细的屋子之前，先把窗口遮上。
+  ///
+  /// 它可能是个加密会话。等它自己报上来再遮就晚了 —— 那时候它的内容
+  /// 已经画过至少一帧。猜错的代价只是白遮一会儿。
+  void _guardBeforeEntering(String runtimeId) {
+    if (_secure[runtimeId] == null) unawaited(ScreenGuard.setSecure(true));
+  }
 
   /// **busy 那一支不许 setState。** 它是在子 widget 的 build 里同步调过来的
   /// （见 `_HomeShellState._reportBusy`），在那儿标脏会直接抛。
@@ -802,6 +847,7 @@ class _ChatShellState extends State<ChatShell> {
       threadId: room.threadId,
       title: room.title,
       onThreadCreated: (id) => _onThreadCreated(room.runtimeId, id),
+      onSecureChanged: (secure) => _onSecureChanged(room.runtimeId, secure),
       onBusyChanged: (busy) => _onBusyChanged(room.runtimeId, busy),
       // 后台那间的这几个回调一律不接：它已经不在屏幕上了，让它改标题、
       // 换会话、弹搜索结果，用户会看到当前这间屋子无缘无故变样。
@@ -879,6 +925,9 @@ class HomeShell extends StatefulWidget {
   /// 系统回收打断的一类。
   final ValueChanged<String>? onThreadCreated;
 
+  /// 这间屋子要不要防截屏。外壳只听**当前那间**的。
+  final ValueChanged<bool>? onSecureChanged;
+
   /// 这间屋子开始/结束生成时报一声。
   ///
   /// 外面拿它决定切走之后要不要把这间留在后台继续跑
@@ -913,6 +962,7 @@ class HomeShell extends StatefulWidget {
     required this.searchTargetMessageId,
     required this.onSearchTargetConsumed,
     this.onThreadCreated,
+    this.onSecureChanged,
     this.onBusyChanged,
   });
 
@@ -1258,11 +1308,21 @@ class _HomeShellState extends State<HomeShell>
     if (threadId != null) {
       _threadPrompt = await widget.chats.systemPromptOf(threadId);
       _prefs = await widget.chats.prefsOf(threadId);
+      // 上了锁的会话默认防截屏 —— 那是同一个担心的两半。
+      _locked = await widget.chats.lockOf(threadId) != null;
     } else {
       // 新会话从当前的全局设置起步。**只是起步** —— 第一条消息落库时会把
       // 这一刻的值定死（见 _pinPrefs），之后改全局不再影响它。
       _prefs = _globalPrefs();
     }
+    // **知道了就立刻报，不等这一帧画完。**
+    //
+    // 下面还要等 runtime、建 agent、读历史，加起来是几百毫秒到几秒。
+    // 等到 build 里再报的话，第一帧内容和"窗口被遮上"之间就隔着一整个
+    // 渲染周期 —— 用户看到的正是"截屏窗口闪了一下"。
+    _secureKnown = true;
+    _reportSecure();
+
     _runtime = await widget.runtime;
     _images = ImageAttachmentStore(Directory('${_runtime.root.path}/images'));
     _agent = widget.buildAgent(this, _runtime);
@@ -2995,6 +3055,25 @@ class _HomeShellState extends State<HomeShell>
   ///
   /// 落盘而不是只留在内存里：切出去一趟、或者被系统回收之后再回来，
   /// 内存里那份早没了 —— 而那恰恰是最需要它的时候。
+  /// 这个会话上了锁没有。决定「防止截屏」的默认值。
+  bool _locked = false;
+
+  /// 已经读出这个会话该不该防截屏了。
+  ///
+  /// 在此之前**什么都不报**：报一个还没读出来的 false，外壳就会把窗口撤开
+  /// （见 `_ChatShellState._applySecure`），而那正是要避免的那一帧。
+  bool _secureKnown = false;
+
+  /// 这一刻要不要防截屏。
+  ///
+  /// 用户明确设过就听他的；没设过时，**上了锁的会话默认开**：会话锁挡的是
+  /// "别人拿到手机点进来"，防截屏挡的是"内容离开这台设备"，一个人会去设
+  /// 前者，多半也不希望后者敞着。
+  bool get _secureScreen => _prefs.secureScreen ?? _locked;
+
+  /// 上一次报上去的防截屏状态。
+  bool? _reportedSecure;
+
   /// 上一次报上去的忙碌状态。
   bool? _reportedBusy;
 
@@ -3003,6 +3082,19 @@ class _HomeShellState extends State<HomeShell>
   /// 在 build 里比对而不是在每一处赋值旁边加一行：`_busy = true` 散落在
   /// 发送、重新生成、切分支好几条路上，逐个加迟早漏掉一处 —— 而漏掉的
   /// 表现是"这间屋子切走之后就没了"，和这个功能本身长得一模一样。
+  /// 防截屏状态一变就往上报。
+  ///
+  /// 由外壳来真正开关那个窗口标志，而不是这里直接调平台：`FLAG_SECURE` 是
+  /// **窗口**的属性，而后台还可能挂着别的会话（见 `_ChatShellState._background`）
+  /// —— 一间后台屋子把它关掉，当前这间就跟着敞开了。
+  void _reportSecure() {
+    if (!_secureKnown) return;
+    final want = _secureScreen;
+    if (want == _reportedSecure) return;
+    _reportedSecure = want;
+    widget.onSecureChanged?.call(want);
+  }
+
   void _reportBusy() {
     if (_busy == _reportedBusy) return;
     _reportedBusy = _busy;
@@ -3054,6 +3146,7 @@ class _HomeShellState extends State<HomeShell>
   @override
   Widget build(BuildContext context) {
     _reportBusy();
+    _reportSecure();
     // 这里以前有一段「键盘弹起时把聊天内容跟着往上挪」。倒序列表之后不需要了
     // ——它的 0 点就锚在底边上，视口一矮，内容自己跟着输入框走。
     // 那段补偿是"列表锚在顶部"逼出来的，锚点一换就整个消失了。
@@ -3832,6 +3925,19 @@ class _HomeShellState extends State<HomeShell>
     return ignored.isEmpty ? touched : '$touched · ${ignored.length} 项当前渠道不认';
   }
 
+  /// 「防止截屏」那一行的说明。
+  ///
+  /// **说清楚它挡不住什么。** 一道防护最危险的时刻，是用户以为它比实际更强
+  /// 的时候 —— 那会改变他往这个会话里放什么。会话锁那边写过同一句话。
+  String _secureSummary() {
+    if (!_secureScreen) {
+      return _locked ? '已关。这个会话上着锁，建议开' : '截屏、录屏、投屏都不拦';
+    }
+    return _prefs.secureScreen == null
+        ? '跟着会话锁开着 · 挡截屏录屏，挡不住拿别的设备拍屏幕'
+        : '挡截屏、录屏、投屏和最近任务缩略图，挡不住拍屏幕';
+  }
+
   Future<void> _editSampling() async {
     await showSamplingPage(
       context,
@@ -3985,6 +4091,15 @@ class _HomeShellState extends State<HomeShell>
   }
 
   Future<void> _showComposerMenu() async {
+    // 锁是在抽屉里设的，设完不会回来通知这边。开菜单时现查一次 ——
+    // 不查的话「上了锁默认防截屏」要等下次重开会话才生效，
+    // 而用户恰恰是刚设完锁的那一刻最想确认这件事。
+    final id = _threadId;
+    if (id != null) {
+      final locked = await widget.chats.lockOf(id) != null;
+      if (!mounted) return;
+      if (locked != _locked) setState(() => _locked = locked);
+    }
     await showAnchoredMenu<void>(
       context: context,
       anchor: _plusKey,
@@ -4048,6 +4163,25 @@ class _HomeShellState extends State<HomeShell>
             _editSampling();
           },
         ),
+        if (ScreenGuard.supported)
+          MenuAction(
+            icon: _secureScreen
+                ? Icons.no_photography_outlined
+                : Icons.photo_camera_back_outlined,
+            label: '防止截屏',
+            detail: _secureSummary(),
+            trailing: Switch(
+              value: _secureScreen,
+              onChanged: (on) async {
+                await _updatePrefs(_prefs.copyWith(secureScreen: on));
+                refresh();
+              },
+            ),
+            onTap: () async {
+              await _updatePrefs(_prefs.copyWith(secureScreen: !_secureScreen));
+              refresh();
+            },
+          ),
       ],
     );
     if (mounted) setState(() {});

@@ -30,6 +30,7 @@ class ThreadPrefs {
     this.thinkingEffort,
     this.temperature,
     this.sampling = SamplingParams.none,
+    this.secureScreen,
   });
 
   /// 这个会话发往哪个渠道。null = 跟当前渠道。
@@ -45,6 +46,14 @@ class ThreadPrefs {
   /// 0–2。各协议上界不同，夹取交给调用方 —— 这里只负责存。
   final double? temperature;
 
+  /// 防止截屏。null = 跟这个会话的默认（上了锁的默认开，见 app.dart 的
+  /// `_secureByDefault`）。
+  ///
+  /// 放在这里而不是会话锁里，是因为这两件事**可以分开要**：一段不想让人
+  /// 从背后看到、也不想进最近任务缩略图的对话，未必需要每次进来都输密码；
+  /// 反过来，上了锁的对话默认就该防截屏 —— 那是同一个担心的两半。
+  final bool? secureScreen;
+
   /// 极客设置。和上面几项不同，它**没有全局默认可跟** —— 空就是空，
   /// 一个字段都不发（见 llm/sampling.dart）。
   ///
@@ -57,7 +66,8 @@ class ThreadPrefs {
       model == null &&
       thinkingEffort == null &&
       temperature == null &&
-      sampling.isEmpty;
+      sampling.isEmpty &&
+      secureScreen == null;
 
   ThreadPrefs copyWith({
     String? channelId,
@@ -65,6 +75,7 @@ class ThreadPrefs {
     ThinkingEffort? thinkingEffort,
     double? temperature,
     SamplingParams? sampling,
+    bool? secureScreen,
   }) =>
       ThreadPrefs(
         channelId: channelId ?? this.channelId,
@@ -72,6 +83,7 @@ class ThreadPrefs {
         thinkingEffort: thinkingEffort ?? this.thinkingEffort,
         temperature: temperature ?? this.temperature,
         sampling: sampling ?? this.sampling,
+        secureScreen: secureScreen ?? this.secureScreen,
       );
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -82,6 +94,7 @@ class ThreadPrefs {
         if (thinkingEffort != null) 'thinking': thinkingEffort!.storage,
         if (temperature != null) 'temperature': temperature,
         if (!sampling.isEmpty) 'sampling': sampling.toJson(),
+        if (secureScreen != null) 'secureScreen': secureScreen,
       };
 
   static ThreadPrefs fromJson(Object? raw) {
@@ -99,6 +112,11 @@ class ThreadPrefs {
       thinkingEffort: _thinkingFrom(raw['thinking']),
       temperature: temperature is num ? temperature.toDouble() : null,
       sampling: SamplingParams.fromJson(raw['sampling']),
+      secureScreen: raw['secureScreen'] is bool
+          ? raw['secureScreen'] as bool
+          // 认不出来当成没设过。填一个默认值进去会让"上了锁默认防截屏"
+          // 那条规则被一个坏字段悄悄关掉。
+          : null,
     );
   }
 
@@ -117,9 +135,10 @@ class ThreadPrefs {
       other.model == model &&
       other.thinkingEffort == thinkingEffort &&
       other.temperature == temperature &&
-      other.sampling == sampling;
+      other.sampling == sampling &&
+      other.secureScreen == secureScreen;
 
   @override
-  int get hashCode =>
-      Object.hash(channelId, model, thinkingEffort, temperature, sampling);
+  int get hashCode => Object.hash(
+      channelId, model, thinkingEffort, temperature, sampling, secureScreen);
 }

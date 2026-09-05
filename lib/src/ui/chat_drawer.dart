@@ -17,6 +17,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../net/screen_guard.dart';
 import '../data/chat_store.dart';
 import '../data/task_runtime.dart';
 import '../net/device_auth.dart';
@@ -686,6 +687,13 @@ class _ChatDrawerState extends State<ChatDrawer> {
   Future<bool> _passGate(ChatThread thread) async {
     final lock = await widget.store.lockOf(thread.id);
     if (lock == null) return true;
+    // 上着锁的会话，从这一刻起就把窗口遮上。
+    //
+    // 接下来要出现的是密码输入框和几道安全问题 —— 那些本身就是不该被截屏、
+    // 也不该进最近任务缩略图的东西；而且开锁成功之后紧接着就是会话内容，
+    // 等它自己读完库再遮就晚了一帧。撤销由聊天页那边负责（它读完库之后会
+    // 报上自己真正的意愿）。
+    unawaited(ScreenGuard.setSecure(true));
     if (widget.unlocked.isUnlocked(thread.id)) return true;
     // 标准答案现从会话里取 —— 不落盘，也就不会和被删过的消息对不上。
     final facts = await _factsOf(thread);

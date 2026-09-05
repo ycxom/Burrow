@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.WindowManager
 import com.burrow.bridge.PtyBridge
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -19,6 +20,29 @@ class MainActivity : FlutterActivity() {
     private var pendingImageSlot: String? = null
     private var pendingSkinResult: MethodChannel.Result? = null
     private var pendingCredentialResult: MethodChannel.Result? = null
+
+    /**
+     * **在窗口建出来之前**把上次那个防截屏状态装回去。
+     *
+     * 不这么做就会漏一帧：Dart 那边要先读数据库才知道这个会话该不该保护，
+     * 而那时候第一帧内容早就画出去了 —— 用户看到的是"截屏窗口闪了一下"，
+     * 而在那一下里截屏是真的能截到的。
+     *
+     * 所以状态存在 native 这边：上一次设成什么，下一次冷启动的**第一帧**
+     * 就是什么。Dart 读完数据库之后再来纠正（多半不用纠正）。
+     *
+     * 宁可多保护一会儿：装回来的是 true 而实际不需要，代价只是几百毫秒内
+     * 截不了图；反过来漏一帧，代价是内容真的被截走了。
+     */
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        if (secureStore().getBoolean(KEY_SECURE, false)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        super.onCreate(savedInstanceState)
+    }
+
+    private fun secureStore() =
+        getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE)
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -70,6 +94,29 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         // 起不来不该让这一轮对话失败：没有前台服务只是"退到
                         // 后台可能被杀"，而抛上去会变成一条看不懂的报错气泡。
+                        result.success(false)
+                    }
+                }
+
+                // 防止截屏 / 录屏 / 投屏，也让最近任务里那张缩略图变成空白。
+                //
+                // 只有窗口这一个开关（FLAG_SECURE），所以它天然是**全窗口**
+                // 的：Dart 侧按"当前打开的是哪个会话"来开关它。
+                "setSecure" -> {
+                    val on = call.argument<Boolean>("on") ?: false
+                    try {
+                        if (on) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                        } else {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                        }
+                        // 记下来，下次冷启动第一帧就照这个来（见 onCreate）。
+                        secureStore().edit().putBoolean(KEY_SECURE, on).apply()
+                        result.success(true)
+                    } catch (_: Exception) {
+                        // 设不上不该让聊天失败。**但也不能谎报成功** ——
+                        // 界面要照着返回值说"这台设备上没生效"，
+                        // 而不是让用户以为自己被保护着。
                         result.success(false)
                     }
                 }
@@ -392,6 +439,9 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val MEDIA_PICKER_CHANNEL = "com.burrow/media_picker"
+        private const val SECURE_PREFS = "burrow_window"
+        private const val KEY_SECURE = "secure"
+
         private const val SYSTEM_CHANNEL = "com.burrow/system"
         private const val REQUEST_PICK_IMAGE = 0xB012
         private const val REQUEST_PICK_SKIN = 0xB013
