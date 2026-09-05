@@ -82,6 +82,13 @@ abstract class AgentHost {
   /// AgentLoop 内部塞进 history 的 —— 不通知的话它们要等到下次重开会话
   /// 才出现，而"重开之后多出来几条消息"比一开始就看见更让人困惑。
   void onContextMessage(ChatMessage message);
+
+  /// 摘要状态在**回合之外**变过了，去落一次盘。
+  ///
+  /// 回合结束之后那次压缩是不等的（见 [AgentLoop._compactLater]），它落地时
+  /// 这一轮的落盘早就跑完了。不补这一下的话，摘要只活在内存里 —— 切走再
+  /// 切回来就没了，而那正是"压缩好像从来没生效过"的一种。
+  void onMemoryUpdated();
 }
 
 /// LLM 后端。用一个窄接口隔开，chatbox 那套 provider 抽象可以直接塞进来实现它。
@@ -456,6 +463,29 @@ class AgentLoop {
     _reportCompaction(await overflow.onMessageAdded(history));
   }
 
+  /// 回合结束之后那一次压缩：**发起，但不等它**。
+  ///
+  /// ## 为什么不能等
+  ///
+  /// 那一刻回答已经写完、已经交付了，这次压缩只是在给**下一轮**做准备。
+  /// 等它的话，用户看着答案已经出来了，输入框却还要再灰上一整个请求的时间
+  /// —— 而那段时间里 `+` 里的东西一个都点不了（那个按钮是按"正在生成"
+  /// 灰掉的）。看起来就是"回答完了但 app 还卡着"。
+  ///
+  /// ## 不等安全吗
+  ///
+  /// 安全，而且这几条是它成立的全部依据：
+  ///
+  ///   - [OverflowManager.onMessageAdded] 自己不抛，失败只会记下原因；
+  ///   - 它一进去就把要摘的那一段同步切出来，之后 history 再怎么变都不影响
+  ///     手里这批；
+  ///   - 中途历史被砍（回退、切分支）时 `truncateTo` 会把 epoch 推掉，
+  ///     在途的结果会被丢弃，不会把一份对不上的摘要写回去；
+  ///   - 同一时刻只会有一次（`_summarizing` 挡着），下一轮发送撞上它就跳过。
+  void _compactLater() {
+    unawaited(_compact().then((_) => host.onMemoryUpdated()));
+  }
+
   /// 重新生成最后一条回复。
   ///
   /// 和 [send] 的差别只有一处：**不追加新的用户消息**，那条问话原样留着。
@@ -585,7 +615,9 @@ class AgentLoop {
     // 场景 —— 它没有工具输出可蒸馏，全是原文。
     //
     // 实测发现的：终端模式关掉后连聊十几轮，`overflow.checkpoint` 一直是 0。
-    await _compact();
+    //
+    // **这一次不等。** 回答已经交付，它只是给下一轮做准备 —— 见 _compactLater。
+    _compactLater();
   }
 
   /// 把压缩的结果说出来 —— **成功和失败都要说**。

@@ -2865,6 +2865,23 @@ class _HomeShellState extends State<HomeShell>
     if (mounted) setState(() => _visible.add(message));
   }
 
+  @override
+  void onMemoryUpdated() {
+    // 回合结束之后那次压缩不等它跑完（见 AgentLoop._compactLater），
+    // 所以它落地时这一轮的落盘早跑完了 —— 这里补一次。
+    //
+    // 只写摘要那一份，**不重写整段历史**：这一刻用户可能已经在打下一句、
+    // 甚至已经切走了，拿一份可能过时的 history 去 replaceMessages 是在
+    // 用旧数据盖新数据。而摘要状态和历史内容是两笔账。
+    final id = _threadId;
+    if (id == null || !mounted) return;
+    unawaited(widget.chats.setMemory(
+      id,
+      _agent.overflow.summary,
+      _agent.overflow.checkpoint,
+    ));
+  }
+
   // ---- 交互 ----
 
   Future<void> _send() async {

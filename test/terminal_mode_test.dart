@@ -98,6 +98,11 @@ class _RecordingHost implements AgentHost {
     toolMessages.add(message);
     feed.add('end:${message.toolTitle}:${message.toolOk ? 'ok' : 'fail'}');
   }
+
+  int memoryUpdates = 0;
+
+  @override
+  void onMemoryUpdated() => memoryUpdates++;
 }
 
 class _NeverSpawns implements NativePtySpawner {

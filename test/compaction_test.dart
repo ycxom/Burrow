@@ -308,4 +308,51 @@ void main() {
       expect(overflow.checkpoint, 0);
     });
   });
+
+  group('回合结束之后那次压缩不挡路', () {
+    test('summarize 还没回来，onMessageAdded 就已经把控制权交回去了', () async {
+      // 那一刻回答已经写完、已经交付了，这次压缩只是在给下一轮做准备。
+      // 等它的话，用户看着答案已经出来，输入框却还要再灰上一整个请求的
+      // 时间 —— 而那段时间里 `+` 里的东西一个都点不了。
+      final gate = Completer<String>();
+      final overflow = OverflowManager(
+        summarize: (_, __) => gate.future,
+        trigger: OverflowTrigger.messageCount,
+        messageThreshold: 2,
+      );
+      final log = history(20);
+
+      var done = false;
+      // 不 await —— 这正是 AgentLoop._compactLater 的做法。
+      unawaited(overflow.onMessageAdded(log).then((_) => done = true));
+      await Future<void>.delayed(Duration.zero);
+      expect(done, isFalse, reason: '它还挂在那次请求上');
+
+      // 而调用方这时早就可以接着干别的了。
+      gate.complete('摘要');
+      await Future<void>.delayed(Duration.zero);
+      expect(overflow.hasSummary, isTrue);
+    });
+
+    test('在途期间又发一句：不会两次同时摘', () async {
+      // 后台那次还没回来，用户又发了一条。第二次要安静地跳过，
+      // 而不是再打一次请求 —— 两次并发写同一个 checkpoint 会互相盖。
+      var calls = 0;
+      final gate = Completer<String>();
+      final overflow = OverflowManager(
+        summarize: (_, __) {
+          calls++;
+          return gate.future;
+        },
+        trigger: OverflowTrigger.messageCount,
+        messageThreshold: 2,
+      );
+      final log = history(20);
+      unawaited(overflow.onMessageAdded(log));
+      await Future<void>.delayed(Duration.zero);
+      expect(await overflow.onMessageAdded(log), isFalse);
+      expect(calls, 1);
+      gate.complete('摘要');
+    });
+  });
 }
