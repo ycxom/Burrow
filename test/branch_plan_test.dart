@@ -163,6 +163,149 @@ void main() {
     });
   });
 
+  group('切走之前要把现在这一段写回去', () {
+    // **这一组钉的是一次真实的数据丢失。**
+    //
+    // "正在看的那一版"的内容其实活在活动路径上，branches 里那一行只是它
+    // 上次被换下去时的快照。切到版本 0、接着又聊了五轮、再切回版本 1 ——
+    // 那五轮连同回复一起消失，而且没有任何提示。
+    //
+    // chatbox 那边是同一句话：切换时 `save currentTail to it`
+    // （见 switchForkInMessages）。
+    late ChatStore store;
+
+    setUp(() async {
+      store = await ChatStore.openAt(inMemoryDatabasePath);
+    });
+
+    tearDown(() => store.close());
+
+    test('写回之后切回来还是最新的那一段', () async {
+      final id = await store.createThread('甲', preferredId: 't1');
+      // 版本 0：原来的回答。版本 1：重新生成的，当前活动。
+      await store.saveVariant(
+        threadId: id,
+        branchId: 'b1',
+        tail: <ChatMessage>[msg('user', '问'), msg('assistant', '第一版')],
+      );
+      await store.saveVariant(
+        threadId: id,
+        branchId: 'b1',
+        tail: <ChatMessage>[msg('user', '问'), msg('assistant', '第二版')],
+      );
+      await store.setActiveVariant('b1', 0);
+
+      // 用户在版本 0 上又聊了两轮。
+      await store.updateVariant(
+        threadId: id,
+        branchId: 'b1',
+        index: 0,
+        tail: <ChatMessage>[
+          msg('user', '问'),
+          msg('assistant', '第一版'),
+          msg('user', '追问'),
+          msg('assistant', '追答'),
+        ],
+      );
+
+      // 切到版本 1 再切回来 —— 那两轮必须还在。
+      expect((await store.loadVariant('b1', 1))!.last.content, '第二版');
+      final back = (await store.loadVariant('b1', 0))!;
+      expect(back.length, 4);
+      expect(back.last.content, '追答');
+    });
+
+    test('写回不动别的版本', () async {
+      final id = await store.createThread('甲', preferredId: 't1');
+      for (final text in <String>['第一版', '第二版', '第三版']) {
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[msg('user', '问'), msg('assistant', text)],
+        );
+      }
+      await store.updateVariant(
+        threadId: id,
+        branchId: 'b1',
+        index: 1,
+        tail: <ChatMessage>[msg('user', '问'), msg('assistant', '改过的')],
+      );
+      expect((await store.loadVariant('b1', 0))!.last.content, '第一版');
+      expect((await store.loadVariant('b1', 1))!.last.content, '改过的');
+      expect((await store.loadVariant('b1', 2))!.last.content, '第三版');
+      // 总数不变 —— 写回是换内容，不是再开一个槽。开新槽的话，切回去看到的
+      // 仍然是旧快照，那几轮照样丢。
+      expect((await store.branchStateOf('b1'))!.total, 3);
+    });
+
+    test('内容没变时什么都不做', () async {
+      // 先减后加会在中间那一瞬把 ref_count 打到 0，而那正好是删除条件 ——
+      // 段被回收掉，而新指针马上又指向它。
+      final id = await store.createThread('甲', preferredId: 't1');
+      final tail = <ChatMessage>[msg('user', '问'), msg('assistant', '答')];
+      await store.saveVariant(threadId: id, branchId: 'b1', tail: tail);
+      await store.updateVariant(
+        threadId: id,
+        branchId: 'b1',
+        index: 0,
+        tail: tail,
+      );
+      expect((await store.loadVariant('b1', 0))!.last.content, '答');
+      expect((await store.raw.query('segments')).length, 1);
+    });
+
+    test('换掉之后旧内容的引用计数跟着放', () async {
+      final id = await store.createThread('甲', preferredId: 't1');
+      await store.saveVariant(
+        threadId: id,
+        branchId: 'b1',
+        tail: <ChatMessage>[msg('user', '问'), msg('assistant', '旧的')],
+      );
+      await store.updateVariant(
+        threadId: id,
+        branchId: 'b1',
+        index: 0,
+        tail: <ChatMessage>[msg('user', '问'), msg('assistant', '新的')],
+      );
+      // 旧那一段没人引用了就该没。留着的话它在任何界面上都看不见，
+      // 只是慢慢把存储吃掉。
+      final rows = await store.raw.query('segments');
+      expect(rows.length, 1);
+    });
+
+    test('两个版本内容相同时，写回不会把共用的那一段回收掉', () async {
+      final id = await store.createThread('甲', preferredId: 't1');
+      final shared = <ChatMessage>[msg('user', '问'), msg('assistant', '一样的')];
+      await store.saveVariant(threadId: id, branchId: 'b1', tail: shared);
+      await store.saveVariant(
+        threadId: id,
+        branchId: 'b2',
+        tail: shared,
+      );
+      await store.updateVariant(
+        threadId: id,
+        branchId: 'b1',
+        index: 0,
+        tail: <ChatMessage>[msg('user', '问'), msg('assistant', '换了')],
+      );
+      // b2 还指着那一段，不能因为 b1 放手就没了。
+      expect((await store.loadVariant('b2', 0))!.last.content, '一样的');
+    });
+
+    test('槽不存在时安静地什么都不做', () async {
+      final id = await store.createThread('甲', preferredId: 't1');
+      await expectLater(
+        store.updateVariant(
+          threadId: id,
+          branchId: 'b1',
+          index: 7,
+          tail: <ChatMessage>[msg('user', 'x')],
+        ),
+        completes,
+      );
+    });
+  });
+
   group('删掉一个版本', () {
     late ChatStore store;
 

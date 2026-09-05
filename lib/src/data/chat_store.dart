@@ -642,6 +642,10 @@ class ChatStore {
     final file = File(_db.path);
     final before = await file.exists() ? await file.length() : 0;
 
+    // 先扫掉够不着的分支行，再重算引用计数 —— 顺序不能反。反了的话那些行
+    // 还占着计数，它们的内容一段都回收不掉。
+    await _reclaimOrphanBranches();
+
     await _db.execute(
       'UPDATE segments SET ref_count = '
       '(SELECT COUNT(*) FROM branches WHERE branches.segment_hash = '
@@ -655,6 +659,120 @@ class ChatStore {
     final after = await file.exists() ? await file.length() : 0;
     return (segments: swept, bytes: before - after > 0 ? before - after : 0);
   }
+
+  /// 扫掉**谁也够不着**的分支行。
+  ///
+  /// ## 什么时候会出现够不着的行
+  ///
+  /// 「回到这条消息」和「删除这条及之后」会把活动路径截短。截掉的那一段里
+  /// 要是有分支锚点，它的那几个版本就再也打不开了 —— 而它们照样占着库，
+  /// 每一份都是一整段对话的副本，在任何界面上都看不见。
+  ///
+  /// ## 为什么要算传递闭包，不能只看 messages 表
+  ///
+  /// **分支会套分支。** 锚点 A 在第 3 条，锚点 B 在第 7 条、落在 A 的版本 1
+  /// 里。把 A 切到版本 0 之后，B 的锚点就不在活动路径上了 —— 但它一点都没
+  /// 丢，切回 A 的版本 1 就又回来了。
+  ///
+  /// 所以"活着"的定义是**从活动路径出发够得着**：活动路径上的锚点算活着，
+  /// 活着的锚点存下来的那些版本里出现的锚点也算活着，一直传下去。只按
+  /// messages 表判的话，上面那个 B 会被当成垃圾删掉 —— 那不是回收，是丢数据。
+  ///
+  /// ## 有一段解不开就一条都不删
+  ///
+  /// 解不开 = **不知道它引用了什么**，而不是"它什么都没引用"。当成后者就会
+  /// 把还在用的分支删掉，而那不可恢复。和 [referencedImagePaths] 同一条规矩。
+  ///
+  /// ## 刚建出来的一律不碰
+  ///
+  /// 分支行和它的锚点**不在同一次写里**：先写分支行，锚点那一列要等这一轮
+  /// 结束时 `replaceMessages` 才落库；「编辑并重发」更是要等用户把新消息发
+  /// 出去，锚点才重新出现在活动路径上。这中间有一段时间，库里确实是
+  /// "有分支、没锚点"的 —— 而那正好是这里判定"够不着"的条件。
+  ///
+  /// 所以留一个宽限期：[_orphanGrace] 之内建的一律不碰。真正够不着的行只会
+  /// 越来越旧，晚一小时回收没有任何代价；而误删一个正在建的分支，代价是
+  /// 用户刚才那一版回答没了。
+  Future<int> _reclaimOrphanBranches() async {
+    // 段里出现了哪些锚点。一次读完，闭包在内存里推。
+    final anchorsInSegment = <String, Set<String>>{};
+    var complete = true;
+    for (final row in await _db
+        .query('segments', columns: <String>['hash', 'messages_json'])) {
+      final hash = row['hash']! as String;
+      final raw = _open(row['messages_json'] as String?);
+      if (raw == null) {
+        complete = false;
+        continue;
+      }
+      final found = <String>{};
+      try {
+        for (final message in jsonDecode(raw) as List) {
+          if (message is Map && message['branchId'] is String) {
+            found.add(message['branchId']! as String);
+          }
+        }
+      } catch (_) {
+        complete = false;
+        continue;
+      }
+      anchorsInSegment[hash] = found;
+    }
+    if (!complete) return 0;
+
+    // 种子：活动路径上还挂着的那些锚点。
+    final alive = <String>{};
+    for (final row in await _db.query('messages',
+        columns: <String>['branch_id'], where: 'branch_id IS NOT NULL')) {
+      alive.add(row['branch_id']! as String);
+    }
+
+    final rows = await _db.query('branches',
+        columns: <String>['branch_id', 'segment_hash', 'created_at']);
+    // 传下去：活着的锚点存的那些版本里出现的锚点也活着。
+    var grew = true;
+    while (grew) {
+      grew = false;
+      for (final row in rows) {
+        final owner = row['branch_id']! as String;
+        if (!alive.contains(owner)) continue;
+        for (final found in anchorsInSegment[row['segment_hash']! as String] ??
+            const <String>{}) {
+          if (alive.add(found)) grew = true;
+        }
+      }
+    }
+
+    // 宽限期内建过任何一个版本的分支都不碰 —— 它多半正在被建出来。
+    final cutoff = DateTime.now().subtract(_orphanGrace).millisecondsSinceEpoch;
+    final fresh = <String>{
+      for (final row in rows)
+        if ((row['created_at'] as int? ?? 0) > cutoff)
+          row['branch_id']! as String,
+    };
+
+    // 先去重再删：一个锚点有好几个版本，按行删会把同一个 branch_id
+    // 删好几遍，返回的数字也就成了"行数"而不是"分支数"。
+    final dead = <String>{
+      for (final row in rows)
+        if (!alive.contains(row['branch_id']! as String) &&
+            !fresh.contains(row['branch_id']! as String))
+          row['branch_id']! as String,
+    };
+    if (dead.isEmpty) return 0;
+    await _db.transaction((txn) async {
+      for (final owner in dead) {
+        await txn.delete('branches',
+            where: 'branch_id = ?', whereArgs: <Object?>[owner]);
+      }
+    });
+    // 内容那一层交给外面那句"按 branches 重算引用计数"，不在这里逐个减 ——
+    // 重算是幂等的，而逐个减一旦漏掉一行就再也回收不掉了。
+    return dead.length;
+  }
+
+  /// 够不着的分支行要旧到这个程度才回收。见 [_reclaimOrphanBranches]。
+  static const _orphanGrace = Duration(hours: 1);
 
   /// 引用减一，减到 0 就把内容删掉。
   static Future<void> _releaseSegment(DatabaseExecutor txn, String hash) async {
@@ -1162,6 +1280,71 @@ class ChatStore {
     final json = _open(rows.first['json'] as String?);
     if (json == null || json.isEmpty) return const <ChatMessage>[];
     return _decodeSegment(json);
+  }
+
+  /// 把某个版本的内容**换成**现在这一段。
+  ///
+  /// ## 为什么切分支之前必须先调它
+  ///
+  /// 一个分支点下，"正在看的那一版"的内容其实活在 messages 表里（那才是
+  /// 活动路径），branches 里那一行只是它切走时的快照。所以**切走之前要先
+  /// 把现在这一段写回自己那个槽**。
+  ///
+  /// 不写的话：切到版本 0、接着又聊了五轮、再切回版本 1 —— 那五轮连同
+  /// 模型的回复一起消失，因为版本 0 那一行里存的还是"切过去那一刻"的样子。
+  /// 而且**没有任何提示**，用户只会看到自己刚才的对话凭空没了。
+  ///
+  /// chatbox 那边是同一句话：切换时 `save currentTail to it`
+  /// （见 `switchForkInMessages`）。
+  Future<void> updateVariant({
+    required String threadId,
+    required String branchId,
+    required int index,
+    required List<ChatMessage> tail,
+  }) async {
+    final json = _encodeSegment(tail);
+    final hash = sha256.convert(utf8.encode(json)).toString();
+    await _db.transaction((txn) async {
+      final rows = await txn.query(
+        'branches',
+        columns: <String>['segment_hash'],
+        where: 'branch_id = ? AND variant_index = ?',
+        whereArgs: <Object?>[branchId, index],
+        limit: 1,
+      );
+      if (rows.isEmpty) return;
+      final old = rows.first['segment_hash']! as String;
+      // 内容一个字都没变就别动引用计数 —— 先减后加会在中间那一瞬把
+      // ref_count 打到 0，而那正好是删除条件。
+      if (old == hash) return;
+
+      final known = await txn.query('segments',
+          columns: <String>['hash'],
+          where: 'hash = ?',
+          whereArgs: <Object?>[hash],
+          limit: 1);
+      if (known.isEmpty) {
+        await txn.insert('segments', <String, Object?>{
+          'hash': hash,
+          'messages_json': _seal(json),
+          'ref_count': 1,
+        });
+      } else {
+        await txn.rawUpdate(
+          'UPDATE segments SET ref_count = ref_count + 1 WHERE hash = ?',
+          <Object?>[hash],
+        );
+      }
+      await txn.update(
+        'branches',
+        <String, Object?>{'segment_hash': hash},
+        where: 'branch_id = ? AND variant_index = ?',
+        whereArgs: <Object?>[branchId, index],
+      );
+      // 新的先落地再放旧的：反过来的话，两个版本内容相同时那一段会在中间
+      // 被回收掉，而新指针马上又指向它。
+      await _releaseSegment(txn, old);
+    });
   }
 
   /// 删掉一个分支点下的某个版本，返回删完之后还剩几个。

@@ -294,5 +294,131 @@ void main() {
         0,
       );
     });
+
+    group('够不着的分支行', () {
+      // 「回到这条消息」和「删除这条及之后」会把活动路径截短。截掉的那一段里
+      // 要是有分支锚点，它的那几个版本就再也打不开了 —— 而它们照样占着库，
+      // 每一份都是一整段对话的副本，在任何界面上都看不见。
+      late Directory tmp;
+      late ChatStore store;
+
+      setUp(() async {
+        tmp = await Directory.systemTemp.createTemp('burrow_orphan_branch');
+        store = await ChatStore.openAt('${tmp.path}/chat.db');
+      });
+
+      tearDown(() async {
+        await store.close();
+        if (await tmp.exists()) await tmp.delete(recursive: true);
+      });
+
+      /// 把分支行的时间往前拨，绕过那个宽限期。
+      ///
+      /// 宽限期存在的理由是"刚建出来的分支可能还没写上锚点"（见
+      /// _reclaimOrphanBranches），而这几条测试要验的是**过了那段时间之后**
+      /// 的行为。
+      Future<void> ageBranches() =>
+          store.raw.update('branches', <String, Object?>{
+            'created_at': DateTime(2020).millisecondsSinceEpoch,
+          });
+
+      ChatMessage anchored(String branchId, String text) => ChatMessage(
+            role: 'user',
+            content: text,
+            at: DateTime(2026),
+            branchId: branchId,
+          );
+
+      test('锚点还在活动路径上时一条都不动', () async {
+        final id = await store.createThread('甲', preferredId: 't1');
+        await store.replaceMessages(id, <ChatMessage>[
+          anchored('b1', '问'),
+          reply('答'),
+        ]);
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[anchored('b1', '问'), reply('另一个答')],
+        );
+        await ageBranches();
+        await store.compact();
+        expect((await store.branchStateOf('b1'))!.total, 1);
+      });
+
+      test('锚点被截掉之后，那几个版本跟着回收', () async {
+        final id = await store.createThread('甲', preferredId: 't1');
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[anchored('b1', '问'), reply('答')],
+        );
+        // 用户「回到这里」把锚点那条也截掉了。
+        await store.replaceMessages(id, <ChatMessage>[user('只剩这一条')]);
+        await ageBranches();
+        await store.compact();
+        expect(await store.branchStateOf('b1'), isNull);
+        // 内容也跟着没了 —— 只删指针不减内容的话，那一段永远回收不掉。
+        expect(await store.raw.query('segments'), isEmpty);
+      });
+
+      test('**套在别的版本里的锚点不算够不着**', () async {
+        // 分支会套分支：锚点 b2 落在 b1 的某个版本里。把 b1 切到另一版之后，
+        // b2 的锚点就不在活动路径上了 —— 但它一点都没丢，切回去就又回来了。
+        // 只按 messages 表判的话，这里会把 b2 当垃圾删掉，那不是回收，是丢数据。
+        final id = await store.createThread('甲', preferredId: 't1');
+        await store.replaceMessages(id, <ChatMessage>[anchored('b1', '问')]);
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[
+            anchored('b1', '问'),
+            reply('答'),
+            anchored('b2', '追问'),
+          ],
+        );
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b2',
+          tail: <ChatMessage>[anchored('b2', '追问'), reply('追答')],
+        );
+        await ageBranches();
+        await store.compact();
+        expect((await store.branchStateOf('b1'))!.total, 1);
+        expect((await store.branchStateOf('b2'))!.total, 1,
+            reason: 'b2 是从 b1 的版本里够得着的，不该被删');
+      });
+
+      test('宽限期内刚建的分支一律不碰', () async {
+        // 分支行和它的锚点不在同一次写里：先写分支行，锚点那一列要等这一轮
+        // 结束才落库。这中间库里确实是"有分支、没锚点"的 —— 而那正好是
+        // "够不着"的判据。误删的代价是用户刚才那一版回答没了。
+        final id = await store.createThread('甲', preferredId: 't1');
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[anchored('b1', '问'), reply('答')],
+        );
+        // 锚点还没写进 messages —— 就是那个窗口。
+        await store.compact();
+        expect((await store.branchStateOf('b1'))!.total, 1);
+      });
+
+      test('有一段解不开就一条都不删', () async {
+        // 解不开 = **不知道它引用了什么**，而不是"它什么都没引用"。
+        final id = await store.createThread('甲', preferredId: 't1');
+        await store.saveVariant(
+          threadId: id,
+          branchId: 'b1',
+          tail: <ChatMessage>[anchored('b1', '问'), reply('答')],
+        );
+        await store.replaceMessages(id, <ChatMessage>[user('只剩这一条')]);
+        await store.raw.update('segments', <String, Object?>{
+          'messages_json': '{ 这不是合法 JSON',
+        });
+        await ageBranches();
+        await store.compact();
+        expect((await store.branchStateOf('b1'))!.total, 1);
+      });
+    });
   });
 }

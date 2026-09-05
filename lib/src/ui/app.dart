@@ -1487,6 +1487,25 @@ class _HomeShellState extends State<HomeShell>
   /// null = 没有待装的（历史本来就是全的，或者已经装过了）。
   int? _pendingCheckpoint;
 
+  /// 用户手动展开着的那几组命令，以及为了定位而被展开的那几组。
+  ///
+  /// **状态记在这儿，不在那一行自己身上。** 两个理由，各自都足以致命：
+  ///
+  ///   - `ListView.builder` 会把滚出缓存范围的行整个丢掉，行的 State 跟着
+  ///     没 —— 展开过的一组滑远一点再滑回来就自己收上了。
+  ///   - 这一行会因为别的原因反复重建（流式输出每 33ms 一次）。以前那一行
+  ///     自己记状态、外面用一个"要不要展开"的布尔去纠正它，而那个布尔里
+  ///     算进了**滚动位置** —— 于是用户收起来之后，下一次滚动采样就把它
+  ///     又展开了，看起来就是"收不回去"。
+  final Set<String> _expandedToolGroups = <String>{};
+
+  /// 一组命令的稳定身份：组里第一条的数据库 id。
+  ///
+  /// 落库之前用下标兜底 —— 那种消息只可能在会话末尾，而末尾那几条不会被
+  /// 回收出缓存，兜底值活不到出问题的时候。
+  String _toolGroupId(ChatMessage first, int fallbackIndex) =>
+      first.messageId?.toString() ?? 'i$fallbackIndex';
+
   /// 打开这个会话时停在哪一条。null = 停在底部。
   int? _initialAnchor;
 
@@ -1576,6 +1595,12 @@ class _HomeShellState extends State<HomeShell>
     required double alignment,
   }) async {
     if (!await _ensureVisible(messageId)) return;
+    // 目标要是收在某一组命令里，先把那一组展开 —— 收着的时候它的 key
+    // 根本不在树上，下面那个 `reveal()` 试八次也只会一直找不到。
+    if (_expandToolGroupOf(messageId) && mounted) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+    }
     final visibleIndex =
         _visible.indexWhere((message) => message.messageId == messageId);
     if (visibleIndex < 0) return;
@@ -1887,12 +1912,7 @@ class _HomeShellState extends State<HomeShell>
     if (!ok) return;
 
     if (id != null && branchId != null && oldTail != null) {
-      await widget.chats.saveVariant(
-        threadId: id,
-        branchId: branchId,
-        tail: oldTail,
-        active: false,
-      );
+      await _stashTail(id, branchId, oldTail);
       // 新版本是这一次发送的产物，发完在 _runTurn 里结账。
       _pendingBranch = (branchId: branchId, anchorIndex: historyIndex);
     }
@@ -2066,6 +2086,22 @@ class _HomeShellState extends State<HomeShell>
         _visible.indexWhere((message) => identical(message, anchor));
     if (visibleAnchor < 0) return;
 
+    // 这两段里只要跑过命令，文件就已经不是这一版该有的样子了。
+    // 下面结束时说一句 —— 判据要在动历史**之前**取，动完就没得比了。
+    final touchedFiles = _agent.history
+            .skip(anchorIndex)
+            .any((message) => message.role == 'tool') ||
+        tail.any((message) => message.role == 'tool');
+
+    // **先把现在这一段写回它自己那个槽，再去装别人的。** 见 [_stashTail]。
+    await _stashTail(
+      id,
+      branchId,
+      _agent.history.sublist(anchorIndex),
+      skipWhenActiveIs: target,
+    );
+    if (!mounted) return;
+
     setState(() {
       _agent.history
         ..removeRange(anchorIndex, _agent.history.length)
@@ -2083,6 +2119,20 @@ class _HomeShellState extends State<HomeShell>
     await widget.chats.setActiveVariant(branchId, target);
     await _refreshBranches();
     HapticFeedback.selectionClick();
+
+    // **切分支不回滚文件，这件事必须说出来。**
+    //
+    // 「回到这条消息」会连着把 workspace 回到那一刻（[AgentLoop.rewindTo]），
+    // 而且会先问一句。切分支只换对话 —— 换过去之后，模型看到的是这一版的
+    // 历史，脚下却是另一版跑出来的文件。那种不一致比不回滚更难查：
+    // 它会照着一个自己以为还没改过的目录继续推理。
+    //
+    // 不自动回滚是有意的：那会把用户在另一版里做出来的东西直接抹掉，
+    // 而他只是想看看另一个回答。所以只说一句，由他决定要不要手动回退。
+    if (touchedFiles) {
+      _setStatus('已切换版本。workspace 里的文件没有回滚 ——'
+          '要一起回到那一刻，用消息上的「回到这里」');
+    }
   }
 
   /// 删掉正在看的这个版本。
@@ -2118,6 +2168,52 @@ class _HomeShellState extends State<HomeShell>
     final after = await widget.chats.branchStateOf(branchId);
     if (after == null || !mounted) return;
     await _switchVariant(branchId, after.active, force: true);
+  }
+
+  /// 把**现在这一段**（锚点起到末尾）收进分支库。
+  ///
+  /// ## 为什么不能只用 saveVariant
+  ///
+  /// "正在看的那一版"的内容其实活在活动路径上（`history` / messages 表），
+  /// branches 里那一行只是它上次被换下去时的快照。用户切到版本 0 之后又聊了
+  /// 五轮，那五轮只在活动路径上 —— 版本 0 那一行还停在切过去那一刻。
+  ///
+  /// 所以这里分两种情况：
+  ///
+  ///   - 这个锚点**还没有任何版本**：现在这一段就是版本 0，开一个槽。
+  ///   - 已经有了：把现在这一段**写回活动那个槽**，而不是再开一个新的。
+  ///     再开一个的话，切回去看到的仍然是那份旧快照，那五轮照样丢。
+  ///
+  /// [skipWhenActiveIs] 给切分支用：目标就是当前活动版时不用写回
+  /// （内容没换过），删完版本之后重新落位那一路也走这条。
+  /// [tail] 由调用方**在动历史之前**取好。编辑重发那一路会先把历史截掉，
+  /// 那时候再从 history 上取就是空的了。
+  Future<void> _stashTail(
+    String threadId,
+    String branchId,
+    List<ChatMessage> tail, {
+    int? skipWhenActiveIs,
+  }) async {
+    if (tail.isEmpty) return;
+    // 现从库里读活动位而不是用 `_branches` 那份缓存：中间隔着 await，
+    // 而写错槽等于把另一个版本覆盖掉 —— 那是更糟的一种丢失。
+    final state = await widget.chats.branchStateOf(branchId);
+    if (state == null) {
+      await widget.chats.saveVariant(
+        threadId: threadId,
+        branchId: branchId,
+        tail: tail,
+        active: false,
+      );
+      return;
+    }
+    if (state.active == skipWhenActiveIs) return;
+    await widget.chats.updateVariant(
+      threadId: threadId,
+      branchId: branchId,
+      index: state.active,
+      tail: tail,
+    );
   }
 
   /// 历史被**改小**之后落盘：编辑、删除、回到某条、切分支。
@@ -2686,6 +2782,15 @@ class _HomeShellState extends State<HomeShell>
   Future<void> _send() async {
     final text = _input.text.trim();
     final images = List<String>.from(_attachments);
+    // **这一笔账先收下，不管这次发不发得出去。**
+    //
+    // 「编辑并重发」会先把旧的一段收进版本库、记下这笔账，再调这里。要是
+    // 这次发送在下面任何一个条件上被挡掉，账还留着 —— 那么**下一次**发送
+    // （可能是几小时后、完全不相干的一句话）会被当成那个分支点的新版本
+    // 挂上去，而那时候记着的下标早就指到别的消息上了。
+    final pending = _pendingBranch;
+    _pendingBranch = null;
+
     // 只有图、没有文字也能发 —— 「你看这个」本来就是一种完整的表达。
     if ((text.isEmpty && images.isEmpty) || _busy || _loadingHistory) return;
 
@@ -2739,10 +2844,8 @@ class _HomeShellState extends State<HomeShell>
     });
     await widget.chats.append(id, _visible.last);
 
-    // 编辑重发：这条新消息其实是某个分支点上的新版本，把账接上。
-    final pending = _pendingBranch;
-    _pendingBranch = null;
-
+    // 编辑重发：这条新消息其实是某个分支点上的新版本，把账接上
+    // （在最上面就收下了）。
     await _runTurn(
       id,
       () => _agent.send(text, images: images),
@@ -2822,7 +2925,13 @@ class _HomeShellState extends State<HomeShell>
         }
       }
       await _persistMessages(id);
-      if (branchId != null && anchorIndex != null) {
+      // 上面那个挂 id 的分支已经守过一次界了，这里也要守：`sublist` 越界
+      // 会抛，而这是在 `finally` 里 —— 抛出去会把这一轮真正的结果连同
+      // 落盘一起带走，而用户看到的是一条毫无头绪的报错。
+      if (branchId != null &&
+          anchorIndex != null &&
+          anchorIndex >= 0 &&
+          anchorIndex < _agent.history.length) {
         await widget.chats.saveVariant(
           threadId: id,
           branchId: branchId,
@@ -2898,12 +3007,11 @@ class _HomeShellState extends State<HomeShell>
     });
 
     // 先把即将被替换的这一段收进版本库，再动它。
-    await widget.chats.saveVariant(
-      threadId: id,
-      branchId: branchId,
-      tail: _agent.history.sublist(pivot),
-      active: false,
-    );
+    //
+    // 走 [_stashTail] 而不是直接 saveVariant：这个锚点下可能已经有版本了，
+    // 而用户在切过来之后又聊了几轮 —— 那几轮只在活动路径上。再开一个新槽
+    // 的话，活动那个槽仍然停在旧快照，切回去就少了一截。
+    await _stashTail(id, branchId, _agent.history.sublist(pivot));
     _agent.history.removeRange(pivot + 1, _agent.history.length);
     // **这一句是"反复重新生成会把压缩系统搞坏"的修复。**
     //
@@ -3518,6 +3626,14 @@ class _HomeShellState extends State<HomeShell>
       final firstInGroup = previous == null ||
           previous.role != message.role ||
           !_sameDay(previous.at, message.at);
+
+      // 连着好几步命令就收成一行。规则见 [toolRunEnd]。
+      final runEnd = toolRunEnd(_visible, i);
+      if (runEnd > i) {
+        rows.add(_ChatRow.toolGroup(i, runEnd));
+        i = runEnd;
+        continue;
+      }
       rows.add(_ChatRow.message(i, lastInGroup, firstInGroup));
     }
     final running = _runningTool;
@@ -3563,6 +3679,8 @@ class _HomeShellState extends State<HomeShell>
 
     final day = row.day;
     if (day != null) return ServicePill(text: _dayLabel(day));
+
+    if (row.groupEnd >= 0) return _buildToolGroup(row.index, row.groupEnd);
 
     final i = row.index;
     // 越界就什么都不画。抛出去的话 release 构建会把这一行渲染成一块纯灰色
@@ -3668,6 +3786,69 @@ class _HomeShellState extends State<HomeShell>
           onRewind: isUser && !_busy ? () => _rewindTo(i) : null,
           onDelete: !_busy ? () => _deleteFrom(i) : null,
         ));
+  }
+
+  /// 把包着 [messageId] 的那一组命令展开。返回 true = 真的动了。
+  ///
+  /// 只在**要跳过去**的时候调（搜索命中、恢复上次的位置）。滚动采样不该
+  /// 走这条路：那个位置每 300ms 就变一次，拿它当"要展开"的依据，用户就
+  /// 永远收不回去。
+  bool _expandToolGroupOf(int messageId) {
+    final index =
+        _visible.indexWhere((message) => message.messageId == messageId);
+    if (index < 0 || _visible[index].role != 'tool') return false;
+    var start = index;
+    while (start > 0 && _visible[start - 1].role == 'tool') {
+      start--;
+    }
+    if (toolRunEnd(_visible, start) <= start) return false;
+    final id = _toolGroupId(_visible[start], start);
+    if (_expandedToolGroups.contains(id)) return false;
+    setState(() => _expandedToolGroups.add(id));
+    return true;
+  }
+
+  /// `_visible[start..end]` 那一串工具调用收成的一行。
+  Widget _buildToolGroup(int start, int end) {
+    if (start < 0 || end >= _visible.length || end <= start) {
+      // 越界就什么都不画。抛出去在 release 里会变成一块灰方块，
+      // 而那块灰和"哪一行算错了"之间没有任何可见的联系。
+      return const SizedBox.shrink();
+    }
+    final steps = _visible.sublist(start, end + 1);
+    var failed = 0;
+    var elapsed = 0;
+    for (final step in steps) {
+      if (!step.toolOk) failed++;
+      elapsed += step.toolMs;
+    }
+    // 定位目标在这一组里时要展开：收着的话，用户点了搜索结果会落在一行
+    // 看不出所以然的摘要上，而他要找的那句话就在里面。
+    final id = _toolGroupId(steps.first, start);
+    final expanded = _expandedToolGroups.contains(id);
+    return ToolCallGroup(
+      key: ValueKey('tools-$id'),
+      count: steps.length,
+      failed: failed,
+      elapsedMs: elapsed,
+      lastTitle: steps.last.toolTitle ?? steps.last.toolName ?? '工具调用',
+      expanded: expanded,
+      onToggle: () => setState(() {
+        if (!_expandedToolGroups.remove(id)) _expandedToolGroups.add(id);
+      }),
+      cards: <Widget>[
+        for (final step in steps)
+          _messageSurface(
+            step,
+            ToolCallCard(
+              title: step.toolTitle ?? step.toolName ?? '工具调用',
+              state: step.toolOk ? ToolCallState.ok : ToolCallState.failed,
+              output: step.content,
+              elapsedMs: step.toolMs,
+            ),
+          ),
+      ],
+    );
   }
 
   Widget _messageSurface(ChatMessage message, Widget child) {
@@ -4309,11 +4490,16 @@ class _ChatRow {
   /// 这一行是摘要分隔线时，线以上被覆盖的消息条数。0 = 不是这种行。
   final int summaryCovered;
 
+  /// 这一行收着一串连续的工具调用时，最后一条在 `_visible` 里的下标（含）。
+  /// [index] 是第一条。0 以下 = 不是这种行。
+  final int groupEnd;
+
   const _ChatRow.date(this.day)
       : index = -1,
         streaming = null,
         runningTool = null,
         summaryCovered = 0,
+        groupEnd = -1,
         lastInGroup = true,
         firstInGroup = true;
 
@@ -4322,6 +4508,7 @@ class _ChatRow {
         index = -1,
         streaming = null,
         runningTool = null,
+        groupEnd = -1,
         lastInGroup = true,
         firstInGroup = true;
 
@@ -4329,13 +4516,24 @@ class _ChatRow {
       : day = null,
         streaming = null,
         runningTool = null,
-        summaryCovered = 0;
+        summaryCovered = 0,
+        groupEnd = -1;
+
+  /// `_visible[index..groupEnd]` 这一串连续的工具调用收成一行。
+  const _ChatRow.toolGroup(this.index, this.groupEnd)
+      : day = null,
+        streaming = null,
+        runningTool = null,
+        summaryCovered = 0,
+        lastInGroup = true,
+        firstInGroup = true;
 
   const _ChatRow.streaming(this.streaming)
       : day = null,
         index = -1,
         runningTool = null,
         summaryCovered = 0,
+        groupEnd = -1,
         lastInGroup = true,
         firstInGroup = false;
 
@@ -4344,6 +4542,7 @@ class _ChatRow {
         index = -1,
         streaming = null,
         summaryCovered = 0,
+        groupEnd = -1,
         lastInGroup = true,
         firstInGroup = false;
 }

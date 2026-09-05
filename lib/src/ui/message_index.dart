@@ -174,3 +174,21 @@ int visibleIndexOfHistory(
   }
   return -1;
 }
+
+/// `messages[start]` 开始那一串连续工具调用的**最后一条**下标（含）。
+///
+/// 不是工具调用、或者只有孤零零一条时返回 [start] 本身 —— 调用方据此
+/// 判断"要不要收起来"：**两步以上才值得收**，一步的摘要行和它自己那张
+/// 卡片一样高，收起来纯粹是多让人点一下。
+///
+/// 只认**连着的**那几条。中间被模型说的一句话隔开时就断开，因为那句话
+/// 通常正是"我接下来要干嘛"，把它折进命令堆里等于把线索一起藏掉。
+int toolRunEnd(List<ChatMessage> messages, int start) {
+  if (start < 0 || start >= messages.length) return start;
+  if (messages[start].role != 'tool') return start;
+  var end = start;
+  while (end + 1 < messages.length && messages[end + 1].role == 'tool') {
+    end++;
+  }
+  return end;
+}
