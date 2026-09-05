@@ -292,143 +292,329 @@ void main() {
     });
   });
 
-  group('排成流程图', () {
-    List<BranchPoint> forkWith(int variants, {int active = 0}) =>
-        buildBranchTree(<ChatMessage>[
-          msg('user', '甲', branchId: 'b1')
-        ], <BranchVariant>[
-          for (var i = 0; i < variants; i++)
-            variant('b1', i, <ChatMessage>[msg('user', '甲', branchId: 'b1')],
-                active: i == active),
-        ]);
+  group('排成图：一句话一个节点', () {
+    List<GraphNode> graph(List<ChatMessage> history,
+            [List<BranchVariant> variants = const <BranchVariant>[]]) =>
+        layoutBranchGraph(history, variants);
 
-    test('岔路口自己是一个节点', () {
-      // 只画版本的话，一屏「版本 1/3、版本 2/3、版本 1/2……」之间看不出
-      // 哪几个是同一次分岔的选择，也看不出这一岔是在问什么的时候岔的 ——
-      // 而"在哪儿岔的"正是用户找那一版时唯一记得住的线索。
-      final nodes = layoutBranchGraph(forkWith(2));
-      final forks = nodes.where((n) => n.kind == GraphNodeKind.fork).toList();
-      expect(forks.length, 1);
-      expect(forks.single.label, '甲');
-      // 根 → 岔路口 → 版本。
-      expect(forks.single.col, 1);
+    test('没岔过的对话是一条直线', () {
+      final nodes = graph(<ChatMessage>[
+        msg('user', '你好'),
+        msg('assistant', '你好呀'),
+      ]);
+      expect(nodes.map((n) => n.kind).toList(), <GraphNodeKind>[
+        GraphNodeKind.root,
+        GraphNodeKind.message,
+        GraphNodeKind.message,
+        GraphNodeKind.here,
+      ]);
+      // 全在同一行 —— 缩进列表做不到这件事。
+      expect(nodes.map((n) => n.row).toSet(), <int>{0});
+      expect(nodes.map((n) => n.col).toList(), <int>[0, 1, 2, 3]);
+    });
+
+    test('重新生成：问话只画一遍，各版本从它下面平铺出去', () {
+      // 各版本的第一条完全相同，真正分岔的是它后面那条回答。不区分的话
+      // 会把同一句问话画两遍，看着像用户问了两次。
+      final history = <ChatMessage>[
+        msg('user', '配 nginx', branchId: 'b1'),
+        msg('assistant', '第二版答'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '配 nginx', branchId: 'b1'),
+          msg('assistant', '第一版答'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '配 nginx', branchId: 'b1'),
+              msg('assistant', '第二版答'),
+            ],
+            active: true),
+      ]);
+      final asked = nodes.where((n) => n.detail == '配 nginx').toList();
+      expect(asked.length, 1, reason: '同一句问话不该画两遍');
+      for (final entry
+          in <String, String>{'第一版答': '版本 1', '第二版答': '版本 2'}.entries) {
+        final node = nodes.firstWhere((n) => n.detail == entry.key);
+        expect(node.parentId, asked.single.id);
+        expect(node.branchHead, isTrue);
+        expect(node.label, entry.value);
+      }
+      // 两支各占一行，谁也没被叠上去。
       expect(
-        nodes
-            .where((n) => n.kind == GraphNodeKind.variant)
-            .map((n) => n.col)
-            .toSet(),
-        <int>{2},
+        nodes.firstWhere((n) => n.detail == '第一版答').row,
+        isNot(nodes.firstWhere((n) => n.detail == '第二版答').row),
       );
     });
 
-    test('没有分支时是一条直线：起点 → 当前位置', () {
-      final nodes = layoutBranchGraph(const <BranchPoint>[]);
-      expect(nodes.map((n) => n.kind).toList(),
-          <GraphNodeKind>[GraphNodeKind.root, GraphNodeKind.here]);
-      // 同一行、下一列 —— 画出来就是一条直线，而那正是它本来的样子。
-      expect(nodes.last.row, 0);
-      expect(nodes.last.col, 1);
+    test('**位置只由版本号决定，和现在选的是哪一版无关**', () {
+      // 早先是"当前走的那一版接着主干往右，其余往下掉"。那样每切一次版本
+      // 整张图就重排一次：刚才还在下面的那一支被提到主干上，原来主干上的
+      // 掉了下去 —— 对话一个字没动，图却面目全非。
+      List<GraphNode> withActive(int which) => graph(<ChatMessage>[
+            msg('user', '甲', branchId: 'b1'),
+            msg('assistant', '答$which'),
+          ], <BranchVariant>[
+            for (var i = 0; i < 3; i++)
+              variant(
+                  'b1',
+                  i,
+                  <ChatMessage>[
+                    msg('user', '甲', branchId: 'b1'),
+                    msg('assistant', '答$i'),
+                  ],
+                  active: i == which),
+          ]);
+
+      Map<String, String> cells(List<GraphNode> nodes) => <String, String>{
+            for (final n in nodes)
+              if (n.detail.isNotEmpty) n.detail: '${n.col},${n.row}',
+          };
+
+      final a = cells(withActive(0));
+      final b = cells(withActive(2));
+      expect(a, b, reason: '切了版本，每一格还得在原地');
     });
 
-    test('第一个孩子接着往右，其余的往下掉', () {
-      // 缩进列表做不到这件事：它把每一层都往右推一格，于是一条从来没分过支
-      // 的对话看着像岔了很多次。
-      final nodes = layoutBranchGraph(forkWith(3));
-      final variants =
-          nodes.where((n) => n.kind == GraphNodeKind.variant).toList();
-      expect(variants.map((n) => n.col).toSet(), <int>{2});
-      expect(variants.map((n) => n.row).toList(), <int>[0, 1, 2]);
+    test('编辑并重发：连问话一起变了，就挂在它前面那条下面', () {
+      final history = <ChatMessage>[
+        msg('assistant', '在的'),
+        msg('user', '改过的问法', branchId: 'b1'),
+        msg('assistant', '新答'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '原来的问法', branchId: 'b1'),
+          msg('assistant', '旧答'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '改过的问法', branchId: 'b1'),
+              msg('assistant', '新答'),
+            ],
+            active: true),
+      ]);
+      final before = nodes.firstWhere((n) => n.detail == '在的');
+      final head = nodes.firstWhere((n) => n.detail == '原来的问法');
+      expect(head.parentId, before.id);
+      expect(head.branchHead, isTrue);
+    });
+
+    test('旁支上每一条都能点，不只是头节点', () {
+      final history = <ChatMessage>[
+        msg('user', '甲', branchId: 'b1'),
+        msg('assistant', '答二'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '甲', branchId: 'b1'),
+          msg('assistant', '答一'),
+          msg('assistant', '还有一句'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '甲', branchId: 'b1'),
+              msg('assistant', '答二'),
+            ],
+            active: true),
+      ]);
+      for (final text in <String>['答一', '还有一句']) {
+        final node = nodes.firstWhere((n) => n.detail == text);
+        expect(node.jumpable, isTrue, reason: text);
+        expect(node.branchId, 'b1');
+        expect(node.index, 0);
+      }
+      // 主干上的不给点：你已经在上面了。
+      expect(nodes.firstWhere((n) => n.detail == '答二').jumpable, isFalse);
     });
 
     test('两支永远不叠在一起', () {
-      // 行号是深度优先发的：一支的子树全部排完，下一支才拿新的行。
-      final tree = buildBranchTree(<ChatMessage>[
-        msg('user', '甲', branchId: 'b1')
-      ], <BranchVariant>[
-        variant(
-            'b1',
-            0,
-            <ChatMessage>[
-              msg('user', '甲', branchId: 'b1'),
-              msg('user', '乙', branchId: 'b2'),
-            ],
-            active: true),
-        variant('b1', 1, <ChatMessage>[msg('user', '甲', branchId: 'b1')]),
-        variant('b2', 0, <ChatMessage>[msg('user', '乙', branchId: 'b2')],
-            active: true),
-        variant('b2', 1, <ChatMessage>[msg('user', '乙', branchId: 'b2')]),
-      ]);
-      final nodes = layoutBranchGraph(tree);
-      final cells = <String>{for (final n in nodes) '${n.col},${n.row}'};
-      expect(cells.length, nodes.length);
-    });
-
-    test('当前位置接在活动链的最深处', () {
-      final tree = buildBranchTree(<ChatMessage>[
-        msg('user', '甲', branchId: 'b1')
-      ], <BranchVariant>[
-        variant(
-            'b1',
-            0,
-            <ChatMessage>[
-              msg('user', '甲', branchId: 'b1'),
-              msg('user', '乙', branchId: 'b2'),
-            ],
-            active: true),
-        variant('b2', 0, <ChatMessage>[msg('user', '乙', branchId: 'b2')],
-            active: true),
-      ]);
-      final nodes = layoutBranchGraph(tree);
-      final here = nodes.firstWhere((n) => n.kind == GraphNodeKind.here);
-      // 根 → 岔路口b1 → b1#0 → 岔路口b2 → b2#0 → 当前位置。
-      expect(here.parentId, 'b2#0');
-      expect(here.col, 5);
-    });
-
-    test('活动链断在半路时，当前位置就接在断点上', () {
-      // b1 选的是版本 2，而 b2 长在版本 1 里 —— 那条链走不下去。
-      final tree = buildBranchTree(<ChatMessage>[
-        msg('user', '甲', branchId: 'b1')
-      ], <BranchVariant>[
+      final history = <ChatMessage>[
+        msg('user', '甲', branchId: 'b1'),
+        msg('assistant', '答三'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
         variant('b1', 0, <ChatMessage>[
           msg('user', '甲', branchId: 'b1'),
-          msg('user', '乙', branchId: 'b2'),
+          msg('assistant', '答一'),
         ]),
-        variant('b1', 1, <ChatMessage>[msg('user', '甲', branchId: 'b1')],
-            active: true),
-        variant('b2', 0, <ChatMessage>[msg('user', '乙', branchId: 'b2')],
-            active: true),
-      ]);
-      final nodes = layoutBranchGraph(tree);
-      final here = nodes.firstWhere((n) => n.kind == GraphNodeKind.here);
-      expect(here.parentId, 'b1#1');
-    });
-
-    test('活动那一版还有孩子时，当前位置另起一行', () {
-      // 两个节点画在同一格上，看起来是一个节点带着别人的标题。
-      final tree = buildBranchTree(<ChatMessage>[
-        msg('user', '甲', branchId: 'b1')
-      ], <BranchVariant>[
+        variant('b1', 1, <ChatMessage>[
+          msg('user', '甲', branchId: 'b1'),
+          msg('assistant', '答二'),
+        ]),
         variant(
             'b1',
-            0,
+            2,
             <ChatMessage>[
               msg('user', '甲', branchId: 'b1'),
-              msg('user', '乙', branchId: 'b2'),
+              msg('assistant', '答三'),
             ],
             active: true),
-        variant('b2', 0, <ChatMessage>[msg('user', '乙', branchId: 'b2')]),
-        variant('b2', 1, <ChatMessage>[msg('user', '乙', branchId: 'b2')]),
       ]);
-      final nodes = layoutBranchGraph(tree);
       final cells = <String>{for (final n in nodes) '${n.col},${n.row}'};
       expect(cells.length, nodes.length);
+    });
+
+    test('长对话整条画完，只把没岔口的直路折起来', () {
+      // 早先是掐头：只画最后 60 条。那样长会话里**早期的岔口整个看不见**
+      // —— 而这一页存在的全部理由就是让人找到那些岔口。
+      final history = <ChatMessage>[
+        msg('user', '很早的那一问', branchId: 'b1'),
+        msg('assistant', '第二版答'),
+        for (var i = 0; i < 200; i++) msg('user', '后来第 $i 条'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '很早的那一问', branchId: 'b1'),
+          msg('assistant', '第一版答'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '很早的那一问', branchId: 'b1'),
+              msg('assistant', '第二版答'),
+            ],
+            active: true),
+      ]);
+      // 200 条之前那个岔口一个都没少。
+      expect(nodes.where((n) => n.detail == '第一版答').length, 1);
+      expect(nodes.where((n) => n.detail == '第二版答').length, 1);
+      // 中间那段直路折起来了，节点数不随对话长度涨。
+      final more = nodes.where((n) => n.kind == GraphNodeKind.more).toList();
+      expect(more.length, 1);
+      expect(more.single.label, '省略 195 条');
+      expect(nodes.length, lessThan(20));
+    });
+
+    test('折起来的那一段头尾都留着', () {
+      // 留着才看得出这一段是从哪儿到哪儿。
+      final nodes = graph(<ChatMessage>[
+        for (var i = 0; i < 30; i++) msg('user', '第 $i 条'),
+      ]);
+      for (final text in <String>['第 0 条', '第 2 条', '第 27 条', '第 29 条']) {
+        expect(nodes.where((n) => n.detail == text).length, 1, reason: text);
+      }
+      expect(nodes.where((n) => n.detail == '第 10 条'), isEmpty);
+    });
+
+    test('短的直路不折', () {
+      final nodes = graph(<ChatMessage>[
+        for (var i = 0; i < 8; i++) msg('user', '第 $i 条'),
+      ]);
+      expect(nodes.where((n) => n.kind == GraphNodeKind.more), isEmpty);
+      expect(nodes.where((n) => n.kind == GraphNodeKind.message).length, 8);
+    });
+
+    test('岔口之间每一段各折各的', () {
+      // 折叠是按"两个岔口之间那一段"算的，不是全局掐一刀。
+      final history = <ChatMessage>[
+        msg('user', '甲', branchId: 'b1'),
+        for (var i = 0; i < 30; i++) msg('assistant', '甲后第 $i 条'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '甲', branchId: 'b1'),
+          for (var i = 0; i < 30; i++) msg('assistant', '旧第 $i 条'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '甲', branchId: 'b1'),
+              for (var i = 0; i < 30; i++) msg('assistant', '甲后第 $i 条'),
+            ],
+            active: true),
+      ]);
+      // 两支各自折了一次。
+      expect(nodes.where((n) => n.kind == GraphNodeKind.more).length, 2);
+    });
+
+    test('岔完之后又聊的那些，一条都不能少', () {
+      // **这一条是"过长的聊天渲染不完全"的墓碑。**
+      //
+      // 活动那一版的快照只在切版本/重新生成时才重写一次；在那之后又聊的
+      // 每一句都只在 history 上。照快照画的话，图会在最后一次分岔那里
+      // 戛然而止 —— 后面聊了多少句一句都不显示。
+      final history = <ChatMessage>[
+        msg('user', '岔在这儿', branchId: 'b1'),
+        msg('assistant', '第二版答'),
+        msg('user', '后来又问的'),
+        msg('assistant', '后来又答的'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '岔在这儿', branchId: 'b1'),
+          msg('assistant', '第一版答'),
+        ]),
+        // 快照停在分岔那一刻，后面两句它不知道。
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '岔在这儿', branchId: 'b1'),
+              msg('assistant', '第二版答'),
+            ],
+            active: true),
+      ]);
+      for (final text in <String>['后来又问的', '后来又答的']) {
+        expect(nodes.where((n) => n.detail == text).length, 1, reason: text);
+      }
+      // 「当前位置」接在最后一句后面，不是接在分岔那儿。
+      final here = nodes.firstWhere((n) => n.kind == GraphNodeKind.here);
+      expect(here.parentId, nodes.firstWhere((n) => n.detail == '后来又答的').id);
+    });
+
+    test('刚重新生成完还没说话：当前位置接在那一版上', () {
+      final history = <ChatMessage>[
+        msg('user', '岔在这儿', branchId: 'b1'),
+        msg('assistant', '第二版答'),
+      ];
+      final nodes = graph(history, <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '岔在这儿', branchId: 'b1'),
+          msg('assistant', '第一版答'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '岔在这儿', branchId: 'b1'),
+              msg('assistant', '第二版答'),
+            ],
+            active: true),
+      ]);
+      final here = nodes.firstWhere((n) => n.kind == GraphNodeKind.here);
+      expect(here.parentId, nodes.firstWhere((n) => n.detail == '第二版答').id);
     });
 
     test('每个节点都找得到自己的父亲', () {
-      // 连线是按 parentId 找的，找不到就画不出那一段 —— 而缺一段线的图
-      // 看起来像是有几个节点凭空飘着。
-      final nodes = layoutBranchGraph(forkWith(3));
+      // 连线是按 parentId 找的，找不到就少画一段 —— 而缺一段线的图看起来
+      // 像是有几个节点凭空飘着。
+      final nodes = graph(<ChatMessage>[
+        msg('user', '甲', branchId: 'b1'),
+        msg('assistant', '答二'),
+      ], <BranchVariant>[
+        variant('b1', 0, <ChatMessage>[
+          msg('user', '甲', branchId: 'b1'),
+          msg('assistant', '答一'),
+        ]),
+        variant(
+            'b1',
+            1,
+            <ChatMessage>[
+              msg('user', '甲', branchId: 'b1'),
+              msg('assistant', '答二'),
+            ],
+            active: true),
+      ]);
       final ids = <String>{for (final n in nodes) n.id};
       for (final node in nodes) {
         if (node.parentId == null) continue;
@@ -436,55 +622,15 @@ void main() {
       }
     });
 
-    test('已经站在上面的那一版不给点', () {
-      final nodes = layoutBranchGraph(forkWith(2, active: 1));
-      final variants =
-          nodes.where((n) => n.kind == GraphNodeKind.variant).toList();
-      expect(variants[0].jumpable, isTrue);
-      expect(variants[1].jumpable, isFalse);
-    });
-  });
-
-  group('画布尺寸', () {
-    test('列数行数都从节点里数出来，不靠猜', () {
-      // 画布小了会把边上那几个节点裁掉，大了会让"适应屏幕"缩得莫名其妙。
-      final tree = buildBranchTree(<ChatMessage>[
-        msg('user', '甲', branchId: 'b1')
-      ], <BranchVariant>[
-        for (var i = 0; i < 4; i++)
-          variant('b1', i, <ChatMessage>[msg('user', '甲', branchId: 'b1')],
-              active: i == 0),
+    test('当前位置接在主干最后一条后面', () {
+      final nodes = graph(<ChatMessage>[
+        msg('user', '甲'),
+        msg('assistant', '乙'),
       ]);
-      final nodes = layoutBranchGraph(tree);
-      final cols = nodes.fold<int>(0, (m, n) => n.col > m ? n.col : m) + 1;
-      final rows = nodes.fold<int>(0, (m, n) => n.row > m ? n.row : m) + 1;
-      // 根 → 岔路口 → 版本 → 当前位置。
-      expect(cols, 4);
-      // 四个版本：第一个跟着岔路口那一行，其余三个各占一行。
-      expect(rows, 4);
-    });
-
-    test('每个节点都落在画布里', () {
-      final tree = buildBranchTree(<ChatMessage>[
-        msg('user', '甲', branchId: 'b1'),
-        msg('user', '乙', branchId: 'b2'),
-      ], <BranchVariant>[
-        variant('b1', 0, <ChatMessage>[msg('user', '甲', branchId: 'b1')],
-            active: true),
-        variant('b1', 1, <ChatMessage>[msg('user', '甲', branchId: 'b1')]),
-        variant('b2', 0, <ChatMessage>[msg('user', '乙', branchId: 'b2')],
-            active: true),
-        variant('b2', 1, <ChatMessage>[msg('user', '乙', branchId: 'b2')]),
-      ]);
-      final nodes = layoutBranchGraph(tree);
-      final cols = nodes.fold<int>(0, (m, n) => n.col > m ? n.col : m) + 1;
-      final rows = nodes.fold<int>(0, (m, n) => n.row > m ? n.row : m) + 1;
-      for (final node in nodes) {
-        expect(node.col, lessThan(cols));
-        expect(node.row, lessThan(rows));
-        expect(node.col, greaterThanOrEqualTo(0));
-        expect(node.row, greaterThanOrEqualTo(0));
-      }
+      final here = nodes.firstWhere((n) => n.kind == GraphNodeKind.here);
+      final last = nodes.firstWhere((n) => n.detail == '乙');
+      expect(here.parentId, last.id);
+      expect(here.row, last.row);
     });
   });
 }

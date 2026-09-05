@@ -2151,20 +2151,29 @@ class _HomeShellState extends State<HomeShell>
   Future<void> _showBranchTree() async {
     final id = _threadId;
     if (id == null || _busy) return;
+    // **等历史补齐。** 打开长会话时只先读最后一页，剩下的在后台补进来
+    // （见 `_fillOlderHistory`）。不等的话，早期那些岔口连同它们所在的消息
+    // 一起还不在 `history` 里 —— 树画出来就缺了一大截，而缺的那一截恰恰是
+    // "我什么时候岔的"最可能在的地方。
+    try {
+      await _backfill;
+    } catch (_) {
+      // 补不上就画现有的这些。缺一截的图比一个打不开的页面强。
+    }
+    if (!mounted) return;
 
-    Future<List<BranchPoint>> read() async =>
-        buildBranchTree(_agent.history, await widget.chats.variantsOf(id));
-
-    final tree = ValueNotifier<List<BranchPoint>>(await read());
+    final tree =
+        ValueNotifier<List<BranchVariant>>(await widget.chats.variantsOf(id));
     if (!mounted) {
       tree.dispose();
       return;
     }
     await Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (route) => ValueListenableBuilder<List<BranchPoint>>(
+      builder: (route) => ValueListenableBuilder<List<BranchVariant>>(
         valueListenable: tree,
         builder: (_, value, __) => BranchTreePage(
-          tree: value,
+          history: _agent.history,
+          variants: value,
           // 跳过去要关掉这一页：用户要看的是对话本身。
           onJump: (branchId, index) async {
             Navigator.of(route).pop();
@@ -2176,7 +2185,7 @@ class _HomeShellState extends State<HomeShell>
           // 得自己再开一次才知道。而删版本这件事往往要连着做好几次。
           onDelete: (branchId, index) async {
             await _deleteVariant(branchId, index);
-            if (mounted) tree.value = await read();
+            if (mounted) tree.value = await widget.chats.variantsOf(id);
           },
         ),
       ),

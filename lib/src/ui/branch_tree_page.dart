@@ -21,6 +21,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../context/overflow_manager.dart';
+import '../data/chat_store.dart';
 import 'branch_tree.dart';
 import 'chat_theme.dart';
 
@@ -39,13 +41,18 @@ const double _maxScale = 2.5;
 
 class BranchTreePage extends StatefulWidget {
   const BranchTreePage({
-    required this.tree,
+    required this.history,
+    required this.variants,
     required this.onJump,
     required this.onDelete,
     super.key,
   });
 
-  final List<BranchPoint> tree;
+  /// 当前走着的这条路。主干按它一条一条铺开。
+  final List<ChatMessage> history;
+
+  /// 库里存着的那些版本。旁支从它们来。
+  final List<BranchVariant> variants;
 
   /// 跳到某一版。调用方负责把整条路径依次切过去。
   final Future<void> Function(String branchId, int index) onJump;
@@ -86,8 +93,8 @@ class _BranchTreePageState extends State<BranchTreePage> {
   @override
   Widget build(BuildContext context) {
     final t = context.chat;
-    final tree = widget.tree;
-    final nodes = layoutBranchGraph(tree);
+    final nodes = layoutBranchGraph(widget.history, widget.variants);
+    final hasBranches = nodes.any((n) => n.branchId != null);
     final cols = nodes.fold<int>(0, (m, n) => n.col > m ? n.col : m) + 1;
     final rows = nodes.fold<int>(0, (m, n) => n.row > m ? n.row : m) + 1;
     final content = Size(cols * _cellWidth + 48, rows * _cellHeight + 52);
@@ -97,7 +104,7 @@ class _BranchTreePageState extends State<BranchTreePage> {
       appBar: AppBar(
         title: const Text('分支树'),
         actions: <Widget>[
-          if (tree.isNotEmpty)
+          if (hasBranches)
             IconButton(
               tooltip: '适应屏幕',
               icon: const Icon(Icons.fit_screen_outlined),
@@ -114,14 +121,16 @@ class _BranchTreePageState extends State<BranchTreePage> {
             child: Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                tree.isEmpty ? '还没有分支' : '双指缩放 · 点一个版本跳过去 · 长按可以删掉',
+                hasBranches
+                    ? '双指缩放 · 点旁支上任意一处跳过去 · 长按可以删掉'
+                    : '双指缩放 · 这条对话还没有岔过',
                 style: TextStyle(fontSize: 11, color: t.tintTertiary),
               ),
             ),
           ),
         ),
       ),
-      body: tree.isEmpty
+      body: widget.history.isEmpty
           ? Center(
               child: Padding(
                 padding: const EdgeInsets.all(32),
@@ -304,28 +313,26 @@ class _NodeTile extends StatelessWidget {
       );
     }
 
-    if (node.kind == GraphNodeKind.fork) {
-      // 岔路口。画成一个小菱形 + 那句问话 —— 它不是一个"状态"，
-      // 是"在这儿分的岔"，所以刻意和圆形的版本节点长得不一样。
+    if (node.kind == GraphNodeKind.more) {
+      // 中间省掉的一段。**只省没有岔口的直路**，所以它后面不会藏着分支
+      // —— 这一点是那个折叠规则给的保证，不是这里的选择。
       final onPath = node.onActivePath;
       return _Labelled(
         label: node.label,
-        color: onPath ? t.brand : t.tintSecondary,
+        color: t.tintTertiary,
         labelLines: 2,
-        child: Transform.rotate(
-          angle: 0.785398,
-          child: Container(
-            width: 15,
-            height: 15,
-            decoration: BoxDecoration(
-              color: onPath ? t.brand : t.bgSecondary,
-              border: Border.all(
-                color: onPath ? t.brand : t.borderPrimary,
-                width: 1.2,
-              ),
-              borderRadius: BorderRadius.circular(2),
+        child: Container(
+          width: _nodeRadius * 2,
+          height: _nodeRadius * 2,
+          decoration: BoxDecoration(
+            color: t.bgSecondary,
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: onPath ? t.brand.withValues(alpha: 0.5) : t.borderPrimary,
+              width: 1,
             ),
           ),
+          child: Icon(Icons.more_horiz, size: 15, color: t.tintTertiary),
         ),
       );
     }
@@ -363,17 +370,19 @@ class _NodeTile extends StatelessWidget {
     }
 
     final onPath = node.onActivePath;
+    final accent = onPath ? t.brand : t.tintSecondary;
     return InkWell(
       borderRadius: BorderRadius.circular(8),
-      // 已经在这一版上时不给点 —— 点了什么都不会发生，
+      // 点旁支上**任意一处**都能跳过去，不用去瞄那个小小的头节点。
+      // 主干上的不给点 —— 你已经在上面了，点了什么都不会发生，
       // 而"点了没反应"永远会被当成坏了。
       onTap: node.jumpable ? () => onJump(node.branchId!, node.index) : null,
-      // 只剩一版时不给删：那等于删这段对话，是另一个动作，
-      // 有它自己的入口和确认。
-      onLongPress: node.total > 1 ? () => _menu(context) : null,
+      // 只剩一版时不给删：那等于删这段对话，是另一个动作。
+      onLongPress:
+          node.branchId != null && node.total > 1 ? () => _menu(context) : null,
       child: _Labelled(
         label: node.label,
-        color: onPath ? t.brand : t.tintSecondary,
+        color: node.branchHead ? t.tintWarning : accent,
         detail: node.detail,
         child: Container(
           width: _nodeRadius * 2,
@@ -382,19 +391,29 @@ class _NodeTile extends StatelessWidget {
             color: onPath ? t.bgBrandSecondary : t.bgSecondary,
             shape: BoxShape.circle,
             border: Border.all(
-              color: onPath ? t.brand : t.borderPrimary,
-              width: onPath ? 1.6 : 1,
+              // 旁支的头节点描一圈警示色：那一格就是"从这儿分出去的"。
+              color: node.branchHead
+                  ? t.tintWarning
+                  : (onPath ? t.brand : t.borderPrimary),
+              width: onPath || node.branchHead ? 1.6 : 1,
             ),
           ),
           child: Icon(
-            Icons.history_toggle_off,
-            size: 15,
+            _roleIcon(node.role),
+            size: 14,
             color: onPath ? t.brand : t.tintTertiary,
           ),
         ),
       ),
     );
   }
+
+  static IconData _roleIcon(String role) => switch (role) {
+        'user' => Icons.person_outline,
+        'assistant' => Icons.chat_bubble_outline,
+        'tool' => Icons.terminal,
+        _ => Icons.info_outline,
+      };
 
   Future<void> _menu(BuildContext context) async {
     final t = context.chat;
