@@ -23,7 +23,10 @@
 /// 罕见词的单点强命中，覆盖率偏爱广泛命中，向量能召回零词法重叠的语义近邻。
 library;
 
+import 'dart:convert';
 import 'dart:math' as math;
+
+import 'package:crypto/crypto.dart';
 
 // ---------------------------------------------------------------------------
 // BM25
@@ -126,7 +129,10 @@ class MemoryDoc {
   /// 上下文邻居只是为了让读的人（或专家模型）读懂对话，本身没被命中，最低。
   final double importance;
 
-  /// 用于回溯定位，例如 `history:1042` 或 `summary:3`。
+  /// 这一条的**身份**，也是向量缓存的键。
+  ///
+  /// **必须由内容决定，不能是位置。** 见 [memoryDocKey]，以及
+  /// `AgentLoop._corpus` 上那段说明。
   final String source;
 
   const MemoryDoc({
@@ -202,8 +208,12 @@ class MemoryRetrieval {
     Map<String, List<double>>? vectorIndex,
   }) : vectorIndex = vectorIndex ?? {};
 
-  /// 给还没有向量的文档补上索引。**只嵌入新的** —— 语料是只增的
-  /// （`history[0..checkpoint)`），每轮全量重嵌等于每轮多付一次全量的钱。
+  /// 给还没有向量的文档补上索引。**只嵌入新的** —— 每轮全量重嵌等于每轮
+  /// 多付一次全量的钱。
+  ///
+  /// "新的"按 [MemoryDoc.source] 判，而那是**内容**的指纹。语料并不是只增的
+  /// （回退、切分支、以及打开会话时把更早的历史补进开头，都会让它整段换掉），
+  /// 所以不能拿位置当身份 —— 那样缓存会把旧内容的向量当成新内容的。
   ///
   /// 失败就算了。向量路本来就是可选的第三路，为了它让用户这句话失败
   /// 是本末倒置。真正的失败原因由 [Embedder] 的实现记下来给界面显示。
@@ -217,6 +227,17 @@ class MemoryRetrieval {
       lastEmbeddingError = null;
     }
     _indexedWith = current;
+
+    // 语料换过一整段之后，缓存里会留下一堆再也用不到的条目（查的时候只按
+    // 当前语料的键查，所以它们不会给出错答案，但会一直占着内存 ——
+    // 一条上千维的向量不是小数目）。涨到语料两倍就清一次。
+    //
+    // 不每次都清：回退之后又走回同一段内容是很常见的，留着就不用重新
+    // 花钱嵌一遍。
+    if (corpus.isNotEmpty && vectorIndex.length > corpus.length * 2) {
+      final keep = <String>{for (final doc in corpus) doc.source};
+      vectorIndex.removeWhere((key, _) => !keep.contains(key));
+    }
 
     final missing =
         corpus.where((d) => !vectorIndex.containsKey(d.source)).toList();
@@ -393,3 +414,12 @@ class MemoryRetrieval {
   static bool _isCjk(int r) =>
       (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0x3400 && r <= 0x4DBF);
 }
+
+/// 一条语料的身份：内容的指纹。
+///
+/// 取 sha256 的前 16 个十六进制位（64 位）。用 `String.hashCode` 会短到
+/// 几千条就有实打实的碰撞概率，而一次碰撞的表现是**两条不相干的内容共用
+/// 一个向量** —— 检索不会报错，只会一直给错答案，和这个函数要根治的
+/// 那个 bug 长得一模一样。
+String memoryDocKey(String text) =>
+    sha256.convert(utf8.encode(text)).toString().substring(0, 16);

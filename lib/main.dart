@@ -422,13 +422,25 @@ Future<void> _boot({
   /// 而摘要在长对话里会反复发生。
   Future<String> summarize(String systemPrompt, String payload) async {
     final bound = role(ModelRole.summary);
-    // 比的是**主客户端现在指着哪个渠道**，不是全局那个当前渠道。比错的话，
-    // 一条指向 A 的摘要指派会在"这个会话用 B"时走主客户端 —— 于是 A 的
-    // 摘要模型名被发到 B 的地址上，而 summarize 出错时返回空串不抛，
-    // 表现是"摘要一直摘不出东西"，没有任何迹象。
-    if (bound == null ||
-        bound.inherited ||
-        bound.channel.id == llm.config.channelId) {
+    // 走主客户端的条件有两个，**缺一不可**。
+    //
+    // 一是同一个渠道：比的是主客户端现在指着哪个渠道，不是全局那个当前
+    // 渠道。比错的话，一条指向 A 的摘要指派会在"这个会话用 B"时走主客户端
+    // —— A 的摘要模型名被发到 B 的地址上。
+    //
+    // 二是同一个模型。主客户端发摘要用的是它配置里那个 `summaryModel`
+    // （渠道自己那一栏），而不是分工表里点名的那个。漏掉这一条的话：
+    // 用户在分工表里给这个渠道指了一个便宜的小模型，而渠道那一栏是空的
+    // —— 于是 `summaryModelOrDefault` 退回对话模型，**每次摘要都在用旗舰
+    // 模型烧钱，而分工表里那一行看起来配得好好的**。
+    //
+    // 两个都对上时才复用主客户端（那条路上有连接复用，而摘要在长对话里
+    // 会反复发生）。
+    final onMainClient = bound != null &&
+        !bound.inherited &&
+        bound.channel.id == llm.config.channelId &&
+        bound.model == llm.config.summaryModelOrDefault;
+    if (bound == null || bound.inherited || onMainClient) {
       return llm.summarize(systemPrompt, payload);
     }
     final client = ConfigurableLlmClient(

@@ -1944,6 +1944,13 @@ class _HomeShellState extends State<HomeShell>
     final historyIndex = _historyIndexOf(visibleIndex);
     if (historyIndex >= 0) {
       _agent.history.removeRange(historyIndex, _agent.history.length);
+      // **这一句以前漏了。** 「回到这里」走的是 AgentLoop.rewindTo，那边收了
+      // checkpoint；而「删除这条及之后」是在这儿直接砍 history 的，谁都没收。
+      // checkpoint 落在末尾之后时 `history.skip()` 返回空窗口 —— 模型当场
+      // 失忆，而且没有任何迹象：请求照发，只是里面一条历史都没有。
+      if (_agent.overflow.truncateTo(_agent.history.length)) {
+        _setStatus('删到了长期记忆覆盖范围之前，摘要已重置');
+      }
     }
     setState(() => _visible.removeRange(visibleIndex, _visible.length));
     await _persist();

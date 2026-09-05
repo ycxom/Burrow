@@ -1070,15 +1070,37 @@ class AgentLoop {
     return section.isEmpty ? '' : '\n\n$section';
   }
 
-  List<MemoryDoc> _corpus() => [
-        for (var i = 0; i < overflow.checkpoint && i < history.length; i++)
-          MemoryDoc(
-            text: '${history[i].role}: ${history[i].content}',
-            at: history[i].at,
-            importance: history[i].role == 'user' ? 0.6 : 0.5,
-            source: 'history:$i',
-          ),
-      ];
+  /// 被摘要挤出窗口、但还能被检索回来的那一段。
+  ///
+  /// ## 为什么条目的身份是内容，不是位置
+  ///
+  /// [MemoryDoc.source] 是向量缓存的键（见 `MemoryRetrieval.vectorIndex`），
+  /// 而缓存只认"这个键有没有算过"。以前这里写的是 `history:$i` —— 一个**位置**。
+  /// 而位置随时会整体错开：
+  ///
+  ///   - 打开长会话时先只读最后一页，更早的那些在后台补进历史**开头**，
+  ///     一补就是几百条 —— 之后每一个下标指的都是别的消息了；
+  ///   - 回退、删除、切分支都会把一段换掉，新消息接着占用同样的下标。
+  ///
+  /// 缓存不会因此重算（键还在），于是"第 12 条"的向量还是上一段内容的。
+  /// 语义那一路从此一直给不相干的结果，**而且不报错**：检索照常返回，
+  /// 只是返回的东西和问题没关系。
+  ///
+  /// 按内容取键就没有这个问题：内容变了键就变，键相同则内容一定相同
+  /// （顺带把重复内容的嵌入费用也省了）。
+  List<MemoryDoc> _corpus() {
+    final docs = <MemoryDoc>[];
+    for (var i = 0; i < overflow.checkpoint && i < history.length; i++) {
+      final text = '${history[i].role}: ${history[i].content}';
+      docs.add(MemoryDoc(
+        text: text,
+        at: history[i].at,
+        importance: history[i].role == 'user' ? 0.6 : 0.5,
+        source: memoryDocKey(text),
+      ));
+    }
+    return docs;
+  }
 
   String _formatCheckpoints() {
     if (snapshots.checkpoints.isEmpty) return '暂无检查点（HEAD = #0）';
